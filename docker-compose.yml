@@ -81,6 +81,14 @@ services:
           --partitions 3 \
           --replication-factor 1
 
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server agentops-kafka:29092 \
+          --create \
+          --if-not-exists \
+          --topic agentops.telemetry.dlq \
+          --partitions 3 \
+          --replication-factor 1
+
         echo "Kafka topics ready."
 
     networks:
