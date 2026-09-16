@@ -19,6 +19,12 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
 
+      # Single-broker local development settings.
+      # Production multi-broker deployments should use replicated internal topics.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
     volumes:
       - kafka-data:/var/lib/kafka/data
 
@@ -63,7 +69,7 @@ services:
           sleep 2
         done
 
-        echo "Creating Kafka topics..."
+        echo "Creating AgentOps Kafka topics..."
 
         /opt/kafka/bin/kafka-topics.sh \
           --bootstrap-server agentops-kafka:29092 \
@@ -89,7 +95,7 @@ services:
           --partitions 3 \
           --replication-factor 1
 
-        echo "Kafka topics ready."
+        echo "Kafka topic initialization complete."
 
     networks:
       - agentops-net
@@ -97,7 +103,7 @@ services:
 
 networks:
   agentops-net:
-    name: agentops-net
+    driver: bridge
 
 
 volumes:
