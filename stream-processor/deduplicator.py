@@ -111,3 +111,37 @@ class SpanDeduplicator:
 
         self._store[key] = None
         return False
+
+    def contains(self, trace_id: str, span_id: str) -> bool:
+        """
+        Return True if (trace_id, span_id) is present in the cache; False otherwise.
+
+        Pure read: no insertion, no LRU promotion, no state change.
+        A check must not change cache state — LRU ordering must reflect
+        successful mark() activity only.
+        When max_size is 0, always returns False.
+        """
+        if self._max_size == 0:
+            return False
+        return (trace_id, span_id) in self._store
+
+    def mark(self, trace_id: str, span_id: str) -> None:
+        """
+        Record (trace_id, span_id) as successfully published.
+
+        Called only after publish_span() returns normally (positive broker ack).
+
+        - max_size == 0: no-op.
+        - Existing key: promote to MRU.
+        - New key at capacity: evict LRU, then insert.
+        - New key below capacity: insert.
+        """
+        if self._max_size == 0:
+            return
+        key: tuple[str, str] = (trace_id, span_id)
+        if key in self._store:
+            self._store.move_to_end(key)
+            return
+        if len(self._store) >= self._max_size:
+            self._store.popitem(last=False)
+        self._store[key] = None

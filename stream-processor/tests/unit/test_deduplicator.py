@@ -283,3 +283,117 @@ class TestDeterministicSequence:
         expected = [False, False, False, True, False, False, True, True, True]
         results = [d.is_duplicate(tid, sid) for tid, sid in calls]
         assert results == expected
+
+
+# ---------------------------------------------------------------------------
+# contains() — pure membership check
+# ---------------------------------------------------------------------------
+
+
+class TestContains:
+    def test_contains_unknown_returns_false(self):
+        d = SpanDeduplicator(max_size=10)
+        assert d.contains(TID_A, SID_A) is False
+
+    def test_contains_after_mark_returns_true(self):
+        d = SpanDeduplicator(max_size=10)
+        d.mark(TID_A, SID_A)
+        assert d.contains(TID_A, SID_A) is True
+
+    def test_contains_does_not_insert(self):
+        """contains() on an absent span must not insert it."""
+        d = SpanDeduplicator(max_size=10)
+        d.contains(TID_A, SID_A)
+        # Still absent — a second contains() should still be False
+        assert d.contains(TID_A, SID_A) is False
+
+    def test_contains_does_not_change_lru_order(self):
+        """contains() must not promote; mark() drives LRU ordering."""
+        d = SpanDeduplicator(max_size=2)
+        d.mark(TID_A, SID_A)  # (A,A) → LRU
+        d.mark(TID_A, SID_B)  # (A,B) → MRU; at capacity
+
+        # contains() on the LRU entry — must not promote it
+        assert d.contains(TID_A, SID_A) is True
+
+        # Adding a new entry should evict LRU = (A,A), not (A,B)
+        d.mark(TID_B, SID_A)
+
+        assert d.contains(TID_A, SID_A) is False   # was LRU; evicted
+        assert d.contains(TID_A, SID_B) is True    # was MRU; survived
+
+    def test_contains_returns_false_for_different_pair(self):
+        d = SpanDeduplicator(max_size=10)
+        d.mark(TID_A, SID_A)
+        # Same trace, different span — distinct key
+        assert d.contains(TID_A, SID_B) is False
+        # Different trace, same span — distinct key
+        assert d.contains(TID_B, SID_A) is False
+
+    def test_contains_max_size_zero_always_false(self):
+        d = SpanDeduplicator(max_size=0)
+        # mark() is a no-op with max_size=0, so contains() is always False
+        d.mark(TID_A, SID_A)
+        assert d.contains(TID_A, SID_A) is False
+        assert d.contains(TID_B, SID_B) is False
+
+
+# ---------------------------------------------------------------------------
+# mark() — insert / promote with LRU eviction
+# ---------------------------------------------------------------------------
+
+
+class TestMark:
+    def test_mark_inserts_new_entry(self):
+        d = SpanDeduplicator(max_size=10)
+        d.mark(TID_A, SID_A)
+        assert d.contains(TID_A, SID_A) is True
+
+    def test_mark_idempotent_membership(self):
+        """Calling mark() multiple times keeps the entry present."""
+        d = SpanDeduplicator(max_size=10)
+        d.mark(TID_A, SID_A)
+        d.mark(TID_A, SID_A)
+        assert d.contains(TID_A, SID_A) is True
+
+    def test_mark_existing_promotes_to_mru(self):
+        """mark() on an existing entry promotes it, preventing eviction."""
+        d = SpanDeduplicator(max_size=2)
+        d.mark(TID_A, SID_A)  # (A,A) → LRU
+        d.mark(TID_A, SID_B)  # (A,B) → MRU; at capacity
+
+        # Re-mark LRU entry — promotes to MRU
+        d.mark(TID_A, SID_A)  # now (A,B) is LRU, (A,A) is MRU
+
+        # Adding a new entry should evict the new LRU = (A,B)
+        d.mark(TID_B, SID_A)
+
+        assert d.contains(TID_A, SID_B) is False   # was LRU; evicted
+        assert d.contains(TID_A, SID_A) is True    # was promoted; survived
+
+    def test_mark_evicts_lru_at_capacity(self):
+        d = SpanDeduplicator(max_size=2)
+        d.mark(TID_A, SID_A)  # (A,A) → LRU
+        d.mark(TID_A, SID_B)  # (A,B) → MRU; at capacity
+
+        d.mark(TID_B, SID_A)  # evicts (A,A), inserts (B,A)
+
+        assert d.contains(TID_A, SID_A) is False   # evicted
+        assert d.contains(TID_A, SID_B) is True    # survived
+        assert d.contains(TID_B, SID_A) is True    # just marked
+
+    def test_mark_max_size_zero_is_noop(self):
+        d = SpanDeduplicator(max_size=0)
+        d.mark(TID_A, SID_A)
+        # contains() is always False with max_size=0
+        assert d.contains(TID_A, SID_A) is False
+
+    def test_mark_multiple_distinct_entries(self):
+        d = SpanDeduplicator(max_size=10)
+        d.mark(TID_A, SID_A)
+        d.mark(TID_A, SID_B)
+        d.mark(TID_B, SID_A)
+        assert d.contains(TID_A, SID_A) is True
+        assert d.contains(TID_A, SID_B) is True
+        assert d.contains(TID_B, SID_A) is True
+        assert d.contains(TID_B, SID_B) is False
