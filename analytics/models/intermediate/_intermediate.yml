@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: int_trace_spans
+    description: >
+      One row per trace_id. Aggregates span-level rows from stg_telemetry_spans
+      into trace-level structural facts: observed timing envelope, root span
+      metadata, span counts by type, and trace-level error state.
+      Root metadata fields (root_span_id, root_span_name, root_service_name,
+      request_id, session_id) are NULL when no root span has been observed yet;
+      this is expected for incomplete or still-arriving traces.
+    columns:
+      - name: trace_id
+        description: Trace identifier — the grain of this model (one row per trace).
+        data_tests:
+          - not_null
+          - unique
