@@ -128,6 +128,28 @@ services:
       - agentops-net
 
 
+  grafana:
+    image: grafana/grafana:13.2.2
+    container_name: agentops-grafana
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      GF_DATASOURCE_AGENTOPS_PASSWORD: ${GF_DATASOURCE_AGENTOPS_PASSWORD}
+
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - agentops-net
+
+
 networks:
   agentops-net:
     driver: bridge
@@ -136,3 +158,4 @@ networks:
 volumes:
   kafka-data:
   postgres-data:
+  grafana-data:
