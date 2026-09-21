@@ -4,9 +4,9 @@ datasources:
   - name: AgentOps PostgreSQL
     type: postgres
     url: postgres:5432
-    database: agentops
     user: grafana_reader
     jsonData:
+      database: agentops
       sslmode: disable
       postgresVersion: 1700
     secureJsonData:
