@@ -488,7 +488,7 @@
           "sort": "none"
         },
         "xTickLabelMaxLength": 0,
-        "xTickLabelRotation": 0,
+        "xTickLabelRotation": -45,
         "xTickLabelSpacing": 0
       },
       "targets": [
@@ -567,7 +567,7 @@
           "sort": "none"
         },
         "xTickLabelMaxLength": 0,
-        "xTickLabelRotation": 0,
+        "xTickLabelRotation": -45,
         "xTickLabelSpacing": 0
       },
       "targets": [
