@@ -476,7 +476,15 @@
         }
       ],
       "title": "Trace Status Breakdown",
-      "transformations": [],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["Status"],
+            "keepFields": false
+          }
+        }
+      ],
       "type": "piechart"
     },
     {
