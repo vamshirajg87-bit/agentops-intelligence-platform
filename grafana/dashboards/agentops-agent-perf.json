@@ -480,7 +480,7 @@
           "placement": "bottom",
           "showLegend": true
         },
-        "orientation": "auto",
+        "orientation": "horizontal",
         "showValue": "auto",
         "stacking": "none",
         "tooltip": {
@@ -488,7 +488,7 @@
           "sort": "none"
         },
         "xTickLabelMaxLength": 0,
-        "xTickLabelRotation": -45,
+        "xTickLabelRotation": 0,
         "xTickLabelSpacing": 0
       },
       "targets": [
@@ -559,7 +559,7 @@
           "placement": "bottom",
           "showLegend": true
         },
-        "orientation": "auto",
+        "orientation": "horizontal",
         "showValue": "auto",
         "stacking": "none",
         "tooltip": {
@@ -567,7 +567,7 @@
           "sort": "none"
         },
         "xTickLabelMaxLength": 0,
-        "xTickLabelRotation": -45,
+        "xTickLabelRotation": 0,
         "xTickLabelSpacing": 0
       },
       "targets": [
