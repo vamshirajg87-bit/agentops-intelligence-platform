@@ -443,6 +443,7 @@
           "color": {
             "mode": "palette-classic"
           },
+          "displayName": "${__series.name}",
           "mappings": [],
           "unit": "short"
         },
