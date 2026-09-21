@@ -443,7 +443,6 @@
           "color": {
             "mode": "palette-classic"
           },
-          "displayName": "${__series.name}",
           "mappings": [],
           "unit": "short"
         },
@@ -472,20 +471,12 @@
           },
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  CASE WHEN has_error THEN 'Traces with Errors' ELSE 'Traces without Errors' END AS \"Status\",\n  COUNT(*) AS \"Count\"\nFROM analytics.mart_trace_metrics\nWHERE $__timeFilter(trace_start_time)\nGROUP BY 1",
+          "rawSql": "SELECT\n  COALESCE(SUM(CASE WHEN NOT has_error THEN 1 ELSE 0 END), 0) AS \"Traces without Errors\",\n  COALESCE(SUM(CASE WHEN has_error THEN 1 ELSE 0 END), 0) AS \"Traces with Errors\"\nFROM analytics.mart_trace_metrics\nWHERE $__timeFilter(trace_start_time)",
           "refId": "A"
         }
       ],
       "title": "Trace Status Breakdown",
-      "transformations": [
-        {
-          "id": "partitionByValues",
-          "options": {
-            "fields": ["Status"],
-            "keepFields": false
-          }
-        }
-      ],
+      "transformations": [],
       "type": "piechart"
     },
     {
