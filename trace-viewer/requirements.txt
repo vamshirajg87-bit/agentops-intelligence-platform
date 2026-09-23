@@ -1,1 +1,5 @@
+# PostgreSQL driver — psycopg 3 (binary distribution).
+# Matches the pin used by storage-consumer.
+psycopg[binary]>=3.1,<4.0
+
 pytest==8.3.5
