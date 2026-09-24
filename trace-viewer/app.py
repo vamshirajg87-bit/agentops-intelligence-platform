@@ -30,13 +30,15 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import pathlib
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Annotated, Generator
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
 from db import connect
@@ -56,6 +58,14 @@ app = FastAPI(
     title="AgentOps Trace Viewer API",
     version="0.1.0",
 )
+
+_STATIC_DIR = pathlib.Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def root() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "index.html")
 
 # ---------------------------------------------------------------------------
 # Response models

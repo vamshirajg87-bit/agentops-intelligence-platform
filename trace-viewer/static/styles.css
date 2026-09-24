@@ -1,0 +1,353 @@
+/* AgentOps Trace Viewer — dark observability theme */
+
+/* --- Custom properties --- */
+:root {
+  --bg:          #0f1117;
+  --surface:     #1a1d27;
+  --border:      #2a2d3a;
+  --text:        #e2e8f0;
+  --text-muted:  #8892a4;
+  --error:       #e05252;
+  --success:     #52b47a;
+  --accent:      #4a9eff;
+  --error-bg:    #38252d;
+  --error-border: #5a2a2a;
+  --font-sans:   -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono:   "Consolas", "SF Mono", "Menlo", "Monaco", ui-monospace, monospace;
+}
+
+/* --- Reset --- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* --- Base --- */
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* --- Accessibility --- */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --- Header --- */
+.app-header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 24px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  flex-wrap: wrap;
+}
+
+.app-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* --- Filter nav --- */
+.filter-nav {
+  display: flex;
+  gap: 4px;
+}
+
+.filter-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.filter-btn:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.filter-btn[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* --- Main --- */
+.app-main {
+  padding: 14px 24px;
+  max-width: 1600px;
+}
+
+/* --- Status region (loading text) --- */
+.status-region {
+  min-height: 22px;
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 2px 0 8px;
+}
+
+/* --- Error banner --- */
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 4px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #f8b4b4;
+}
+
+.error-banner.hidden {
+  display: none;
+}
+
+.error-message {
+  flex: 1;
+}
+
+.retry-btn {
+  background: transparent;
+  border: 1px solid currentColor;
+  color: inherit;
+  padding: 3px 10px;
+  border-radius: 3px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.retry-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* --- Table wrapper (horizontal scroll on narrow screens) --- */
+.table-wrapper {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+/* --- Table --- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+thead {
+  background: var(--surface);
+}
+
+th {
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+th.align-right {
+  text-align: right;
+}
+
+td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+  color: var(--text);
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+tbody tr:hover td {
+  background: var(--surface);
+}
+
+/* --- Status dot --- */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+
+.status-dot.ok    { background: var(--success); }
+.status-dot.error { background: var(--error); }
+
+/* --- Root operation name --- */
+.op-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  max-width: 240px;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Spans count --- */
+.align-right {
+  text-align: right;
+}
+
+/* --- Breakdown badges --- */
+.breakdown {
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.badge {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.badge.error-badge {
+  color: var(--error);
+}
+
+/* --- Trace ID cell --- */
+.trace-id-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trace-id-display {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.copy-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
+
+.copy-btn:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.copy-btn.copied {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.copy-btn.failed {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+/* --- Empty state row --- */
+.empty-row td {
+  text-align: center;
+  padding: 40px 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.clear-filter-link {
+  color: var(--accent);
+  text-decoration: none;
+  margin-left: 8px;
+}
+
+.clear-filter-link:hover {
+  text-decoration: underline;
+}
+
+/* --- Table footer (count + pagination) --- */
+.table-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.count-display {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* --- Pagination --- */
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.page-btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 14px;
+  border-radius: 4px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.page-btn:hover:not([aria-disabled="true"]) {
+  background: var(--border);
+}
+
+.page-btn[aria-disabled="true"] {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.page-indicator {
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 100px;
+  text-align: center;
+}
