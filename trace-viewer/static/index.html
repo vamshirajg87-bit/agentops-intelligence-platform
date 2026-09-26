@@ -17,36 +17,89 @@
     </nav>
   </header>
   <main class="app-main">
-    <div id="status-region" class="status-region" role="status" aria-live="polite" aria-atomic="true"></div>
-    <div id="error-banner" class="error-banner hidden" role="alert">
-      <span id="error-message" class="error-message"></span>
-      <button id="retry-btn" class="retry-btn" type="button">Retry</button>
+
+    <!-- LIST VIEW -->
+    <div id="list-view">
+      <div id="status-region" class="status-region" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="error-banner" class="error-banner hidden" role="alert">
+        <span id="error-message" class="error-message"></span>
+        <button id="retry-btn" class="retry-btn" type="button">Retry</button>
+      </div>
+      <div class="table-wrapper">
+        <table id="traces-table" aria-label="Trace list">
+          <thead>
+            <tr>
+              <th scope="col">Status</th>
+              <th scope="col">Started (UTC)</th>
+              <th scope="col">Duration</th>
+              <th scope="col">Root Operation</th>
+              <th scope="col">Service</th>
+              <th scope="col" class="align-right">Spans</th>
+              <th scope="col">Breakdown</th>
+              <th scope="col">Trace ID</th>
+            </tr>
+          </thead>
+          <tbody id="traces-body"></tbody>
+        </table>
+      </div>
+      <footer class="table-footer">
+        <span id="count-display" class="count-display" aria-live="polite"></span>
+        <nav class="pagination" aria-label="Page navigation">
+          <button id="prev-btn" class="page-btn" type="button" aria-label="Previous page">Prev</button>
+          <span id="page-indicator" class="page-indicator" aria-live="polite" aria-atomic="true"></span>
+          <button id="next-btn" class="page-btn" type="button" aria-label="Next page">Next</button>
+        </nav>
+      </footer>
     </div>
-    <div class="table-wrapper">
-      <table id="traces-table" aria-label="Trace list">
-        <thead>
-          <tr>
-            <th scope="col">Status</th>
-            <th scope="col">Started (UTC)</th>
-            <th scope="col">Duration</th>
-            <th scope="col">Root Operation</th>
-            <th scope="col">Service</th>
-            <th scope="col" class="align-right">Spans</th>
-            <th scope="col">Breakdown</th>
-            <th scope="col">Trace ID</th>
-          </tr>
-        </thead>
-        <tbody id="traces-body"></tbody>
-      </table>
+
+    <!-- DETAIL VIEW -->
+    <div id="detail-view" class="hidden">
+      <div class="detail-toolbar">
+        <button id="back-btn" class="back-btn" type="button">← Back to traces</button>
+        <div class="detail-trace-meta">
+          <div class="trace-id-cell">
+            <span id="detail-trace-id-display" class="trace-id-display"></span>
+            <button id="detail-copy-btn" class="copy-btn" type="button" aria-label="Copy full trace ID">copy</button>
+          </div>
+          <span id="detail-span-count" class="detail-meta-item"></span>
+          <span id="detail-health" class="detail-meta-item"></span>
+        </div>
+      </div>
+      <div id="cycle-warning" class="cycle-warning hidden" role="alert">
+        ⚠ This trace contains cyclic span references. Cycle members are shown in a separate section below.
+      </div>
+      <div id="detail-status" class="status-region" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="detail-error-banner" class="error-banner hidden" role="alert">
+        <span id="detail-error-message" class="error-message"></span>
+        <button id="detail-retry-btn" class="retry-btn" type="button">Retry</button>
+      </div>
+      <div class="detail-body">
+        <div class="tree-pane">
+          <section id="roots-section" class="tree-section">
+            <h2 class="tree-section-heading">Execution Tree</h2>
+            <div id="roots-container" role="tree" aria-label="Execution tree"></div>
+          </section>
+          <section id="orphans-section" class="tree-section hidden">
+            <h2 class="tree-section-heading">Orphan Spans</h2>
+            <p class="tree-section-desc">These spans reference a parent not present in this trace.</p>
+            <div id="orphans-container" role="tree" aria-label="Orphan spans"></div>
+          </section>
+          <section id="cycle-members-section" class="tree-section hidden">
+            <h2 class="tree-section-heading">Cycle Members</h2>
+            <p class="tree-section-desc">Spans involved in cyclic references. Back-edges are not rendered.</p>
+            <div id="cycle-members-container" role="tree" aria-label="Cycle member spans"></div>
+          </section>
+        </div>
+        <aside class="span-panel" aria-label="Span details">
+          <div id="span-panel-empty" class="span-panel-empty">Select a span to view its details.</div>
+          <div id="span-panel-content" class="hidden">
+            <h2 class="span-panel-heading">Span Details</h2>
+            <dl id="span-fields" class="span-fields"></dl>
+          </div>
+        </aside>
+      </div>
     </div>
-    <footer class="table-footer">
-      <span id="count-display" class="count-display" aria-live="polite"></span>
-      <nav class="pagination" aria-label="Page navigation">
-        <button id="prev-btn" class="page-btn" type="button" aria-label="Previous page">Prev</button>
-        <span id="page-indicator" class="page-indicator" aria-live="polite" aria-atomic="true"></span>
-        <button id="next-btn" class="page-btn" type="button" aria-label="Next page">Next</button>
-      </nav>
-    </footer>
+
   </main>
 </body>
 </html>

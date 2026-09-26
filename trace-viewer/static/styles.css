@@ -197,6 +197,11 @@ tbody tr:hover td {
   background: var(--surface);
 }
 
+/* Rows are clickable in list mode */
+#traces-body tr {
+  cursor: pointer;
+}
+
 /* --- Status dot --- */
 .status-dot {
   display: inline-block;
@@ -350,4 +355,270 @@ tbody tr:hover td {
   white-space: nowrap;
   min-width: 100px;
   text-align: center;
+}
+
+/* ===================================================================
+   Phase 9.6 — Detail view
+   =================================================================== */
+
+/* --- View switching --- */
+body.detail-mode .filter-nav { display: none; }
+#detail-view.hidden           { display: none; }
+#list-view.hidden             { display: none; }
+
+/* --- Detail toolbar --- */
+.detail-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 0 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.back-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--accent);
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.back-btn:hover { background: var(--border); }
+
+.detail-trace-meta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.detail-meta-item {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.health-ok    { color: var(--success); }
+.health-error { color: var(--error); }
+
+/* --- Cycle warning banner --- */
+.cycle-warning {
+  background: #2a2510;
+  border: 1px solid #5a4818;
+  border-radius: 4px;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: #e8c84a;
+  margin-bottom: 12px;
+}
+.cycle-warning.hidden { display: none; }
+
+/* --- Detail body layout: tree pane + span panel side by side --- */
+.detail-body {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.tree-pane {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+/* --- Tree sections --- */
+.tree-section             { margin-bottom: 28px; }
+.tree-section.hidden      { display: none; }
+
+.tree-section-heading {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.tree-section-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.tree-empty {
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 6px 0;
+  font-style: italic;
+}
+
+/* --- Tree nodes --- */
+.tree-node-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  min-height: 26px;
+  outline: none;
+}
+
+.tree-node-row:hover       { background: var(--surface); }
+.tree-node-row:focus       { outline: 1px solid var(--accent); outline-offset: -1px; }
+.tree-node-row.selected    { background: rgba(74, 158, 255, 0.12); }
+
+/* Children: indented with a vertical guide line */
+.tree-children {
+  margin-left: 14px;
+  border-left: 1px solid var(--border);
+  padding-left: 6px;
+}
+
+/* --- Span type badge (single letter A / T / R / L) --- */
+.span-type-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+  font-family: var(--font-sans);
+}
+
+.span-type-agent     { background: #152a44; color: #6aaeff; }
+.span-type-tool      { background: #152a1e; color: #5ace88; }
+.span-type-retrieval { background: #2a2414; color: #d4b84a; }
+.span-type-llm       { background: #221438; color: #b080e8; }
+
+/* --- Span name --- */
+.span-name {
+  flex: 1;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-node-row.error-row .span-name { color: var(--error); }
+
+/* --- Span duration --- */
+.span-duration {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* --- Inline status pills in tree rows --- */
+.span-error-pill {
+  font-size: 10px;
+  color: var(--error);
+  background: rgba(224, 82, 82, 0.12);
+  border: 1px solid rgba(224, 82, 82, 0.25);
+  padding: 1px 5px;
+  border-radius: 10px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.span-cycle-pill {
+  font-size: 10px;
+  color: #d4b84a;
+  background: rgba(212, 184, 74, 0.10);
+  border: 1px solid rgba(212, 184, 74, 0.25);
+  padding: 1px 5px;
+  border-radius: 10px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* --- Span panel (sticky sidebar) --- */
+.span-panel {
+  width: 300px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  padding: 12px;
+  overflow-y: auto;
+  max-height: calc(100vh - 120px);
+  position: sticky;
+  top: 60px;
+}
+
+.span-panel-empty {
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 2px 0;
+}
+
+.span-panel-heading {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 10px;
+}
+
+/* --- Span fields definition list --- */
+.span-fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+}
+
+.span-fields dt {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  padding-top: 1px;
+}
+
+.span-fields dd {
+  color: var(--text);
+  font-size: 12px;
+  word-break: break-all;
+  margin: 0;
+}
+
+.span-fields dd.mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.span-fields dd.error-value { color: var(--error); }
+
+/* Visual group separator — hr as grid-spanning element */
+.span-fields > .field-sep {
+  grid-column: 1 / -1;
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 5px 0;
+}
+
+/* --- Responsive: stack panel below tree on narrow screens --- */
+@media (max-width: 900px) {
+  .detail-body {
+    flex-direction: column;
+  }
+  .span-panel {
+    width: 100%;
+    position: static;
+    max-height: none;
+  }
 }
