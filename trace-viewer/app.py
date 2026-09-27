@@ -283,14 +283,26 @@ def list_traces_endpoint(
     limit: Annotated[int, Query(ge=1, le=_MAX_LIMIT)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
     has_error: Annotated[bool | None, Query()] = None,
+    service_name: Annotated[str | None, Query()] = None,
+    request_id: Annotated[str | None, Query()] = None,
+    session_id: Annotated[str | None, Query()] = None,
+    min_duration_ms: Annotated[float | None, Query(ge=0)] = None,
+    max_duration_ms: Annotated[float | None, Query(ge=0)] = None,
+    search: Annotated[str | None, Query()] = None,
 ) -> TraceListResponse:
     """
     Return a paginated list of traces from analytics.int_trace_spans.
 
     Query parameters:
-        limit      1–200, default 50
-        offset     >= 0, default 0
-        has_error  optional boolean filter; omit to return all traces
+        limit            1–200, default 50
+        offset           >= 0, default 0
+        has_error        optional boolean filter
+        service_name     exact match on root_service_name
+        request_id       exact match on request_id
+        session_id       exact match on session_id
+        min_duration_ms  >= 0; lower bound on trace_duration_ms
+        max_duration_ms  >= 0; upper bound on trace_duration_ms
+        search           OR-match across trace_id, request_id, session_id
 
     Response:
         total   — total matching traces before pagination
@@ -298,8 +310,25 @@ def list_traces_endpoint(
         offset  — echoed from request
         traces  — rows for this page
     """
+    if min_duration_ms is not None and max_duration_ms is not None:
+        if min_duration_ms > max_duration_ms:
+            raise HTTPException(
+                status_code=422,
+                detail="min_duration_ms must be <= max_duration_ms",
+            )
     with get_db() as conn:
-        result = list_traces(conn, limit=limit, offset=offset, has_error=has_error)
+        result = list_traces(
+            conn,
+            limit=limit,
+            offset=offset,
+            has_error=has_error,
+            service_name=service_name,
+            request_id=request_id,
+            session_id=session_id,
+            min_duration_ms=min_duration_ms,
+            max_duration_ms=max_duration_ms,
+            search=search,
+        )
     return TraceListResponse(
         total=result.total,
         limit=limit,

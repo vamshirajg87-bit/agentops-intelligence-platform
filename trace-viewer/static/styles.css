@@ -101,6 +101,76 @@ body {
   max-width: 1600px;
 }
 
+/* --- Filter form (Phase 9.7) --- */
+.filter-form {
+  margin-bottom: 10px;
+}
+
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.filter-input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  outline: none;
+  min-width: 0;
+}
+
+.filter-input::placeholder {
+  color: var(--text-muted);
+}
+
+.filter-input:focus {
+  border-color: var(--accent);
+}
+
+.filter-input-wide {
+  flex: 2;
+  min-width: 160px;
+}
+
+.filter-input-short {
+  width: 90px;
+  flex-shrink: 0;
+}
+
+.filter-apply-btn,
+.filter-clear-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 5px 14px;
+  border-radius: 4px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.filter-apply-btn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.filter-apply-btn:hover {
+  opacity: 0.9;
+}
+
+.filter-clear-btn:hover {
+  background: var(--border);
+}
+
 /* --- Status region (loading text) --- */
 .status-region {
   min-height: 22px;

@@ -7,6 +7,10 @@ const MAX_TREE_DEPTH = 50; // safety guard against unexpected deep nesting
 let pageIndex = 0;
 let hasErrorFilter = null; // null | true | false
 let currentTotal = 0;
+let searchFilter    = '';
+let serviceFilter   = '';
+let minDurFilter    = '';
+let maxDurFilter    = '';
 
 // ---------- Detail-view state ----------
 let currentTraceId = null;
@@ -108,10 +112,16 @@ function buildApiUrl() {
   const params = new URLSearchParams();
   params.set('limit', String(PAGE_SIZE));
   params.set('offset', String(pageIndex * PAGE_SIZE));
-  if (hasErrorFilter !== null) {
-    params.set('has_error', String(hasErrorFilter));
-  }
+  if (hasErrorFilter !== null) params.set('has_error', String(hasErrorFilter));
+  if (searchFilter)            params.set('search', searchFilter);
+  if (serviceFilter)           params.set('service_name', serviceFilter);
+  if (minDurFilter !== '')     params.set('min_duration_ms', minDurFilter);
+  if (maxDurFilter !== '')     params.set('max_duration_ms', maxDurFilter);
   return '/api/traces?' + params.toString();
+}
+
+function hasAnySearchFilter() {
+  return searchFilter || serviceFilter || minDurFilter !== '' || maxDurFilter !== '';
 }
 
 async function fetchTraces() {
@@ -181,18 +191,10 @@ function renderEmpty() {
   tr.className = 'empty-row';
   const td = document.createElement('td');
   td.setAttribute('colspan', '8');
-  td.textContent = 'No traces found.';
-  if (hasErrorFilter !== null) {
-    const link = document.createElement('a');
-    link.href = '#';
-    link.className = 'clear-filter-link';
-    link.textContent = 'Show all traces';
-    link.addEventListener('click', e => {
-      e.preventDefault();
-      applyFilter(null);
-    });
-    td.appendChild(link);
-  }
+  const hasAnyFilter = hasErrorFilter !== null || hasAnySearchFilter();
+  td.textContent = hasAnyFilter
+    ? 'No traces match the current filters.'
+    : 'No traces found.';
   tr.appendChild(td);
   tracesBody.replaceChildren(tr);
 }
@@ -724,6 +726,33 @@ document.getElementById('filter-errors')
   .addEventListener('click', () => applyFilter(true));
 document.getElementById('filter-healthy')
   .addEventListener('click', () => applyFilter(false));
+
+document.getElementById('filter-form').addEventListener('submit', e => {
+  e.preventDefault();
+  searchFilter  = document.getElementById('search-input').value.trim();
+  serviceFilter = document.getElementById('service-input').value.trim();
+  minDurFilter  = document.getElementById('min-dur-input').value.trim();
+  maxDurFilter  = document.getElementById('max-dur-input').value.trim();
+  pageIndex = 0;
+  fetchTraces();
+});
+
+document.getElementById('clear-filters-btn').addEventListener('click', () => {
+  searchFilter  = '';
+  serviceFilter = '';
+  minDurFilter  = '';
+  maxDurFilter  = '';
+  document.getElementById('search-input').value  = '';
+  document.getElementById('service-input').value = '';
+  document.getElementById('min-dur-input').value = '';
+  document.getElementById('max-dur-input').value = '';
+  hasErrorFilter = null;
+  pageIndex = 0;
+  document.getElementById('filter-all').setAttribute('aria-pressed', 'true');
+  document.getElementById('filter-errors').setAttribute('aria-pressed', 'false');
+  document.getElementById('filter-healthy').setAttribute('aria-pressed', 'false');
+  fetchTraces();
+});
 
 retryBtn.addEventListener('click', fetchTraces);
 

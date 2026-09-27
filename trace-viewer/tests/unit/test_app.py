@@ -117,13 +117,18 @@ def test_health_response_shape():
 
 
 def test_list_traces_default_params():
-    """Default limit=50, offset=0, has_error=None are forwarded to list_traces."""
+    """Default params are forwarded to list_traces with all filters None/empty."""
     mock_conn = MagicMock()
     with patch("app.connect", return_value=mock_conn), \
          patch("app.list_traces") as mock_lt:
         mock_lt.return_value = TraceListResult(total=0, traces=[])
         client.get("/api/traces")
-    mock_lt.assert_called_once_with(mock_conn, limit=50, offset=0, has_error=None)
+    mock_lt.assert_called_once_with(
+        mock_conn,
+        limit=50, offset=0, has_error=None,
+        service_name=None, request_id=None, session_id=None,
+        min_duration_ms=None, max_duration_ms=None, search=None,
+    )
 
 
 def test_list_traces_echoes_limit_and_offset():
@@ -156,7 +161,12 @@ def test_list_traces_has_error_true():
          patch("app.list_traces") as mock_lt:
         mock_lt.return_value = TraceListResult(total=1, traces=[_make_trace_row(has_error=True)])
         client.get("/api/traces?has_error=true")
-    mock_lt.assert_called_once_with(mock_conn, limit=50, offset=0, has_error=True)
+    mock_lt.assert_called_once_with(
+        mock_conn,
+        limit=50, offset=0, has_error=True,
+        service_name=None, request_id=None, session_id=None,
+        min_duration_ms=None, max_duration_ms=None, search=None,
+    )
 
 
 def test_list_traces_has_error_false():
@@ -166,7 +176,12 @@ def test_list_traces_has_error_false():
          patch("app.list_traces") as mock_lt:
         mock_lt.return_value = TraceListResult(total=0, traces=[])
         client.get("/api/traces?has_error=false")
-    mock_lt.assert_called_once_with(mock_conn, limit=50, offset=0, has_error=False)
+    mock_lt.assert_called_once_with(
+        mock_conn,
+        limit=50, offset=0, has_error=False,
+        service_name=None, request_id=None, session_id=None,
+        min_duration_ms=None, max_duration_ms=None, search=None,
+    )
 
 
 def test_list_traces_empty_result():
@@ -433,3 +448,153 @@ def test_connection_closes_on_query_exception():
         resp = client.get(f"/api/traces/{_VALID_TRACE_ID}")
     assert resp.status_code == 503
     mock_conn.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.7: New filter params — forwarding
+# ---------------------------------------------------------------------------
+
+
+def test_list_traces_service_name_forwarded():
+    """service_name is parsed and forwarded to list_traces."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?service_name=my-svc")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["service_name"] == "my-svc"
+
+
+def test_list_traces_request_id_forwarded():
+    """request_id is parsed and forwarded to list_traces."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?request_id=req-abc")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["request_id"] == "req-abc"
+
+
+def test_list_traces_session_id_forwarded():
+    """session_id is parsed and forwarded to list_traces."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?session_id=sess-xyz")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["session_id"] == "sess-xyz"
+
+
+def test_list_traces_min_duration_ms_forwarded():
+    """min_duration_ms is parsed as float and forwarded."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?min_duration_ms=100")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["min_duration_ms"] == 100.0
+
+
+def test_list_traces_max_duration_ms_forwarded():
+    """max_duration_ms is parsed as float and forwarded."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?max_duration_ms=5000")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["max_duration_ms"] == 5000.0
+
+
+def test_list_traces_duration_range_forwarded():
+    """Both min and max duration are forwarded when both are valid."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?min_duration_ms=10&max_duration_ms=500")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["min_duration_ms"] == 10.0
+    assert kwargs["max_duration_ms"] == 500.0
+
+
+def test_list_traces_search_forwarded():
+    """search is parsed and forwarded to list_traces as-is (prefix % appended in queries.py)."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?search=abc123")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["search"] == "abc123"
+
+
+def test_list_traces_filters_and_has_error_combined():
+    """service_name + has_error together are both forwarded."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        client.get("/api/traces?service_name=svc&has_error=true")
+    _, kwargs = mock_lt.call_args
+    assert kwargs["service_name"] == "svc"
+    assert kwargs["has_error"] is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.7: New filter params — validation (connect() never called)
+# ---------------------------------------------------------------------------
+
+
+def test_list_traces_min_gt_max_returns_422():
+    """min_duration_ms > max_duration_ms → 422 before DB connection."""
+    with patch("app.connect") as mock_connect:
+        resp = client.get("/api/traces?min_duration_ms=1000&max_duration_ms=100")
+    assert resp.status_code == 422
+    mock_connect.assert_not_called()
+
+
+def test_list_traces_negative_min_duration_returns_422():
+    """min_duration_ms < 0 → 422 from FastAPI param validation before DB."""
+    with patch("app.connect") as mock_connect:
+        resp = client.get("/api/traces?min_duration_ms=-1")
+    assert resp.status_code == 422
+    mock_connect.assert_not_called()
+
+
+def test_list_traces_negative_max_duration_returns_422():
+    """max_duration_ms < 0 → 422 from FastAPI param validation before DB."""
+    with patch("app.connect") as mock_connect:
+        resp = client.get("/api/traces?max_duration_ms=-5")
+    assert resp.status_code == 422
+    mock_connect.assert_not_called()
+
+
+def test_list_traces_non_numeric_min_duration_returns_422():
+    """min_duration_ms=abc → 422 from FastAPI param validation before DB."""
+    with patch("app.connect") as mock_connect:
+        resp = client.get("/api/traces?min_duration_ms=abc")
+    assert resp.status_code == 422
+    mock_connect.assert_not_called()
+
+
+def test_list_traces_non_numeric_max_duration_returns_422():
+    """max_duration_ms=xyz → 422 from FastAPI param validation before DB."""
+    with patch("app.connect") as mock_connect:
+        resp = client.get("/api/traces?max_duration_ms=xyz")
+    assert resp.status_code == 422
+    mock_connect.assert_not_called()
+
+
+def test_list_traces_equal_min_max_is_valid():
+    """min_duration_ms == max_duration_ms is a valid single-point range."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.list_traces") as mock_lt:
+        mock_lt.return_value = TraceListResult(total=0, traces=[])
+        resp = client.get("/api/traces?min_duration_ms=100&max_duration_ms=100")
+    assert resp.status_code == 200

@@ -512,3 +512,225 @@ class TestGetTraceReconstruction:
         conn, _ = _make_conn_for_fetch(rows)
         result = get_trace_reconstruction(conn, _VALID_TRACE_ID)
         assert result.has_cycle is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.7: list_traces — new filter params
+# ---------------------------------------------------------------------------
+
+class TestListTracesServiceFilter:
+    def test_service_name_adds_where_clause(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, service_name="my-svc")
+        count_sql, count_params = cur.execute_calls[0]
+        page_sql, page_params = cur.execute_calls[1]
+        assert "WHERE" in count_sql
+        assert "WHERE" in page_sql
+        assert "root_service_name" in count_sql
+        assert count_params["service_name"] == "my-svc"
+        assert page_params["service_name"] == "my-svc"
+
+    def test_service_name_uses_parameter_binding(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, service_name="svc")
+        count_sql, _ = cur.execute_calls[0]
+        assert "%(service_name)s" in count_sql
+
+    def test_no_service_name_no_root_service_filter(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn)
+        count_sql, count_params = cur.execute_calls[0]
+        assert "root_service_name" not in count_sql
+        assert "service_name" not in count_params
+
+
+class TestListTracesRequestIdFilter:
+    def test_request_id_adds_where_clause(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, request_id="req-1")
+        count_sql, count_params = cur.execute_calls[0]
+        assert "WHERE" in count_sql
+        assert "request_id" in count_sql
+        assert count_params["request_id"] == "req-1"
+
+    def test_request_id_uses_parameter_binding(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, request_id="req-1")
+        count_sql, _ = cur.execute_calls[0]
+        assert "%(request_id)s" in count_sql
+
+
+class TestListTracesSessionIdFilter:
+    def test_session_id_adds_where_clause(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, session_id="sess-1")
+        count_sql, count_params = cur.execute_calls[0]
+        assert "WHERE" in count_sql
+        assert "session_id" in count_sql
+        assert count_params["session_id"] == "sess-1"
+
+    def test_session_id_uses_parameter_binding(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, session_id="sess-1")
+        count_sql, _ = cur.execute_calls[0]
+        assert "%(session_id)s" in count_sql
+
+
+class TestListTracesMinDurationFilter:
+    def test_min_duration_adds_where_clause(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, min_duration_ms=100.0)
+        count_sql, count_params = cur.execute_calls[0]
+        assert "WHERE" in count_sql
+        assert "trace_duration_ms" in count_sql
+        assert ">=" in count_sql
+        assert count_params["min_duration_ms"] == 100.0
+
+    def test_min_duration_uses_parameter_binding(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, min_duration_ms=50.0)
+        count_sql, _ = cur.execute_calls[0]
+        assert "%(min_duration_ms)s" in count_sql
+
+    def test_min_duration_zero_is_valid(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, min_duration_ms=0.0)
+        _, count_params = cur.execute_calls[0]
+        assert count_params["min_duration_ms"] == 0.0
+
+
+class TestListTracesMaxDurationFilter:
+    def test_max_duration_adds_where_clause(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, max_duration_ms=5000.0)
+        count_sql, count_params = cur.execute_calls[0]
+        assert "WHERE" in count_sql
+        assert "trace_duration_ms" in count_sql
+        assert "<=" in count_sql
+        assert count_params["max_duration_ms"] == 5000.0
+
+    def test_max_duration_uses_parameter_binding(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, max_duration_ms=999.0)
+        count_sql, _ = cur.execute_calls[0]
+        assert "%(max_duration_ms)s" in count_sql
+
+
+class TestListTracesDurationRange:
+    def test_both_bounds_generate_two_conditions(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, min_duration_ms=10.0, max_duration_ms=500.0)
+        count_sql, count_params = cur.execute_calls[0]
+        assert "%(min_duration_ms)s" in count_sql
+        assert "%(max_duration_ms)s" in count_sql
+        assert count_params["min_duration_ms"] == 10.0
+        assert count_params["max_duration_ms"] == 500.0
+
+    def test_equal_min_max_is_accepted(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, min_duration_ms=100.0, max_duration_ms=100.0)
+        _, count_params = cur.execute_calls[0]
+        assert count_params["min_duration_ms"] == 100.0
+        assert count_params["max_duration_ms"] == 100.0
+
+
+class TestListTracesSearchFilter:
+    def test_search_adds_like_or_clause(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, search="abc123")
+        count_sql, count_params = cur.execute_calls[0]
+        assert "WHERE" in count_sql
+        assert "trace_id" in count_sql
+        assert "request_id" in count_sql
+        assert "session_id" in count_sql
+        assert "OR" in count_sql
+        assert "LIKE" in count_sql
+
+    def test_search_appends_percent_to_bound_value(self):
+        """The % wildcard is part of the bound parameter value, not the SQL template."""
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, search="abc123")
+        _, count_params = cur.execute_calls[0]
+        assert count_params["search"] == "abc123%"
+
+    def test_search_partial_prefix_bound(self):
+        """Entering 8 hex chars produces a prefix-match bound value."""
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, search="97a1b6fe")
+        _, count_params = cur.execute_calls[0]
+        assert count_params["search"] == "97a1b6fe%"
+
+    def test_search_full_id_still_works(self):
+        """A full 32-char trace_id produces a bound value of id + '%'."""
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, search="a" * 32)
+        _, count_params = cur.execute_calls[0]
+        assert count_params["search"] == "a" * 32 + "%"
+
+    def test_search_uses_parameter_binding(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, search="abc")
+        count_sql, _ = cur.execute_calls[0]
+        assert "%(search)s" in count_sql
+
+    def test_search_not_in_params_when_none(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn)
+        _, count_params = cur.execute_calls[0]
+        assert "search" not in count_params
+
+    def test_search_count_and_page_both_receive_param(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, search="prefix")
+        _, count_params = cur.execute_calls[0]
+        _, page_params  = cur.execute_calls[1]
+        assert count_params["search"] == "prefix%"
+        assert page_params["search"]  == "prefix%"
+
+
+class TestListTracesFilteredTotal:
+    def test_filtered_total_comes_from_count_query(self):
+        conn, cur = _make_conn_for_list(count_value=7, page_rows=[])
+        result = list_traces(conn, service_name="svc")
+        assert result.total == 7
+
+    def test_total_reflects_active_filter_not_page_size(self):
+        conn, cur = _make_conn_for_list(count_value=200, page_rows=[{"x": 1}])
+        result = list_traces(conn, min_duration_ms=100.0, limit=1, offset=0)
+        assert result.total == 200
+        assert len(result.traces) == 1
+
+
+class TestListTracesCombinedFilters:
+    def test_has_error_and_service_name_both_in_where(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(conn, has_error=True, service_name="svc")
+        count_sql, count_params = cur.execute_calls[0]
+        assert "has_error" in count_sql
+        assert "root_service_name" in count_sql
+        assert "AND" in count_sql
+        assert count_params["has_error"] is True
+        assert count_params["service_name"] == "svc"
+
+    def test_all_filters_combined_generates_and_clauses(self):
+        conn, cur = _make_conn_for_list()
+        list_traces(
+            conn,
+            has_error=False,
+            service_name="svc",
+            request_id="req",
+            session_id="sess",
+            min_duration_ms=10.0,
+            max_duration_ms=1000.0,
+            search="abc",
+        )
+        count_sql, count_params = cur.execute_calls[0]
+        assert "WHERE" in count_sql
+        assert "AND" in count_sql
+        assert count_params["has_error"] is False
+        assert count_params["service_name"] == "svc"
+        assert count_params["request_id"] == "req"
+        assert count_params["session_id"] == "sess"
+        assert count_params["min_duration_ms"] == 10.0
+        assert count_params["max_duration_ms"] == 1000.0
+        assert count_params["search"] == "abc%"

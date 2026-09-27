@@ -158,29 +158,40 @@ def list_traces(
     limit: int = 50,
     offset: int = 0,
     has_error: bool | None = None,
+    service_name: str | None = None,
+    request_id: str | None = None,
+    session_id: str | None = None,
+    min_duration_ms: float | None = None,
+    max_duration_ms: float | None = None,
+    search: str | None = None,
 ) -> TraceListResult:
     """
     Return a paginated page of traces from analytics.int_trace_spans.
 
-    Both the count (for pagination) and the page rows respect the has_error
-    filter. Two SQL statements are executed on a single cursor within the
+    Both the count (for pagination) and the page rows respect all active
+    filters. Two SQL statements are executed on a single cursor within the
     same function call: a COUNT for the total and a paginated SELECT for
     the rows.
 
     Args:
-        conn:       Open psycopg connection with SELECT on
-                    analytics.int_trace_spans.
-        limit:      Maximum number of rows to return. Must be >= 1.
-        offset:     Number of rows to skip. Must be >= 0.
-        has_error:  None  → all traces (no WHERE clause).
-                    True  → only traces where has_error = true.
-                    False → only traces where has_error = false.
-                    The value is always passed as a bound parameter;
-                    it is never interpolated into the SQL string.
+        conn:             Open psycopg connection with SELECT on
+                          analytics.int_trace_spans.
+        limit:            Maximum number of rows to return. Must be >= 1.
+        offset:           Number of rows to skip. Must be >= 0.
+        has_error:        None → all; True → error traces; False → healthy.
+        service_name:     Filter by root_service_name (exact match).
+        request_id:       Filter by request_id (exact match).
+        session_id:       Filter by session_id (exact match).
+        min_duration_ms:  Filter to traces with duration >= this value.
+        max_duration_ms:  Filter to traces with duration <= this value.
+        search:           OR-match across trace_id, request_id, session_id.
+
+    All filter values are always passed as bound parameters; none are
+    interpolated into the SQL string.
 
     Returns:
         TraceListResult with:
-            total  — total traces matching the filter (before pagination).
+            total  — total traces matching active filters (before pagination).
             traces — rows for this page, each a dict of all 16 int_trace_spans
                      columns with native Python types.
         Ordering: trace_start_time DESC, trace_id ASC.
@@ -194,14 +205,34 @@ def list_traces(
     if offset < 0:
         raise ValueError(f"offset must be >= 0, got {offset}")
 
+    conditions: list[str] = []
     params: dict[str, Any] = {"limit": limit, "offset": offset}
 
-    # Choose fixed WHERE fragment; bind value as parameter — never interpolated.
     if has_error is not None:
-        where = _LIST_TRACES_WHERE_HAS_ERROR
+        conditions.append("has_error = %(has_error)s")
         params["has_error"] = has_error
-    else:
-        where = ""
+    if service_name is not None:
+        conditions.append("root_service_name = %(service_name)s")
+        params["service_name"] = service_name
+    if request_id is not None:
+        conditions.append("request_id = %(request_id)s")
+        params["request_id"] = request_id
+    if session_id is not None:
+        conditions.append("session_id = %(session_id)s")
+        params["session_id"] = session_id
+    if min_duration_ms is not None:
+        conditions.append("trace_duration_ms >= %(min_duration_ms)s")
+        params["min_duration_ms"] = min_duration_ms
+    if max_duration_ms is not None:
+        conditions.append("trace_duration_ms <= %(max_duration_ms)s")
+        params["max_duration_ms"] = max_duration_ms
+    if search is not None:
+        conditions.append(
+            "(trace_id LIKE %(search)s OR request_id LIKE %(search)s OR session_id LIKE %(search)s)"
+        )
+        params["search"] = search + "%"
+
+    where = ("WHERE " + " AND ".join(conditions) + "\n") if conditions else ""
 
     count_sql = f"SELECT COUNT(*) FROM analytics.int_trace_spans\n{where}"
     page_sql = (

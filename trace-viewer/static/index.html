@@ -20,6 +20,20 @@
 
     <!-- LIST VIEW -->
     <div id="list-view">
+      <form id="filter-form" class="filter-form" autocomplete="off" aria-label="Trace filters">
+        <div class="filter-row">
+          <input id="search-input" class="filter-input filter-input-wide" type="text"
+                 placeholder="Trace / Request / Session ID" aria-label="Search by trace, request, or session ID">
+          <input id="service-input" class="filter-input" type="text"
+                 placeholder="Service name" aria-label="Filter by service name">
+          <input id="min-dur-input" class="filter-input filter-input-short" type="number"
+                 min="0" step="any" placeholder="Min ms" aria-label="Minimum duration in milliseconds">
+          <input id="max-dur-input" class="filter-input filter-input-short" type="number"
+                 min="0" step="any" placeholder="Max ms" aria-label="Maximum duration in milliseconds">
+          <button id="apply-filters-btn" class="filter-apply-btn" type="submit">Apply</button>
+          <button id="clear-filters-btn" class="filter-clear-btn" type="button">Clear</button>
+        </div>
+      </form>
       <div id="status-region" class="status-region" role="status" aria-live="polite" aria-atomic="true"></div>
       <div id="error-banner" class="error-banner hidden" role="alert">
         <span id="error-message" class="error-message"></span>
