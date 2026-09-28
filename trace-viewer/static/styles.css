@@ -477,6 +477,18 @@ body.detail-mode .filter-nav { display: none; }
 .health-ok    { color: var(--success); }
 .health-error { color: var(--error); }
 
+/* --- Failure summary banner (trace-level, error traces only) --- */
+.failure-summary {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 4px;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: var(--error);
+  margin-bottom: 12px;
+}
+.failure-summary.hidden { display: none; }
+
 /* --- Cycle warning banner --- */
 .cycle-warning {
   background: #2a2510;

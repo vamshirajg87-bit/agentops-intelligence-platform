@@ -79,7 +79,7 @@ function formatDuration(ms) {
 // ==========================================================================
 
 function isErrorSpan(span) {
-  return span.status_code === 'STATUS_CODE_ERROR' || span.error_type !== null;
+  return span.status_code === 'ERROR' || span.error_type !== null;
 }
 
 function getSpanType(span) {
@@ -102,6 +102,16 @@ function anySpanHasError(nodes) {
     if (anySpanHasError(node.children)) return true;
   }
   return false;
+}
+
+// Return the first error span found via depth-first preorder traversal, or null.
+function findFirstErrorSpan(nodes) {
+  for (const node of nodes) {
+    if (isErrorSpan(node.span)) return node.span;
+    const found = findFirstErrorSpan(node.children);
+    if (found) return found;
+  }
+  return null;
 }
 
 // ==========================================================================
@@ -387,7 +397,8 @@ async function openTraceDetail(traceId) {
   detailHealthEl.textContent = '';
   detailHealthEl.className = 'detail-meta-item';
 
-  // Clear previous tree content
+  // Clear previous content
+  clearFailureSummary();
   cycleWarningEl.classList.add('hidden');
   rootsContainer.replaceChildren();
   orphansSection.classList.add('hidden');
@@ -459,6 +470,15 @@ function renderDetail(data) {
                  anySpanHasError(data.cycle_members);
   detailHealthEl.textContent = hasErr ? 'Error' : 'Healthy';
   detailHealthEl.className   = 'detail-meta-item ' + (hasErr ? 'health-error' : 'health-ok');
+
+  if (hasErr) {
+    const errSpan = findFirstErrorSpan(data.roots) ||
+                    findFirstErrorSpan(data.orphans) ||
+                    findFirstErrorSpan(data.cycle_members);
+    renderFailureSummary(errSpan);
+  } else {
+    clearFailureSummary();
+  }
 
   cycleWarningEl.classList.toggle('hidden', !data.has_cycle);
 
@@ -591,6 +611,27 @@ function renderTreeNode(node, depth) {
   }
 
   return item;
+}
+
+// ==========================================================================
+// Failure summary banner
+// ==========================================================================
+
+function renderFailureSummary(errSpan) {
+  const el = document.getElementById('failure-summary');
+  if (!el || !errSpan) return;
+  let text = 'Failed at: ' + errSpan.span_name;
+  const errMsg = errSpan.error_message || errSpan.status_message;
+  if (errMsg) text += ' — ' + errMsg;
+  el.textContent = text;
+  el.classList.remove('hidden');
+}
+
+function clearFailureSummary() {
+  const el = document.getElementById('failure-summary');
+  if (!el) return;
+  el.textContent = '';
+  el.classList.add('hidden');
 }
 
 // ==========================================================================
