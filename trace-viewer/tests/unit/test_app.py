@@ -598,3 +598,96 @@ def test_list_traces_equal_min_max_is_valid():
         mock_lt.return_value = TraceListResult(total=0, traces=[])
         resp = client.get("/api/traces?min_duration_ms=100&max_duration_ms=100")
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Phase 9.8: Error span data contract — error_type and error_message in response
+#
+# These tests lock the API data contract that the JS findDeepestErrorSpan relies
+# on: the deepest ERROR span in a nested tree must expose error_type and
+# error_message so the failure-summary banner can show the originating failure
+# rather than a propagated ancestor error.
+# ---------------------------------------------------------------------------
+
+
+def test_get_trace_error_span_exposes_error_type():
+    """A span with error_type set serializes that field in the detail response."""
+    mock_conn = MagicMock()
+    span = _make_span_record(status_code="ERROR", error_type="ToolExecutionError")
+    recon = _make_reconstruction(roots=[TraceNode(span=span)])
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.get_trace_reconstruction", return_value=recon):
+        resp = client.get(f"/api/traces/{_VALID_TRACE_ID}")
+    assert resp.status_code == 200
+    assert resp.json()["roots"][0]["span"]["error_type"] == "ToolExecutionError"
+
+
+def test_get_trace_error_span_exposes_error_message():
+    """A span with error_message set serializes that field in the detail response."""
+    mock_conn = MagicMock()
+    span = _make_span_record(
+        status_code="ERROR",
+        error_type="ToolExecutionError",
+        error_message="External service unavailable: connection refused",
+    )
+    recon = _make_reconstruction(roots=[TraceNode(span=span)])
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.get_trace_reconstruction", return_value=recon):
+        resp = client.get(f"/api/traces/{_VALID_TRACE_ID}")
+    assert resp.status_code == 200
+    assert resp.json()["roots"][0]["span"]["error_message"] == (
+        "External service unavailable: connection refused"
+    )
+
+
+def test_get_trace_healthy_span_error_fields_are_null():
+    """Healthy spans serialize error_type and error_message as null."""
+    mock_conn = MagicMock()
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.get_trace_reconstruction", return_value=_make_reconstruction()):
+        resp = client.get(f"/api/traces/{_VALID_TRACE_ID}")
+    assert resp.status_code == 200
+    span_json = resp.json()["roots"][0]["span"]
+    assert span_json["error_type"] is None
+    assert span_json["error_message"] is None
+
+
+def test_get_trace_nested_error_span_data_contract():
+    """Child ERROR span error_type and error_message appear in the nested tree response.
+
+    This locks the data contract required by the JS findDeepestErrorSpan:
+    a child span that is the originating failure must carry error_type and
+    error_message through the API so the failure-summary banner can display
+    'Failed at: tool.execute — ToolExecutionError: ...' rather than the
+    propagated error on the parent root span.
+    """
+    mock_conn = MagicMock()
+    child_span = _make_span_record(
+        span_id="e" * 32,
+        parent_span_id="c" * 32,
+        span_name="tool.execute",
+        status_code="ERROR",
+        error_type="ToolExecutionError",
+        error_message=(
+            "External service unavailable: "
+            "connection refused to metadata.example.internal"
+        ),
+    )
+    parent_span = _make_span_record(span_name="agentops.request", status_code="ERROR")
+    recon = TraceReconstruction(
+        roots=[TraceNode(span=parent_span, children=[TraceNode(span=child_span)])],
+        orphans=[],
+        cycle_members=[],
+        has_cycle=False,
+        span_count=2,
+    )
+    with patch("app.connect", return_value=mock_conn), \
+         patch("app.get_trace_reconstruction", return_value=recon):
+        resp = client.get(f"/api/traces/{_VALID_TRACE_ID}")
+    assert resp.status_code == 200
+    body = resp.json()
+    child_json = body["roots"][0]["children"][0]["span"]
+    assert child_json["span_name"] == "tool.execute"
+    assert child_json["status_code"] == "ERROR"
+    assert child_json["error_type"] == "ToolExecutionError"
+    assert "unavailable" in child_json["error_message"]

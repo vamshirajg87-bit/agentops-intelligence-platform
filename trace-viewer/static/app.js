@@ -104,12 +104,14 @@ function anySpanHasError(nodes) {
   return false;
 }
 
-// Return the first error span found via depth-first preorder traversal, or null.
-function findFirstErrorSpan(nodes) {
+// Return the deepest originating error span via depth-first children-first traversal.
+// Prefers the most specific (leaf) ERROR span over a parent that propagated it,
+// so the failure summary names the source of the failure rather than its ancestor.
+function findDeepestErrorSpan(nodes) {
   for (const node of nodes) {
-    if (isErrorSpan(node.span)) return node.span;
-    const found = findFirstErrorSpan(node.children);
+    const found = findDeepestErrorSpan(node.children);
     if (found) return found;
+    if (isErrorSpan(node.span)) return node.span;
   }
   return null;
 }
@@ -472,9 +474,9 @@ function renderDetail(data) {
   detailHealthEl.className   = 'detail-meta-item ' + (hasErr ? 'health-error' : 'health-ok');
 
   if (hasErr) {
-    const errSpan = findFirstErrorSpan(data.roots) ||
-                    findFirstErrorSpan(data.orphans) ||
-                    findFirstErrorSpan(data.cycle_members);
+    const errSpan = findDeepestErrorSpan(data.roots) ||
+                    findDeepestErrorSpan(data.orphans) ||
+                    findDeepestErrorSpan(data.cycle_members);
     renderFailureSummary(errSpan);
   } else {
     clearFailureSummary();
