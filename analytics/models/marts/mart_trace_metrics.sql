@@ -1,4 +1,7 @@
-{{ config(materialized='table') }}
+{{ config(
+    materialized='table',
+    post_hook="GRANT SELECT ON {{ this }} TO anomaly_detector"
+) }}
 
 select
     trace_id,
