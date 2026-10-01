@@ -7,7 +7,7 @@ mapping, Phase 10.3 concrete detectors, and Phase 10.4D anomaly persistence.
 One call to a run_* method:
     1. Fetches telemetry rows for the requested window via a query function.
     2. Maps each row to the typed detector record.
-    3. For every record as current, calls detector.detect(current, history)
+    3. For every candidate record as current, calls detector.detect(current, history)
        where history = {records with start_time strictly less than current.start_time}.
     4. Persists each produced AnomalyEvent via AnomalyRepository.save().
     5. Returns a deterministic OrchestrationResult summary.
@@ -19,6 +19,22 @@ History rule
 Records with identical start_time are contemporaneous; neither appears in the
 other's history.  SQL ORDER BY tie-breakers (trace_id, span_id) govern
 iteration order only and are never used to establish temporal precedence.
+
+candidate_after (Phase 10.5)
+----------------------------
+All run_* methods accept an optional keyword argument candidate_after.
+
+When supplied, records fetched from [window_start, window_end) are split:
+
+    history-only  : start_time < candidate_after
+    candidates    : start_time >= candidate_after
+
+History-only records contribute to baselines but are never passed as current
+to detector.detect().  This allows the runner to widen window_start to include
+baseline context without re-evaluating already-processed observations.
+
+When candidate_after is None (the default), all records are candidates and
+behavior is identical to the locked Phase 10.4E implementation.
 
 No scheduling, checkpointing, watermarks, or runner behavior is implemented
 here.  Those concerns belong to Phase 10.5.
@@ -74,6 +90,8 @@ class OrchestrationResult:
     Immutable summary of one orchestration invocation.
 
     Invariant: inserted_anomalies + duplicate_anomalies == detected_anomalies
+    processed_observations counts candidate records only (start_time >= candidate_after
+    when candidate_after is supplied; all records otherwise).
     """
     processed_observations: int
     detected_anomalies: int
@@ -128,6 +146,8 @@ class AnomalyOrchestrator:
         operation_name: str,
         window_start: datetime,
         window_end: datetime,
+        *,
+        candidate_after: Optional[datetime] = None,
     ) -> OrchestrationResult:
         rows = fetch_trace_latency_history(
             self._conn,
@@ -136,7 +156,10 @@ class AnomalyOrchestrator:
             window_start=window_start,
             window_end=window_end,
         )
-        return self._orchestrate(rows, row_to_trace_latency_record, self._trace_latency_detector)
+        return self._orchestrate(
+            rows, row_to_trace_latency_record, self._trace_latency_detector,
+            candidate_after=candidate_after,
+        )
 
     def run_agent_latency(
         self,
@@ -144,6 +167,8 @@ class AnomalyOrchestrator:
         operation_name: str,
         window_start: datetime,
         window_end: datetime,
+        *,
+        candidate_after: Optional[datetime] = None,
     ) -> OrchestrationResult:
         rows = fetch_agent_latency_history(
             self._conn,
@@ -152,13 +177,18 @@ class AnomalyOrchestrator:
             window_start=window_start,
             window_end=window_end,
         )
-        return self._orchestrate(rows, row_to_span_latency_record, self._agent_latency_detector)
+        return self._orchestrate(
+            rows, row_to_span_latency_record, self._agent_latency_detector,
+            candidate_after=candidate_after,
+        )
 
     def run_tool_latency(
         self,
         service_name: str,
         window_start: datetime,
         window_end: datetime,
+        *,
+        candidate_after: Optional[datetime] = None,
     ) -> OrchestrationResult:
         rows = fetch_tool_latency_history(
             self._conn,
@@ -166,13 +196,18 @@ class AnomalyOrchestrator:
             window_start=window_start,
             window_end=window_end,
         )
-        return self._orchestrate(rows, row_to_span_latency_record, self._tool_latency_detector)
+        return self._orchestrate(
+            rows, row_to_span_latency_record, self._tool_latency_detector,
+            candidate_after=candidate_after,
+        )
 
     def run_retrieval(
         self,
         service_name: str,
         window_start: datetime,
         window_end: datetime,
+        *,
+        candidate_after: Optional[datetime] = None,
     ) -> OrchestrationResult:
         rows = fetch_retrieval_history(
             self._conn,
@@ -180,7 +215,10 @@ class AnomalyOrchestrator:
             window_start=window_start,
             window_end=window_end,
         )
-        return self._orchestrate(rows, row_to_retrieval_record, self._retrieval_detector)
+        return self._orchestrate(
+            rows, row_to_retrieval_record, self._retrieval_detector,
+            candidate_after=candidate_after,
+        )
 
     def run_error_rate(
         self,
@@ -188,6 +226,8 @@ class AnomalyOrchestrator:
         operation_name: str,
         window_start: datetime,
         window_end: datetime,
+        *,
+        candidate_after: Optional[datetime] = None,
     ) -> OrchestrationResult:
         rows = fetch_error_rate_history(
             self._conn,
@@ -196,13 +236,18 @@ class AnomalyOrchestrator:
             window_start=window_start,
             window_end=window_end,
         )
-        return self._orchestrate(rows, row_to_error_record, self._error_rate_detector)
+        return self._orchestrate(
+            rows, row_to_error_record, self._error_rate_detector,
+            candidate_after=candidate_after,
+        )
 
     def run_tool_failure(
         self,
         service_name: str,
         window_start: datetime,
         window_end: datetime,
+        *,
+        candidate_after: Optional[datetime] = None,
     ) -> OrchestrationResult:
         rows = fetch_tool_failure_history(
             self._conn,
@@ -210,7 +255,45 @@ class AnomalyOrchestrator:
             window_start=window_start,
             window_end=window_end,
         )
-        return self._orchestrate(rows, row_to_tool_record, self._tool_failure_detector)
+        return self._orchestrate(
+            rows, row_to_tool_record, self._tool_failure_detector,
+            candidate_after=candidate_after,
+        )
+
+    # ------------------------------------------------------------------
+    # Public query methods
+    # ------------------------------------------------------------------
+
+    def history_days_for(self, signal_path: str) -> int:
+        """
+        Return the configured baseline_window_days for the detector used by
+        signal_path.  The runner uses this to compute how far before
+        evaluation_start it must query in order to supply sufficient baseline
+        context to each candidate observation.
+
+        For 'retrieval', returns the maximum of the relevance and count
+        detector configs because both signals must have full baseline coverage.
+
+        Raises ValueError for unknown signal_path values so that callers fail
+        loudly rather than silently querying an insufficient history window.
+        """
+        _table = {
+            "trace_latency": self._trace_latency_detector.config.baseline_window_days,
+            "agent_latency": self._agent_latency_detector.config.baseline_window_days,
+            "tool_latency":  self._tool_latency_detector.config.baseline_window_days,
+            "retrieval": max(
+                self._retrieval_detector.relevance_config.baseline_window_days,
+                self._retrieval_detector.count_config.baseline_window_days,
+            ),
+            "error_rate":    self._error_rate_detector.config.baseline_window_days,
+            "tool_failure":  self._tool_failure_detector.config.baseline_window_days,
+        }
+        if signal_path not in _table:
+            raise ValueError(
+                f"unknown signal_path {signal_path!r}; "
+                f"valid paths: {sorted(_table)}"
+            )
+        return _table[signal_path]
 
     # ------------------------------------------------------------------
     # Private orchestration core
@@ -221,21 +304,35 @@ class AnomalyOrchestrator:
         rows: list[dict[str, Any]],
         mapper: Callable[[Mapping[str, Any]], Any],
         detector: Any,
+        *,
+        candidate_after: Optional[datetime] = None,
     ) -> OrchestrationResult:
         """
-        Map rows to records, evaluate each as current against prior-timestamp
-        history, persist produced anomalies, and return a summary.
+        Map rows to records, evaluate candidates against prior-timestamp history,
+        persist produced anomalies, and return a summary.
 
         History contract: history = [r for r in records if r.start_time < current.start_time]
         Records with equal start_time are contemporaneous; neither is in the other's history.
+
+        candidate_after: when set, records with start_time < candidate_after contribute
+        to baselines but are never passed as current to detector.detect().  Records
+        with start_time >= candidate_after are candidates.  When None, all records are
+        candidates — identical to locked Phase 10.4E behavior.
+        processed_observations counts candidates only.
         """
         records = [mapper(row) for row in rows]
+
+        candidates = (
+            records
+            if candidate_after is None
+            else [r for r in records if r.start_time >= candidate_after]
+        )
 
         detected = 0
         inserted = 0
         duplicate = 0
 
-        for current in records:
+        for current in candidates:
             history = [r for r in records if r.start_time < current.start_time]
             events: list[AnomalyEvent] = detector.detect(current, history)
             detected += len(events)
@@ -246,7 +343,7 @@ class AnomalyOrchestrator:
                     duplicate += 1
 
         return OrchestrationResult(
-            processed_observations=len(records),
+            processed_observations=len(candidates),
             detected_anomalies=detected,
             inserted_anomalies=inserted,
             duplicate_anomalies=duplicate,
