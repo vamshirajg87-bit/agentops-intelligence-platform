@@ -11,7 +11,7 @@ select
     -- would double-count work that executed concurrently within the same interval.
     min(start_time)                                                    as trace_start_time,
     max(end_time)                                                      as trace_end_time,
-    extract(epoch from (max(end_time) - min(start_time))) * 1000.0    as trace_duration_ms,
+    (extract(epoch from (max(end_time) - min(start_time))) * 1000.0)::double precision as trace_duration_ms,
 
     -- Root span metadata via conditional aggregation.
     -- Groups only by trace_id; root fields are extracted without additional GROUP BY

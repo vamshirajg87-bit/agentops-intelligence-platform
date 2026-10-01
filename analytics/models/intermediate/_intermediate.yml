@@ -15,3 +15,12 @@ models:
         data_tests:
           - not_null
           - unique
+      - name: trace_duration_ms
+        description: >
+          Wall-clock duration of the trace in milliseconds (double precision).
+          Derived as (max(end_time) - min(start_time)) converted to ms.
+          Explicitly cast to DOUBLE PRECISION so psycopg3 delivers float, not
+          decimal.Decimal — the anomaly detector record mapper relies on native
+          type delivery without coercion.
+        data_tests:
+          - not_null
