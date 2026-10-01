@@ -80,7 +80,10 @@ def main(argv: list[str] | None = None) -> None:
         # receives the raw exception.").  db.connect() raises RuntimeError for a
         # missing password (db.py:35-38) and psycopg.OperationalError for a
         # failed connection attempt.  Those are the only exceptions that reach here.
-        logging.error("Database startup failure: %s", exc)
+        logging.error(
+            "Database startup failure (%s): verify ANOMALY_DETECTOR_DB_* environment variables",
+            type(exc).__name__,
+        )
         sys.exit(4)
 
     _log_result(result)

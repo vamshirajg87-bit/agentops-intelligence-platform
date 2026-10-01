@@ -256,6 +256,34 @@ class TestExitCodes:
                 main.main(["--config", "cfg.json"])
         assert exc_info.value.code == 130
 
+    def test_startup_db_error_raw_message_not_logged(self, caplog):
+        raw_msg = "FATAL: password authentication failed for user 'anomaly_detector'"
+        with caplog.at_level(logging.ERROR):
+            with patch("main.load_config", return_value=_make_config()), \
+                 patch("main.run_all_groups",
+                       side_effect=psycopg.OperationalError(raw_msg)):
+                with pytest.raises(SystemExit):
+                    main.main(["--config", "cfg.json"])
+        assert raw_msg not in caplog.text
+
+    def test_startup_db_error_logs_exception_type(self, caplog):
+        with caplog.at_level(logging.ERROR):
+            with patch("main.load_config", return_value=_make_config()), \
+                 patch("main.run_all_groups",
+                       side_effect=RuntimeError("ANOMALY_DETECTOR_DB_PASSWORD not set")):
+                with pytest.raises(SystemExit):
+                    main.main(["--config", "cfg.json"])
+        assert "RuntimeError" in caplog.text
+
+    def test_startup_db_error_logs_env_var_guidance(self, caplog):
+        with caplog.at_level(logging.ERROR):
+            with patch("main.load_config", return_value=_make_config()), \
+                 patch("main.run_all_groups",
+                       side_effect=psycopg.OperationalError("conn refused")):
+                with pytest.raises(SystemExit):
+                    main.main(["--config", "cfg.json"])
+        assert "ANOMALY_DETECTOR_DB_" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # 13-14: Config path forwarding
