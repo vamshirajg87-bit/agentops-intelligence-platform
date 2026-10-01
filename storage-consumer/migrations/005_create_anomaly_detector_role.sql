@@ -51,6 +51,12 @@ TO anomaly_detector;
 -- INSERT only — no UPDATE, no DELETE.
 GRANT INSERT ON public.anomaly_events TO anomaly_detector;
 
+-- Conflict-resolution read: ON CONFLICT (anomaly_id) DO NOTHING requires the
+-- executor to read the anomaly_id column to detect duplicate keys.
+-- A column-level SELECT on anomaly_id alone satisfies this without granting
+-- full-table SELECT on public.anomaly_events.
+GRANT SELECT (anomaly_id) ON public.anomaly_events TO anomaly_detector;
+
 -- NOTE — dbt DROP+CREATE lifecycle:
 -- dbt materializes mart tables with DROP + CREATE TABLE on each run (under the
 -- agentops role), which replaces the table object and silently drops all
