@@ -221,3 +221,49 @@ def assess_confidence(
     # 4. HIGH
     # ------------------------------------------------------------------
     return "HIGH"
+
+
+# ---------------------------------------------------------------------------
+# Public signal interface (Phase 11.6 additions — interface-only; no new logic)
+# ---------------------------------------------------------------------------
+# Each public symbol below delegates to or aliases the canonical private
+# constant or helper defined above.  All existing private symbols are
+# unchanged; no confidence semantics are altered.
+
+def derive_signal(anomaly: RcaAnomalyRecord) -> str:
+    """
+    Map anomaly to its canonical signal name.
+
+    Public delegation to _derive_signal.  Behavior is identical.
+
+    Returns one of: 'trace_latency', 'agent_latency', 'tool_latency',
+    'retrieval_quality', 'error_rate', 'tool_failure'.
+    """
+    return _derive_signal(anomaly)
+
+
+def signal_threshold(signal: str) -> float:
+    """
+    Return the minimum evidence_score for MEDIUM or HIGH confidence.
+
+    This is the inclusive lower bound used in assess_confidence() to
+    distinguish LOW from not-LOW for the given signal.  An unknown signal
+    returns 0.40 (the _SIGNAL_THRESHOLDS.get default).
+    """
+    return _SIGNAL_THRESHOLDS.get(signal, 0.40)
+
+
+#: Public alias for the frozenset of signal names that require a direct
+#: subject span to reach MEDIUM or HIGH confidence.
+#: ``_SPAN_SPECIFIC_SIGNALS`` is the single source of truth.
+SPAN_SPECIFIC_SIGNALS: frozenset[str] = _SPAN_SPECIFIC_SIGNALS
+
+
+def orphan_fraction(reconstruction: TraceReconstruction) -> float:
+    """
+    Fraction of total spans belonging to orphan subtrees.
+
+    Public delegation to _orphan_fraction.  Behavior is identical.
+    Returns 0.0 for an empty reconstruction.
+    """
+    return _orphan_fraction(reconstruction)
