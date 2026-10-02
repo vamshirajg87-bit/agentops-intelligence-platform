@@ -40,7 +40,17 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from typing import Optional
 
-from rca_confidence import assess_confidence
+from rca_confidence import (
+    assess_confidence,
+    derive_signal,
+    signal_threshold,
+    SPAN_SPECIFIC_SIGNALS,
+    orphan_fraction,
+    _derive_signal,
+    _SIGNAL_THRESHOLDS,
+    _SPAN_SPECIFIC_SIGNALS,
+    _orphan_fraction,
+)
 from rca_models import SpanEvidence
 from rca_ranker import score_and_rank
 from rca_evidence import UnscoredSpanFacts
@@ -725,3 +735,122 @@ class TestHigh:
 
         assert evidence[0].evidence_score == pytest.approx(0.88, abs=1e-9)
         assert assess_confidence(anomaly, evidence, recon) == "HIGH"
+
+
+# ---------------------------------------------------------------------------
+# Public signal API (Phase 11.6 interface-only additions)
+# ---------------------------------------------------------------------------
+
+class TestPublicSignalAPI:
+    """
+    Regression tests for the four public symbols extracted in Phase 11.6.
+    Each public symbol must delegate faithfully to the private canonical
+    implementation it wraps; no new logic is permitted.
+    """
+
+    # ----- derive_signal -----
+
+    def test_derive_signal_trace_latency(self):
+        a = _make_anomaly(anomaly_type="latency", operation_name="trace")
+        assert derive_signal(a) == "trace_latency"
+
+    def test_derive_signal_tool_latency(self):
+        a = _make_anomaly(anomaly_type="latency", operation_name="tool.execute")
+        assert derive_signal(a) == "tool_latency"
+
+    def test_derive_signal_agent_latency(self):
+        a = _make_anomaly(anomaly_type="latency", operation_name="research/plan")
+        assert derive_signal(a) == "agent_latency"
+
+    def test_derive_signal_retrieval_quality(self):
+        a = _make_anomaly(anomaly_type="retrieval_quality",
+                          operation_name="retrieval.search")
+        assert derive_signal(a) == "retrieval_quality"
+
+    def test_derive_signal_error_rate(self):
+        a = _make_anomaly(anomaly_type="error_rate", operation_name="some_op")
+        assert derive_signal(a) == "error_rate"
+
+    def test_derive_signal_tool_failure(self):
+        a = _make_anomaly(anomaly_type="tool_failure",
+                          operation_name="tool.execute/Timeout")
+        assert derive_signal(a) == "tool_failure"
+
+    def test_derive_signal_agrees_with_private(self):
+        cases = [
+            ("latency", "trace"),
+            ("latency", "tool.execute"),
+            ("latency", "research/plan"),
+            ("retrieval_quality", None),
+            ("error_rate", None),
+            ("tool_failure", "tool.execute/TypeError"),
+        ]
+        for atype, op in cases:
+            a = _make_anomaly(anomaly_type=atype, operation_name=op)
+            assert derive_signal(a) == _derive_signal(a), f"Mismatch for {atype}/{op}"
+
+    # ----- signal_threshold -----
+
+    def test_signal_threshold_all_known_signals(self):
+        expected = {
+            "trace_latency": 0.50,
+            "agent_latency": 0.40,
+            "tool_latency": 0.40,
+            "retrieval_quality": 0.50,
+            "error_rate": 0.40,
+            "tool_failure": 0.40,
+        }
+        for sig, thr in expected.items():
+            assert signal_threshold(sig) == pytest.approx(thr), f"Signal: {sig}"
+
+    def test_signal_threshold_unknown_defaults_to_040(self):
+        assert signal_threshold("nonexistent_signal") == pytest.approx(0.40)
+
+    # ----- SPAN_SPECIFIC_SIGNALS -----
+
+    def test_span_specific_signals_membership(self):
+        expected = frozenset({
+            "agent_latency", "tool_latency", "retrieval_quality",
+            "error_rate", "tool_failure",
+        })
+        assert SPAN_SPECIFIC_SIGNALS == expected
+
+    def test_span_specific_signals_is_private_alias(self):
+        assert SPAN_SPECIFIC_SIGNALS is _SPAN_SPECIFIC_SIGNALS
+
+    # ----- orphan_fraction -----
+
+    def test_orphan_fraction_empty_reconstruction(self):
+        recon = _minimal_reconstruction(span_count=0, n_roots=0, n_orphans=0)
+        assert orphan_fraction(recon) == pytest.approx(0.0)
+
+    def test_orphan_fraction_no_orphans(self):
+        recon = _minimal_reconstruction(span_count=3, n_orphans=0, n_roots=1)
+        assert orphan_fraction(recon) == pytest.approx(0.0)
+
+    def test_orphan_fraction_with_orphans(self):
+        # 1 orphan node (no children), 1 root → span_count=2 → fraction = 0.50
+        orphan = TraceNode(
+            span=_make_span_record("o1", "absent"), children=[], depth=0,
+        )
+        root = TraceNode(
+            span=_make_span_record("root", None), children=[], depth=0,
+        )
+        recon = TraceReconstruction(
+            roots=[root], orphans=[orphan], cycle_members=[],
+            has_cycle=False, span_count=2, trace_duration_ms=100.0,
+        )
+        assert orphan_fraction(recon) == pytest.approx(0.50)
+
+    def test_orphan_fraction_agrees_with_private(self):
+        orphan = TraceNode(
+            span=_make_span_record("o1", "absent"), children=[], depth=0,
+        )
+        root = TraceNode(
+            span=_make_span_record("root", None), children=[], depth=0,
+        )
+        recon = TraceReconstruction(
+            roots=[root], orphans=[orphan], cycle_members=[],
+            has_cycle=False, span_count=2, trace_duration_ms=100.0,
+        )
+        assert orphan_fraction(recon) == pytest.approx(_orphan_fraction(recon))
