@@ -51,6 +51,13 @@ investigation is excluded.
 Ordering is cosine distance ASC, then investigation_id ASC.  The search is
 exact; there is no similarity threshold.
 
+Investigation context (Phase 12.7)
+----------------------------------
+One batch SELECT returns the presentation fields of several investigations
+at once, so historical context needs a single query rather than one per
+match.  Rows come back ordered by investigation_id; callers that need another
+order look rows up by id.
+
 Public API:
     EMBEDDING_COLUMN_DIMENSION      — dimension of the embedding column (384)
     fetch_investigation()           — one investigation, or None
@@ -58,6 +65,7 @@ Public API:
     fetch_stored_document_text()    — document_text of an embedding, or None
     insert_embedding()              — insert one row; True if inserted
     fetch_similar_investigations()  — ranked (investigation_id, similarity)
+    fetch_investigation_contexts()  — presentation fields for a set of ids
 """
 
 from __future__ import annotations
@@ -163,6 +171,22 @@ WHERE c.doc_version = %(doc_version)s
   AND c.investigation_id <> %(investigation_id)s
 ORDER BY c.embedding <=> q.embedding ASC, c.investigation_id ASC
 LIMIT %(top_k)s
+"""
+
+_SQL_FETCH_INVESTIGATION_CONTEXTS = """\
+SELECT
+    investigation_id,
+    anomaly_type,
+    service_name,
+    operation_name,
+    confidence,
+    severity,
+    event_time,
+    summary,
+    limitations
+FROM public.rca_investigations
+WHERE investigation_id = ANY(%(investigation_ids)s)
+ORDER BY investigation_id ASC
 """
 
 
@@ -354,3 +378,29 @@ def fetch_similar_investigations(
         rows = cur.fetchall()
 
     return [(row["investigation_id"], row["similarity"]) for row in rows]
+
+
+def fetch_investigation_contexts(
+    conn: psycopg.Connection,
+    investigation_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """
+    Fetch the presentation fields of several investigations in one query.
+
+    Returns one dict per investigation found, with the keys
+    investigation_id, anomaly_type, service_name, operation_name, confidence,
+    severity, event_time, summary, limitations, ordered investigation_id ASC.
+    Ids that do not exist are simply absent from the result; the caller
+    decides whether that is an error.
+
+    Read-only.  Does not commit or roll back.
+
+    Raises:
+        psycopg.Error  on any database error.
+    """
+    params = {"investigation_ids": list(investigation_ids)}
+    with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(_SQL_FETCH_INVESTIGATION_CONTEXTS, params)
+        rows = cur.fetchall()
+
+    return [dict(row) for row in rows]

@@ -18,6 +18,8 @@ Test inventory:
     ST08  Import boundary
     ST09  Similarity SELECT (Phase 12.6): shape, filters, ordering
     ST10  fetch_similar_investigations (Phase 12.6)
+    ST11  Investigation-context SELECT (Phase 12.7): shape, grants
+    ST12  fetch_investigation_contexts (Phase 12.7)
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from embedding_store import (
     EMBEDDING_COLUMN_DIMENSION,
     fetch_evidence,
     fetch_investigation,
+    fetch_investigation_contexts,
     fetch_similar_investigations,
     fetch_stored_document_text,
     insert_embedding,
@@ -66,6 +69,7 @@ _ALL_SQL = {
     "fetch_stored_document_text": embedding_store._SQL_FETCH_STORED_DOCUMENT_TEXT,
     "insert_embedding": embedding_store._SQL_INSERT_EMBEDDING,
     "fetch_similar_investigations": embedding_store._SQL_FETCH_SIMILAR_INVESTIGATIONS,
+    "fetch_investigation_contexts": embedding_store._SQL_FETCH_INVESTIGATION_CONTEXTS,
 }
 
 _INVESTIGATION_COLUMNS = [
@@ -323,7 +327,7 @@ class TestSqlSafety:
     def test_no_do_update(self):
         assert "DO UPDATE" not in _normalise(_ALL_SQL["insert_embedding"]).upper()
 
-    def test_exactly_five_sql_statements_in_module(self):
+    def test_exactly_six_sql_statements_in_module(self):
         tree = ast.parse(open(_MODULE_PATH, encoding="utf-8").read())
         constants = [
             node.targets[0].id for node in tree.body
@@ -332,13 +336,14 @@ class TestSqlSafety:
         ]
         assert sorted(constants) == [
             "_SQL_FETCH_EVIDENCE", "_SQL_FETCH_INVESTIGATION",
+            "_SQL_FETCH_INVESTIGATION_CONTEXTS",
             "_SQL_FETCH_SIMILAR_INVESTIGATIONS",
             "_SQL_FETCH_STORED_DOCUMENT_TEXT", "_SQL_INSERT_EMBEDDING",
         ]
         assert sorted(constants) == sorted(
             name for name in vars(embedding_store) if name.startswith("_SQL_")
         )
-        assert len(_ALL_SQL) == 5
+        assert len(_ALL_SQL) == 6
 
     def test_exactly_one_write_statement(self):
         writes = [n for n, sql in _ALL_SQL.items() if re.search(r"\bINSERT\b", sql, re.IGNORECASE)]
@@ -944,3 +949,211 @@ class TestFetchSimilarInvestigations:
         _similar(conn)
         _similar(conn)
         assert cur.execute.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# ST11  Investigation-context SELECT (Phase 12.7)
+# ---------------------------------------------------------------------------
+
+_CONTEXT_SQL = embedding_store._SQL_FETCH_INVESTIGATION_CONTEXTS
+
+_APPROVED_CONTEXT_SQL = """\
+SELECT
+    investigation_id,
+    anomaly_type,
+    service_name,
+    operation_name,
+    confidence,
+    severity,
+    event_time,
+    summary,
+    limitations
+FROM public.rca_investigations
+WHERE investigation_id = ANY(%(investigation_ids)s)
+ORDER BY investigation_id ASC
+"""
+
+_CONTEXT_COLUMNS = [
+    "investigation_id", "anomaly_type", "service_name", "operation_name",
+    "confidence", "severity", "event_time", "summary", "limitations",
+]
+
+
+def _context_row(investigation_id: str = _INV, **overrides) -> dict:
+    import datetime
+
+    row = {
+        "investigation_id": investigation_id,
+        "anomaly_type": "tool_failure",
+        "service_name": "agentops-demo-app",
+        "operation_name": "tool.execute/ToolExecutionError",
+        "confidence": "HIGH",
+        "severity": "CRITICAL",
+        "event_time": datetime.datetime(2026, 9, 28, 14, 2, 11, tzinfo=datetime.timezone.utc),
+        "summary": "Span 'tool.execute' showed the strongest contributing evidence.",
+        "limitations": ["tool_name_absent"],
+    }
+    row.update(overrides)
+    return row
+
+
+class TestContextSqlShape:
+
+    def test_matches_the_approved_statement(self):
+        assert _normalise(_CONTEXT_SQL) == _normalise(_APPROVED_CONTEXT_SQL)
+
+    def test_columns_exact(self):
+        assert _select_columns(_CONTEXT_SQL) == _CONTEXT_COLUMNS
+
+    def test_exactly_nine_columns(self):
+        assert len(_select_columns(_CONTEXT_SQL)) == 9
+
+    def test_every_column_is_granted_by_migration_011(self):
+        assert set(_CONTEXT_COLUMNS) <= _granted_columns("public.rca_investigations")
+
+    def test_only_trace_span_count_of_the_granted_columns_is_unused(self):
+        assert _granted_columns("public.rca_investigations") - set(_CONTEXT_COLUMNS) == {
+            "trace_span_count",
+        }
+
+    @pytest.mark.parametrize(
+        "ungranted",
+        ["anomaly_id", "analyzer_version", "investigated_at", "trace_id",
+         "subject_span_id", "observed_value", "baseline_median", "anomaly_score",
+         "trace_span_count"],
+    )
+    def test_excluded_column_not_selected(self, ungranted):
+        assert not re.search(rf"\b{ungranted}\b", _CONTEXT_SQL)
+
+    def test_columns_exist_in_migration_007(self):
+        migration_007 = os.path.join(
+            _COMPONENT_DIR, "..", "storage-consumer", "migrations",
+            "007_create_rca_tables.sql",
+        )
+        with open(migration_007, encoding="utf-8") as fh:
+            table = fh.read().split("CREATE TABLE public.rca_evidence")[0]
+        for column in _CONTEXT_COLUMNS:
+            assert re.search(rf"^\s+{column}\s+[A-Z]", table, re.MULTILINE), column
+
+    def test_reads_only_rca_investigations(self):
+        tables = set(re.findall(r"\b(?:FROM|JOIN)\s+([\w.]+)", _CONTEXT_SQL))
+        assert tables == {"public.rca_investigations"}
+
+    def test_no_evidence_or_embedding_table(self):
+        assert "rca_evidence" not in _CONTEXT_SQL
+        assert "rca_investigation_embeddings" not in _CONTEXT_SQL
+
+    def test_batch_filter_uses_any_with_one_bound_parameter(self):
+        assert "WHERE investigation_id = ANY(%(investigation_ids)s)" in _CONTEXT_SQL
+        assert re.findall(r"%\((\w+)\)s", _CONTEXT_SQL) == ["investigation_ids"]
+
+    def test_deterministic_order(self):
+        assert _normalise(_CONTEXT_SQL).endswith("ORDER BY investigation_id ASC")
+
+    def test_no_limit_or_literals(self):
+        assert not re.search(r"\bLIMIT\b", _CONTEXT_SQL, re.IGNORECASE)
+        assert "'" not in _CONTEXT_SQL
+        assert not re.search(r"\d", _CONTEXT_SQL)
+
+    def test_read_only(self):
+        upper = _CONTEXT_SQL.upper()
+        for keyword in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "FOR UPDATE", "FOR SHARE", "LOCK"):
+            assert keyword not in upper
+        assert upper.lstrip().startswith("SELECT")
+
+    def test_no_similarity_or_vector_content(self):
+        for fragment in ("<=>", "similarity", "embedding", "::vector"):
+            assert fragment not in _CONTEXT_SQL
+
+
+# ---------------------------------------------------------------------------
+# ST12  fetch_investigation_contexts (Phase 12.7)
+# ---------------------------------------------------------------------------
+
+class TestFetchInvestigationContexts:
+
+    def test_returns_one_dict_per_row(self):
+        rows = [_context_row("b" * 64), _context_row("c" * 64, confidence="LOW")]
+        conn, _ = _make_conn(fetchall=rows)
+        result = fetch_investigation_contexts(conn, ["b" * 64, "c" * 64])
+        assert result == rows
+        assert type(result) is list
+        assert all(type(row) is dict for row in result)
+
+    def test_rows_are_copies_with_exactly_the_nine_keys(self):
+        row = _context_row()
+        conn, _ = _make_conn(fetchall=[row])
+        result = fetch_investigation_contexts(conn, [_INV])
+        assert result[0] is not row
+        assert list(result[0]) == _CONTEXT_COLUMNS
+
+    def test_cursor_order_is_preserved(self):
+        rows = [_context_row("c" * 64), _context_row("b" * 64)]
+        conn, _ = _make_conn(fetchall=rows)
+        result = fetch_investigation_contexts(conn, ["b" * 64, "c" * 64])
+        assert [row["investigation_id"] for row in result] == ["c" * 64, "b" * 64]
+
+    def test_values_are_not_modified(self):
+        row = _context_row(
+            service_name=None, operation_name=None, summary="  padded \n text ",
+            limitations=[],
+        )
+        conn, _ = _make_conn(fetchall=[row])
+        assert fetch_investigation_contexts(conn, [_INV]) == [row]
+
+    def test_empty_result(self):
+        conn, _ = _make_conn(fetchall=[])
+        assert fetch_investigation_contexts(conn, [_INV]) == []
+
+    def test_missing_ids_are_simply_absent(self):
+        conn, _ = _make_conn(fetchall=[_context_row("b" * 64)])
+        result = fetch_investigation_contexts(conn, ["b" * 64, "c" * 64])
+        assert [row["investigation_id"] for row in result] == ["b" * 64]
+
+    def test_executes_the_sql_constant_once(self):
+        conn, cur = _make_conn(fetchall=[])
+        fetch_investigation_contexts(conn, [_INV, "b" * 64, "c" * 64])
+        assert cur.execute.call_count == 1
+        assert cur.execute.call_args.args[0] is embedding_store._SQL_FETCH_INVESTIGATION_CONTEXTS
+
+    def test_ids_bound_as_one_list_parameter(self):
+        conn, cur = _make_conn(fetchall=[])
+        fetch_investigation_contexts(conn, [_INV, "b" * 64])
+        assert cur.execute.call_args.args[1] == {"investigation_ids": [_INV, "b" * 64]}
+        assert type(cur.execute.call_args.args[1]["investigation_ids"]) is list
+
+    def test_tuple_of_ids_is_bound_as_a_list(self):
+        conn, cur = _make_conn(fetchall=[])
+        fetch_investigation_contexts(conn, (_INV, "b" * 64))
+        assert cur.execute.call_args.args[1] == {"investigation_ids": [_INV, "b" * 64]}
+
+    def test_id_order_and_duplicates_are_passed_through(self):
+        conn, cur = _make_conn(fetchall=[])
+        fetch_investigation_contexts(conn, ["c", "a", "c"])
+        assert cur.execute.call_args.args[1]["investigation_ids"] == ["c", "a", "c"]
+
+    def test_input_sequence_is_not_mutated(self):
+        ids = [_INV, "b" * 64]
+        conn, _ = _make_conn(fetchall=[])
+        fetch_investigation_contexts(conn, ids)
+        assert ids == [_INV, "b" * 64]
+
+    def test_uses_dict_row_cursor(self):
+        conn, _ = _make_conn(fetchall=[])
+        fetch_investigation_contexts(conn, [_INV])
+        conn.cursor.assert_called_once_with(row_factory=psycopg.rows.dict_row)
+
+    def test_no_commit_rollback_or_close(self):
+        conn, _ = _make_conn(fetchall=[_context_row()])
+        fetch_investigation_contexts(conn, [_INV])
+        conn.commit.assert_not_called()
+        conn.rollback.assert_not_called()
+        conn.close.assert_not_called()
+
+    def test_database_error_propagates_without_transaction_management(self):
+        conn, cur = _make_conn()
+        cur.execute.side_effect = psycopg.OperationalError("boom")
+        with pytest.raises(psycopg.OperationalError):
+            fetch_investigation_contexts(conn, [_INV])
+        conn.commit.assert_not_called()
+        conn.rollback.assert_not_called()

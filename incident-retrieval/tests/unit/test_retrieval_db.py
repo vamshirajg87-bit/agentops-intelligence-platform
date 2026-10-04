@@ -255,6 +255,39 @@ class TestImportBoundary:
         ]
         assert sorted(defaults) == ["5432", "agentops", "incident_retrieval", "localhost"]
 
+    def test_database_error_is_the_driver_base_error(self):
+        """Callers catch database errors through this name without importing the driver."""
+        assert retrieval_db.DatabaseError is psycopg.Error
+
+    @pytest.mark.parametrize(
+        "error_type",
+        [psycopg.OperationalError, psycopg.DatabaseError, psycopg.InterfaceError,
+         psycopg.ProgrammingError, psycopg.IntegrityError, psycopg.DataError],
+    )
+    def test_database_error_catches_every_driver_error(self, error_type):
+        assert issubclass(error_type, retrieval_db.DatabaseError)
+        with pytest.raises(retrieval_db.DatabaseError):
+            raise error_type("boom")
+
+    def test_database_error_does_not_catch_unrelated_errors(self):
+        for unrelated in (RuntimeError, ValueError, KeyError, OSError):
+            assert not issubclass(unrelated, retrieval_db.DatabaseError)
+
+    def test_connect_error_is_catchable_through_the_alias(self, fake_connect, monkeypatch):
+        monkeypatch.setenv("INCIDENT_RETRIEVAL_DB_PASSWORD", "pw")
+        fake_connect.side_effect = psycopg.OperationalError("connection refused")
+        with pytest.raises(retrieval_db.DatabaseError):
+            connect()
+
+    def test_missing_password_is_not_a_database_error(self, fake_connect):
+        with pytest.raises(RuntimeError) as excinfo:
+            connect()
+        assert not isinstance(excinfo.value, retrieval_db.DatabaseError)
+
+    def test_public_names(self):
+        public = {name for name in vars(retrieval_db) if not name.startswith("_")}
+        assert public == {"annotations", "os", "psycopg", "DatabaseError", "connect"}
+
     def test_only_environment_variables_with_the_component_prefix(self):
         tree = ast.parse(open(_MODULE_PATH, encoding="utf-8").read())
         names = [

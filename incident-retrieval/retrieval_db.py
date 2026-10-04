@@ -9,6 +9,9 @@ explicitly before calling connect().
 
 The returned connection is synchronous (psycopg 3). The caller is responsible
 for closing it.
+
+DatabaseError is the driver's base error type.  Callers that own a connection
+catch it through this name, so they do not need to import the driver.
 """
 
 from __future__ import annotations
@@ -16,6 +19,10 @@ from __future__ import annotations
 import os
 
 import psycopg
+
+
+#: Base class of every error raised by the database driver.
+DatabaseError = psycopg.Error
 
 
 def connect() -> psycopg.Connection:
