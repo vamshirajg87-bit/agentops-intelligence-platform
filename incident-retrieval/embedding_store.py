@@ -2,10 +2,12 @@
 incident-retrieval/embedding_store.py
 
 Phase 12.5: Database access for embedding persistence.
+Phase 12.6: Similarity query over stored embeddings.
 
-This module holds every SQL statement of the phase.  It reads the
-investigation and evidence fields that the incident document needs and writes
-one row to public.rca_investigation_embeddings.
+This module holds every SQL statement of the component.  It reads the
+investigation and evidence fields that the incident document needs, writes
+one row to public.rca_investigation_embeddings, and ranks stored embeddings
+by cosine similarity to one stored query embedding.
 
 Role
 ----
@@ -25,8 +27,8 @@ First-write-wins: an existing row is never overwritten.  No UPDATE, no DELETE.
 
 Transactions
 ------------
-Functions here never commit or roll back.  The caller (embedding_pipeline)
-owns the transaction and supplies an open connection, which it also closes.
+Functions here never commit or roll back.  The caller owns the transaction
+and supplies an open connection, which it also closes.
 
 SQL safety
 ----------
@@ -36,12 +38,26 @@ column lists.  No SELECT *.
 The embedding is bound as text in pgvector's input format and cast with
 ::vector.  embedded_at is not supplied; the column has DEFAULT NOW().
 
+Similarity query
+----------------
+The query vector is a stored row, referenced by its embedding_id inside the
+statement; no vector is sent from Python.  Candidates must share the query's
+doc_version, model_name, and model_revision, and the query's own
+investigation is excluded.
+
+    cosine distance    = candidate.embedding <=> query.embedding
+    cosine similarity  = 1.0 - cosine distance
+
+Ordering is cosine distance ASC, then investigation_id ASC.  The search is
+exact; there is no similarity threshold.
+
 Public API:
-    EMBEDDING_COLUMN_DIMENSION    — dimension of the embedding column (384)
-    fetch_investigation()         — one investigation, or None
-    fetch_evidence()              — its evidence rows, rank_position ASC
-    fetch_stored_document_text()  — document_text of an embedding, or None
-    insert_embedding()            — insert one row; True if inserted
+    EMBEDDING_COLUMN_DIMENSION      — dimension of the embedding column (384)
+    fetch_investigation()           — one investigation, or None
+    fetch_evidence()                — its evidence rows, rank_position ASC
+    fetch_stored_document_text()    — document_text of an embedding, or None
+    insert_embedding()              — insert one row; True if inserted
+    fetch_similar_investigations()  — ranked (investigation_id, similarity)
 """
 
 from __future__ import annotations
@@ -125,6 +141,29 @@ INSERT INTO public.rca_investigation_embeddings (
     %(document_text)s,
     %(embedding)s::vector
 ) ON CONFLICT (investigation_id, doc_version, model_name, model_revision) DO NOTHING"""
+
+# c = candidate rows, q = the stored query row.
+# The q join is constrained to the same (doc_version, model_name,
+# model_revision) as the candidate, so embeddings produced under different
+# document contracts or models are never compared.
+_SQL_FETCH_SIMILAR_INVESTIGATIONS = """\
+SELECT
+    c.investigation_id,
+    1.0 - (c.embedding <=> q.embedding) AS similarity
+FROM public.rca_investigation_embeddings AS c
+JOIN public.rca_investigation_embeddings AS q
+  ON q.embedding_id = %(query_embedding_id)s
+ AND q.investigation_id = %(investigation_id)s
+ AND q.doc_version = c.doc_version
+ AND q.model_name = c.model_name
+ AND q.model_revision = c.model_revision
+WHERE c.doc_version = %(doc_version)s
+  AND c.model_name = %(model_name)s
+  AND c.model_revision = %(model_revision)s
+  AND c.investigation_id <> %(investigation_id)s
+ORDER BY c.embedding <=> q.embedding ASC, c.investigation_id ASC
+LIMIT %(top_k)s
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +312,45 @@ def insert_embedding(
     with conn.cursor() as cur:
         cur.execute(_SQL_INSERT_EMBEDDING, params)
         return cur.rowcount == 1
+
+
+def fetch_similar_investigations(
+    conn: psycopg.Connection,
+    *,
+    query_embedding_id: str,
+    investigation_id: str,
+    doc_version: str,
+    model_name: str,
+    model_revision: str,
+    top_k: int,
+) -> list[tuple[Any, Any]]:
+    """
+    Rank stored embeddings by cosine similarity to one stored query embedding.
+
+    The query vector is the row identified by query_embedding_id, which must
+    belong to investigation_id.  Candidates share the given doc_version,
+    model_name, and model_revision; investigation_id itself is excluded.
+
+    Returns (investigation_id, similarity) pairs in database order: cosine
+    distance ASC, then investigation_id ASC, at most top_k of them.  Returns
+    an empty list when there is no other compatible embedding, or when the
+    query row does not exist.
+
+    Read-only.  Does not commit or roll back.
+
+    Raises:
+        psycopg.Error  on any database error.
+    """
+    params = {
+        "query_embedding_id": query_embedding_id,
+        "investigation_id": investigation_id,
+        "doc_version": doc_version,
+        "model_name": model_name,
+        "model_revision": model_revision,
+        "top_k": top_k,
+    }
+    with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(_SQL_FETCH_SIMILAR_INVESTIGATIONS, params)
+        rows = cur.fetchall()
+
+    return [(row["investigation_id"], row["similarity"]) for row in rows]

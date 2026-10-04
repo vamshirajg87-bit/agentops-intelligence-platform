@@ -16,6 +16,8 @@ Test inventory:
     ST06  insert_embedding
     ST07  Transactions: the store never commits or rolls back
     ST08  Import boundary
+    ST09  Similarity SELECT (Phase 12.6): shape, filters, ordering
+    ST10  fetch_similar_investigations (Phase 12.6)
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from embedding_store import (
     EMBEDDING_COLUMN_DIMENSION,
     fetch_evidence,
     fetch_investigation,
+    fetch_similar_investigations,
     fetch_stored_document_text,
     insert_embedding,
 )
@@ -62,6 +65,7 @@ _ALL_SQL = {
     "fetch_evidence": embedding_store._SQL_FETCH_EVIDENCE,
     "fetch_stored_document_text": embedding_store._SQL_FETCH_STORED_DOCUMENT_TEXT,
     "insert_embedding": embedding_store._SQL_INSERT_EMBEDDING,
+    "fetch_similar_investigations": embedding_store._SQL_FETCH_SIMILAR_INVESTIGATIONS,
 }
 
 _INVESTIGATION_COLUMNS = [
@@ -319,7 +323,7 @@ class TestSqlSafety:
     def test_no_do_update(self):
         assert "DO UPDATE" not in _normalise(_ALL_SQL["insert_embedding"]).upper()
 
-    def test_exactly_four_sql_statements_in_module(self):
+    def test_exactly_five_sql_statements_in_module(self):
         tree = ast.parse(open(_MODULE_PATH, encoding="utf-8").read())
         constants = [
             node.targets[0].id for node in tree.body
@@ -328,8 +332,13 @@ class TestSqlSafety:
         ]
         assert sorted(constants) == [
             "_SQL_FETCH_EVIDENCE", "_SQL_FETCH_INVESTIGATION",
+            "_SQL_FETCH_SIMILAR_INVESTIGATIONS",
             "_SQL_FETCH_STORED_DOCUMENT_TEXT", "_SQL_INSERT_EMBEDDING",
         ]
+        assert sorted(constants) == sorted(
+            name for name in vars(embedding_store) if name.startswith("_SQL_")
+        )
+        assert len(_ALL_SQL) == 5
 
     def test_exactly_one_write_statement(self):
         writes = [n for n, sql in _ALL_SQL.items() if re.search(r"\bINSERT\b", sql, re.IGNORECASE)]
@@ -665,3 +674,273 @@ class TestImportBoundary:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                     assert node.func.attr not in {"execute", "executemany"}, name
+
+
+# ---------------------------------------------------------------------------
+# ST09  Similarity SELECT (Phase 12.6)
+# ---------------------------------------------------------------------------
+
+_SIMILAR_SQL = embedding_store._SQL_FETCH_SIMILAR_INVESTIGATIONS
+
+_APPROVED_SIMILAR_SQL = """\
+SELECT
+    c.investigation_id,
+    1.0 - (c.embedding <=> q.embedding) AS similarity
+FROM public.rca_investigation_embeddings AS c
+JOIN public.rca_investigation_embeddings AS q
+  ON q.embedding_id = %(query_embedding_id)s
+ AND q.investigation_id = %(investigation_id)s
+ AND q.doc_version = c.doc_version
+ AND q.model_name = c.model_name
+ AND q.model_revision = c.model_revision
+WHERE c.doc_version = %(doc_version)s
+  AND c.model_name = %(model_name)s
+  AND c.model_revision = %(model_revision)s
+  AND c.investigation_id <> %(investigation_id)s
+ORDER BY c.embedding <=> q.embedding ASC, c.investigation_id ASC
+LIMIT %(top_k)s
+"""
+
+_SIMILAR_PARAMS = {
+    "query_embedding_id", "investigation_id", "doc_version",
+    "model_name", "model_revision", "top_k",
+}
+
+
+def _similar(conn, **overrides):
+    kwargs = dict(
+        query_embedding_id=_EMB,
+        investigation_id=_INV,
+        doc_version="1.0.0",
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_revision="1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+        top_k=5,
+    )
+    kwargs.update(overrides)
+    return fetch_similar_investigations(conn, **kwargs)
+
+
+def _where_clause(sql: str) -> str:
+    return sql.split("WHERE")[1].split("ORDER BY")[0]
+
+
+class TestSimilaritySqlShape:
+
+    def test_matches_the_approved_statement(self):
+        assert _normalise(_SIMILAR_SQL) == _normalise(_APPROVED_SIMILAR_SQL)
+
+    def test_select_list_exact(self):
+        assert _select_columns(_SIMILAR_SQL) == [
+            "c.investigation_id",
+            "1.0 - (c.embedding <=> q.embedding) AS similarity",
+        ]
+
+    def test_similarity_is_one_minus_cosine_distance(self):
+        assert "1.0 - (c.embedding <=> q.embedding) AS similarity" in _SIMILAR_SQL
+
+    def test_uses_cosine_distance_operator_only(self):
+        assert _SIMILAR_SQL.count("<=>") == 2
+        for operator in ("<->", "<#>", "<+>"):
+            assert operator not in _SIMILAR_SQL
+
+    def test_candidate_and_query_are_the_embeddings_table(self):
+        normalised = _normalise(_SIMILAR_SQL)
+        assert "FROM public.rca_investigation_embeddings AS c" in normalised
+        assert "JOIN public.rca_investigation_embeddings AS q" in normalised
+        tables = set(re.findall(r"\b(?:FROM|JOIN)\s+([\w.]+)", _SIMILAR_SQL))
+        assert tables == {"public.rca_investigation_embeddings"}
+
+    def test_query_row_is_selected_by_embedding_id(self):
+        assert "q.embedding_id = %(query_embedding_id)s" in _SIMILAR_SQL
+
+    def test_query_row_must_belong_to_the_query_investigation(self):
+        assert "q.investigation_id = %(investigation_id)s" in _SIMILAR_SQL
+
+    @pytest.mark.parametrize("column", ["doc_version", "model_name", "model_revision"])
+    def test_candidate_filtered_by_bound_identity(self, column):
+        assert f"c.{column} = %({column})s" in _SIMILAR_SQL
+
+    @pytest.mark.parametrize("column", ["doc_version", "model_name", "model_revision"])
+    def test_query_and_candidate_share_identity(self, column):
+        assert f"q.{column} = c.{column}" in _SIMILAR_SQL
+
+    @pytest.mark.parametrize("column", ["doc_version", "model_name", "model_revision"])
+    def test_each_identity_column_is_constrained_twice(self, column):
+        """Embeddings from different document contracts or models are never compared."""
+        assert _SIMILAR_SQL.count(f"c.{column}") == 2
+        assert _SIMILAR_SQL.count(f"q.{column}") == 1
+
+    def test_self_match_excluded_by_investigation_id(self):
+        assert "c.investigation_id <> %(investigation_id)s" in _where_clause(_SIMILAR_SQL)
+
+    def test_self_match_not_excluded_by_embedding_id(self):
+        assert "c.embedding_id" not in _SIMILAR_SQL
+
+    def test_order_by_distance_then_investigation_id(self):
+        match = re.search(r"ORDER BY\s+(.*?)\s+LIMIT", _SIMILAR_SQL, re.DOTALL)
+        assert _normalise(match.group(1)) == (
+            "c.embedding <=> q.embedding ASC, c.investigation_id ASC"
+        )
+
+    def test_no_descending_or_time_based_ordering(self):
+        assert "DESC" not in _SIMILAR_SQL.upper()
+        assert "embedded_at" not in _SIMILAR_SQL
+
+    def test_limit_is_a_bound_parameter(self):
+        assert _normalise(_SIMILAR_SQL).endswith("LIMIT %(top_k)s")
+        assert not re.search(r"LIMIT\s+\d", _SIMILAR_SQL)
+
+    def test_named_parameters_exact(self):
+        assert set(re.findall(r"%\((\w+)\)s", _SIMILAR_SQL)) == _SIMILAR_PARAMS
+
+    def test_no_literal_values(self):
+        """Only the constant 1.0 of the similarity formula appears as a literal."""
+        assert "'" not in _SIMILAR_SQL
+        assert re.findall(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", _SIMILAR_SQL) == ["1.0"]
+
+    def test_no_vector_sent_from_python(self):
+        assert "::vector" not in _SIMILAR_SQL
+        assert "%(embedding)s" not in _SIMILAR_SQL
+        assert "%(vector)s" not in _SIMILAR_SQL
+
+    def test_no_similarity_threshold(self):
+        where = _where_clause(_SIMILAR_SQL)
+        assert "<=>" not in where
+        assert "similarity" not in where
+        assert "HAVING" not in _SIMILAR_SQL.upper()
+
+    def test_no_approximate_index_hints(self):
+        upper = _SIMILAR_SQL.upper()
+        for word in ("HNSW", "IVFFLAT", "PROBES", "EF_SEARCH"):
+            assert word not in upper
+
+    def test_read_only(self):
+        upper = _SIMILAR_SQL.upper()
+        for keyword in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "FOR UPDATE", "FOR SHARE", "LOCK"):
+            assert keyword not in upper
+        assert upper.lstrip().startswith("SELECT")
+
+    def test_columns_used_exist_in_migration_010(self):
+        with open(_MIGRATION_010, encoding="utf-8") as fh:
+            migration = fh.read()
+        for column in ("embedding_id", "investigation_id", "doc_version",
+                       "model_name", "model_revision", "embedding"):
+            assert re.search(rf"^\s*{column}\s+\S+", migration, re.MULTILINE), column
+
+    def test_document_text_is_not_selected(self):
+        """Presentation fields belong to a later phase."""
+        assert "document_text" not in _SIMILAR_SQL
+
+    def test_embeddings_table_select_is_granted_to_the_role(self):
+        with open(_MIGRATION_011, encoding="utf-8") as fh:
+            migration = _normalise(
+                "\n".join(line.split("--")[0] for line in fh.read().splitlines())
+            )
+        assert (
+            "GRANT INSERT, SELECT ON public.rca_investigation_embeddings TO incident_retrieval"
+            in migration
+        )
+
+
+# ---------------------------------------------------------------------------
+# ST10  fetch_similar_investigations (Phase 12.6)
+# ---------------------------------------------------------------------------
+
+class TestFetchSimilarInvestigations:
+
+    def test_returns_pairs_in_cursor_order(self):
+        conn, _ = _make_conn(fetchall=[
+            {"investigation_id": "b" * 64, "similarity": 0.91},
+            {"investigation_id": "c" * 64, "similarity": 0.42},
+            {"investigation_id": "d" * 64, "similarity": 0.42},
+        ])
+        assert _similar(conn) == [("b" * 64, 0.91), ("c" * 64, 0.42), ("d" * 64, 0.42)]
+
+    def test_order_is_not_changed_by_the_store(self):
+        rows = [
+            {"investigation_id": "z", "similarity": 0.1},
+            {"investigation_id": "a", "similarity": 0.9},
+        ]
+        conn, _ = _make_conn(fetchall=rows)
+        assert [pair[0] for pair in _similar(conn)] == ["z", "a"]
+
+    def test_empty_list_when_no_candidates(self):
+        conn, _ = _make_conn(fetchall=[])
+        assert _similar(conn) == []
+
+    def test_returns_a_list_of_tuples(self):
+        conn, _ = _make_conn(fetchall=[{"investigation_id": "b", "similarity": 0.5}])
+        result = _similar(conn)
+        assert type(result) is list
+        assert all(type(pair) is tuple and len(pair) == 2 for pair in result)
+
+    def test_values_are_passed_through_unmodified(self):
+        value = 0.123456789012345678
+        conn, _ = _make_conn(fetchall=[{"investigation_id": " padded ", "similarity": value}])
+        assert _similar(conn) == [(" padded ", value)]
+
+    def test_similarity_is_not_rounded_or_validated_here(self):
+        nan = float("nan")
+        conn, _ = _make_conn(fetchall=[{"investigation_id": "b", "similarity": nan}])
+        assert _similar(conn)[0][1] is nan
+
+    def test_executes_the_sql_constant(self):
+        conn, cur = _make_conn(fetchall=[])
+        _similar(conn)
+        assert cur.execute.call_count == 1
+        assert cur.execute.call_args.args[0] is embedding_store._SQL_FETCH_SIMILAR_INVESTIGATIONS
+
+    def test_parameter_keys_exact(self):
+        conn, cur = _make_conn(fetchall=[])
+        _similar(conn)
+        assert set(cur.execute.call_args.args[1]) == _SIMILAR_PARAMS
+
+    def test_parameters_bound_exactly(self):
+        conn, cur = _make_conn(fetchall=[])
+        _similar(conn, top_k=17)
+        assert cur.execute.call_args.args[1] == {
+            "query_embedding_id": _EMB,
+            "investigation_id": _INV,
+            "doc_version": "1.0.0",
+            "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+            "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+            "top_k": 17,
+        }
+
+    def test_no_vector_parameter(self):
+        conn, cur = _make_conn(fetchall=[])
+        _similar(conn)
+        params = cur.execute.call_args.args[1]
+        assert "embedding" not in params and "vector" not in params
+        assert not any(isinstance(v, (list, tuple)) for v in params.values())
+
+    def test_uses_dict_row_cursor(self):
+        conn, _ = _make_conn(fetchall=[])
+        _similar(conn)
+        conn.cursor.assert_called_once_with(row_factory=psycopg.rows.dict_row)
+
+    def test_arguments_are_keyword_only(self):
+        conn, _ = _make_conn(fetchall=[])
+        with pytest.raises(TypeError):
+            fetch_similar_investigations(conn, _EMB, _INV, "1.0.0", "m", "r", 5)  # type: ignore[misc]
+
+    def test_no_commit_rollback_or_close(self):
+        conn, _ = _make_conn(fetchall=[{"investigation_id": "b", "similarity": 0.5}])
+        _similar(conn)
+        conn.commit.assert_not_called()
+        conn.rollback.assert_not_called()
+        conn.close.assert_not_called()
+
+    def test_database_error_propagates_without_transaction_management(self):
+        conn, cur = _make_conn()
+        cur.execute.side_effect = psycopg.OperationalError("boom")
+        with pytest.raises(psycopg.OperationalError):
+            _similar(conn)
+        conn.commit.assert_not_called()
+        conn.rollback.assert_not_called()
+
+    def test_one_statement_per_call(self):
+        conn, cur = _make_conn(fetchall=[])
+        _similar(conn)
+        _similar(conn)
+        assert cur.execute.call_count == 2
