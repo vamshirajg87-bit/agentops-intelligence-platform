@@ -28,5 +28,10 @@ tokenizers==0.23.2
 # Must stay below 2.0: sentence-transformers 6.1.0 requires huggingface-hub<2.0.0.
 huggingface-hub==1.33.0
 
+# PostgreSQL driver -- psycopg 3 (binary distribution).
+# Used by embedding_store.py and retrieval_db.py for embedding persistence.
+# Same constraint as storage-consumer and trace-viewer.
+psycopg[binary]>=3.1,<4.0
+
 # Test dependencies
 pytest==8.3.5
