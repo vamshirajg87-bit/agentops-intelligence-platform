@@ -102,7 +102,9 @@ services:
 
 
   postgres:
-    image: postgres:17
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
     container_name: agentops-postgres
 
     environment:
