@@ -66,6 +66,13 @@ Public API:
     insert_embedding()              — insert one row; True if inserted
     fetch_similar_investigations()  — ranked (investigation_id, similarity)
     fetch_investigation_contexts()  — presentation fields for a set of ids
+    fetch_investigation_ids()       — every investigation_id, ascending
+
+Investigation discovery (Phase 12.8)
+------------------------------------
+fetch_investigation_ids() lists every investigation, ordered by
+investigation_id.  It applies no eligibility filter: whether an investigation
+is embedded is decided by the document builder, not by SQL.
 """
 
 from __future__ import annotations
@@ -186,6 +193,12 @@ SELECT
     limitations
 FROM public.rca_investigations
 WHERE investigation_id = ANY(%(investigation_ids)s)
+ORDER BY investigation_id ASC
+"""
+
+_SQL_FETCH_INVESTIGATION_IDS = """\
+SELECT investigation_id
+FROM public.rca_investigations
 ORDER BY investigation_id ASC
 """
 
@@ -404,3 +417,22 @@ def fetch_investigation_contexts(
         rows = cur.fetchall()
 
     return [dict(row) for row in rows]
+
+
+def fetch_investigation_ids(conn: psycopg.Connection) -> list[Any]:
+    """
+    List the investigation_id of every investigation, ordered ASC.
+
+    No eligibility filter is applied; investigations that must not be
+    embedded are included and are classified by the caller's pipeline.
+
+    Read-only.  Does not commit or roll back.
+
+    Raises:
+        psycopg.Error  on any database error.
+    """
+    with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(_SQL_FETCH_INVESTIGATION_IDS)
+        rows = cur.fetchall()
+
+    return [row["investigation_id"] for row in rows]

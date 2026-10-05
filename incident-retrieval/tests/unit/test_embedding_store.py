@@ -20,6 +20,8 @@ Test inventory:
     ST10  fetch_similar_investigations (Phase 12.6)
     ST11  Investigation-context SELECT (Phase 12.7): shape, grants
     ST12  fetch_investigation_contexts (Phase 12.7)
+    ST13  Discovery SELECT (Phase 12.8): shape, no eligibility filter
+    ST14  fetch_investigation_ids (Phase 12.8)
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from embedding_store import (
     fetch_evidence,
     fetch_investigation,
     fetch_investigation_contexts,
+    fetch_investigation_ids,
     fetch_similar_investigations,
     fetch_stored_document_text,
     insert_embedding,
@@ -70,6 +73,7 @@ _ALL_SQL = {
     "insert_embedding": embedding_store._SQL_INSERT_EMBEDDING,
     "fetch_similar_investigations": embedding_store._SQL_FETCH_SIMILAR_INVESTIGATIONS,
     "fetch_investigation_contexts": embedding_store._SQL_FETCH_INVESTIGATION_CONTEXTS,
+    "fetch_investigation_ids": embedding_store._SQL_FETCH_INVESTIGATION_IDS,
 }
 
 _INVESTIGATION_COLUMNS = [
@@ -327,7 +331,7 @@ class TestSqlSafety:
     def test_no_do_update(self):
         assert "DO UPDATE" not in _normalise(_ALL_SQL["insert_embedding"]).upper()
 
-    def test_exactly_six_sql_statements_in_module(self):
+    def test_exactly_seven_sql_statements_in_module(self):
         tree = ast.parse(open(_MODULE_PATH, encoding="utf-8").read())
         constants = [
             node.targets[0].id for node in tree.body
@@ -337,13 +341,14 @@ class TestSqlSafety:
         assert sorted(constants) == [
             "_SQL_FETCH_EVIDENCE", "_SQL_FETCH_INVESTIGATION",
             "_SQL_FETCH_INVESTIGATION_CONTEXTS",
+            "_SQL_FETCH_INVESTIGATION_IDS",
             "_SQL_FETCH_SIMILAR_INVESTIGATIONS",
             "_SQL_FETCH_STORED_DOCUMENT_TEXT", "_SQL_INSERT_EMBEDDING",
         ]
         assert sorted(constants) == sorted(
             name for name in vars(embedding_store) if name.startswith("_SQL_")
         )
-        assert len(_ALL_SQL) == 6
+        assert len(_ALL_SQL) == 7
 
     def test_exactly_one_write_statement(self):
         writes = [n for n, sql in _ALL_SQL.items() if re.search(r"\bINSERT\b", sql, re.IGNORECASE)]
@@ -1155,5 +1160,131 @@ class TestFetchInvestigationContexts:
         cur.execute.side_effect = psycopg.OperationalError("boom")
         with pytest.raises(psycopg.OperationalError):
             fetch_investigation_contexts(conn, [_INV])
+        conn.commit.assert_not_called()
+        conn.rollback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ST13  Discovery SELECT (Phase 12.8)
+# ---------------------------------------------------------------------------
+
+_IDS_SQL = embedding_store._SQL_FETCH_INVESTIGATION_IDS
+
+_APPROVED_IDS_SQL = """\
+SELECT investigation_id
+FROM public.rca_investigations
+ORDER BY investigation_id ASC
+"""
+
+
+class TestDiscoverySqlShape:
+
+    def test_matches_the_approved_statement(self):
+        assert _normalise(_IDS_SQL) == _normalise(_APPROVED_IDS_SQL)
+
+    def test_selects_only_investigation_id(self):
+        assert _select_columns(_IDS_SQL) == ["investigation_id"]
+
+    def test_column_is_granted_by_migration_011(self):
+        assert "investigation_id" in _granted_columns("public.rca_investigations")
+
+    def test_reads_only_rca_investigations(self):
+        tables = set(re.findall(r"\b(?:FROM|JOIN)\s+([\w.]+)", _IDS_SQL))
+        assert tables == {"public.rca_investigations"}
+
+    def test_no_eligibility_filter(self):
+        """Eligibility is decided by the document builder, never by this query."""
+        upper = _IDS_SQL.upper()
+        assert "WHERE" not in upper
+        assert "CONFIDENCE" not in upper
+        assert "INSUFFICIENT_DATA" not in upper
+
+    def test_already_embedded_investigations_are_not_excluded(self):
+        lowered = _IDS_SQL.lower()
+        for fragment in ("rca_investigation_embeddings", "not exists", "left join",
+                         "except", " join "):
+            assert fragment not in lowered
+
+    def test_deterministic_ascending_order(self):
+        assert _normalise(_IDS_SQL).endswith("ORDER BY investigation_id ASC")
+        assert "DESC" not in _IDS_SQL.upper()
+
+    def test_no_limit_parameters_or_literals(self):
+        assert not re.search(r"\bLIMIT\b", _IDS_SQL, re.IGNORECASE)
+        assert "%" not in _IDS_SQL
+        assert "'" not in _IDS_SQL
+        assert not re.search(r"\d", _IDS_SQL)
+
+    def test_read_only(self):
+        upper = _IDS_SQL.upper()
+        for keyword in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "FOR UPDATE", "FOR SHARE", "LOCK"):
+            assert keyword not in upper
+        assert upper.lstrip().startswith("SELECT")
+
+    def test_still_exactly_one_write_statement_in_the_store(self):
+        writes = [
+            name for name, sql in _ALL_SQL.items()
+            if re.search(r"\b(INSERT|UPDATE|DELETE|TRUNCATE)\b", sql, re.IGNORECASE)
+        ]
+        assert writes == ["insert_embedding"]
+
+
+# ---------------------------------------------------------------------------
+# ST14  fetch_investigation_ids (Phase 12.8)
+# ---------------------------------------------------------------------------
+
+class TestFetchInvestigationIds:
+
+    def test_returns_ids_in_cursor_order(self):
+        conn, _ = _make_conn(fetchall=[
+            {"investigation_id": "a" * 64},
+            {"investigation_id": "b" * 64},
+            {"investigation_id": "c" * 64},
+        ])
+        assert fetch_investigation_ids(conn) == ["a" * 64, "b" * 64, "c" * 64]
+
+    def test_order_is_not_changed_by_the_store(self):
+        conn, _ = _make_conn(fetchall=[{"investigation_id": "z"}, {"investigation_id": "a"}])
+        assert fetch_investigation_ids(conn) == ["z", "a"]
+
+    def test_empty_list_when_no_investigations(self):
+        conn, _ = _make_conn(fetchall=[])
+        assert fetch_investigation_ids(conn) == []
+
+    def test_returns_a_plain_list(self):
+        conn, _ = _make_conn(fetchall=[{"investigation_id": "a"}])
+        assert type(fetch_investigation_ids(conn)) is list
+
+    def test_values_are_passed_through_unmodified(self):
+        conn, _ = _make_conn(fetchall=[{"investigation_id": " padded "}])
+        assert fetch_investigation_ids(conn) == [" padded "]
+
+    def test_executes_the_sql_constant_once_without_parameters(self):
+        conn, cur = _make_conn(fetchall=[])
+        fetch_investigation_ids(conn)
+        cur.execute.assert_called_once_with(embedding_store._SQL_FETCH_INVESTIGATION_IDS)
+
+    def test_uses_dict_row_cursor(self):
+        conn, _ = _make_conn(fetchall=[])
+        fetch_investigation_ids(conn)
+        conn.cursor.assert_called_once_with(row_factory=psycopg.rows.dict_row)
+
+    def test_takes_only_the_connection(self):
+        conn, _ = _make_conn(fetchall=[])
+        with pytest.raises(TypeError):
+            fetch_investigation_ids(conn, "extra")  # type: ignore[call-arg]
+
+    def test_no_commit_rollback_or_close(self):
+        conn, _ = _make_conn(fetchall=[{"investigation_id": "a"}])
+        fetch_investigation_ids(conn)
+        conn.commit.assert_not_called()
+        conn.rollback.assert_not_called()
+        conn.close.assert_not_called()
+
+    def test_database_error_propagates_without_transaction_management(self):
+        conn, cur = _make_conn()
+        cur.execute.side_effect = psycopg.OperationalError("boom")
+        with pytest.raises(psycopg.OperationalError):
+            fetch_investigation_ids(conn)
         conn.commit.assert_not_called()
         conn.rollback.assert_not_called()
