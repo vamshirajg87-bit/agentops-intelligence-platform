@@ -61,6 +61,7 @@ jobs:
           python -m compileall -q \
             alerting \
             anomaly-detector \
+            db-bootstrap \
             demo-app \
             incident-retrieval \
             rca-analyzer \
@@ -104,3 +105,9 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/demo-app
         run: python -m pytest storage-consumer/tests/unit -q -rs -p no:cacheprovider
+
+      # Database bootstrap and analytics refresh: standard library only.
+      # Every psql and dbt call is replaced inside the tests.
+      - name: Test db-bootstrap
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest db-bootstrap/tests -q -rs -p no:cacheprovider
