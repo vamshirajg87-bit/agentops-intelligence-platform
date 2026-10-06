@@ -1,6 +1,6 @@
 {{ config(
     materialized='table',
-    post_hook="GRANT SELECT ON {{ this }} TO anomaly_detector"
+    post_hook="{{ grant_select_if_role_exists(this, 'anomaly_detector') }}"
 ) }}
 
 select
