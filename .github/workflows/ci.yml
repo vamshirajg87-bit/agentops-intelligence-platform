@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  offline-tests:
+    name: Offline tests (Python 3.13)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    env:
+      # Live suites are opt-in. Keep them off explicitly.
+      ALERTING_RUN_DB_TESTS: "0"
+      INCIDENT_RETRIEVAL_RUN_DB_TESTS: "0"
+      INCIDENT_RETRIEVAL_RUN_MODEL_TESTS: "0"
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            alerting/requirements.txt
+            trace-viewer/requirements.txt
+            stream-processor/requirements.txt
+            storage-consumer/requirements.txt
+            demo-app/requirements.txt
+
+      # One pip command, so that all five files are resolved together.
+      # incident-retrieval's model stack and analytics' dbt are not needed by
+      # the offline suites and are not installed.
+      - name: Install dependencies
+        id: install
+        run: |
+          python -m pip install \
+            -r alerting/requirements.txt \
+            -r trace-viewer/requirements.txt \
+            -r stream-processor/requirements.txt \
+            -r storage-consumer/requirements.txt \
+            -r demo-app/requirements.txt
+          python -m pip check
+
+      - name: Compile all Python sources
+        run: |
+          python -m compileall -q \
+            alerting \
+            anomaly-detector \
+            demo-app \
+            incident-retrieval \
+            rca-analyzer \
+            scripts \
+            storage-consumer \
+            stream-processor \
+            trace-viewer
+
+      # Each component runs in its own pytest process: components reuse module
+      # names such as config and main. Every suite runs even if an earlier one
+      # failed, so that one run shows every failing component.
+      - name: Test alerting
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest alerting -q -rs -p no:cacheprovider
+
+      - name: Test rca-analyzer
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest rca-analyzer/tests -q -rs -p no:cacheprovider
+
+      - name: Test anomaly-detector
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest anomaly-detector/tests -q -rs -p no:cacheprovider
+
+      - name: Test trace-viewer
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest trace-viewer/tests -q -rs -p no:cacheprovider
+
+      - name: Test incident-retrieval
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest incident-retrieval/tests -q -rs -p no:cacheprovider
+
+      # demo-app holds the canonical schema these two components import.
+      - name: Test stream-processor
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/demo-app
+        run: python -m pytest stream-processor -m "not integration" -q -rs -p no:cacheprovider
+
+      - name: Test storage-consumer
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/demo-app
+        run: python -m pytest storage-consumer/tests/unit -q -rs -p no:cacheprovider
