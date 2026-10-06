@@ -5,7 +5,7 @@
 # profiles.yml is listed in analytics/.gitignore and must never be committed.
 #
 # Usage (PowerShell):
-#   $env:DBT_PG_PASSWORD = "agentops_dev"        # required — no default
+#   $env:DBT_PG_PASSWORD = "<the PostgreSQL owner password>"   # required — no default
 #   $env:DBT_PG_HOST     = "localhost"            # optional — default shown
 #   $env:DBT_PG_PORT     = "5432"                # optional — default shown
 #   $env:DBT_PG_DATABASE = "agentops"            # optional — default shown
@@ -13,7 +13,7 @@
 #   $env:DBT_PG_SCHEMA   = "analytics"           # optional — default shown
 #
 # Usage (bash/zsh):
-#   export DBT_PG_PASSWORD="agentops_dev"
+#   export DBT_PG_PASSWORD="<the PostgreSQL owner password>"
 #
 # Run from the analytics/ directory:
 #   cd analytics

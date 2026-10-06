@@ -66,5 +66,8 @@ PG_HOST: str = os.environ.get("PG_HOST", "localhost")
 PG_PORT: int = int(os.environ.get("PG_PORT", "5432"))
 PG_DATABASE: str = os.environ.get("PG_DATABASE", "agentops")
 PG_USER: str = os.environ.get("PG_USER", "agentops")
-# Local-development credential only — not a production secret.
-PG_PASSWORD: str = os.environ.get("PG_PASSWORD", "agentops_dev")
+# Required: there is no default.  The storage consumer connects as the owner
+# role, so this is the PostgreSQL owner password (POSTGRES_PASSWORD in .env).
+# Left unset, the connection is attempted without a password and PostgreSQL
+# refuses it.
+PG_PASSWORD: str = os.environ.get("PG_PASSWORD", "")
