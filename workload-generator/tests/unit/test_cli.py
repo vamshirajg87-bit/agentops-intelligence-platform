@@ -479,8 +479,8 @@ class TestModuleInvocation:
 # ---------------------------------------------------------------------------
 
 _ALLOWED_IMPORTS = {
-    "__future__", "argparse", "dataclasses", "enum", "hashlib", "json", "math",
-    "pathlib", "random", "re", "secrets", "sys", "typing",
+    "__future__", "argparse", "contextlib", "contextvars", "dataclasses", "enum",
+    "hashlib", "json", "math", "pathlib", "random", "re", "secrets", "sys", "typing",
 }
 
 _FORBIDDEN_IMPORTS = {
@@ -526,8 +526,8 @@ class TestArchitecturalGuards:
 
     def test_the_runtime_package_is_these_modules(self):
         assert [path.name for path in _RUNTIME_MODULES] == [
-            "__init__.py", "__main__.py", "cli.py", "personas.py", "plan.py",
-            "report.py", "rng.py", "scenarios.py",
+            "__init__.py", "__main__.py", "cli.py", "faults.py", "personas.py",
+            "plan.py", "report.py", "rng.py", "scenarios.py",
         ]
 
     @pytest.mark.parametrize("path", _RUNTIME_MODULES, ids=lambda p: p.name)
@@ -577,8 +577,15 @@ class TestArchitecturalGuards:
         text = (_PACKAGE / "report.py").read_text(encoding="utf-8")
         assert text.count("open(") == 1 and 'open(path, "x"' in text
 
-    def test_no_driver_fault_or_detector_file_exists_yet(self):
-        for name in ("faults.py", "real_driver.py", "synthetic_driver.py"):
+    def test_the_command_does_not_use_the_fault_layer_yet(self):
+        # Fault injection exists as a module; nothing executes a plan yet.
+        for path in _RUNTIME_MODULES:
+            if path.name != "faults.py":
+                text = path.read_text(encoding="utf-8")
+                assert ".faults" not in text and "import faults" not in text, path.name
+
+    def test_no_driver_or_detector_file_exists_yet(self):
+        for name in ("real_driver.py", "synthetic_driver.py", "driver.py"):
             assert not (_PACKAGE / name).exists()
         assert not list(_COMPONENT.rglob("runner_config*.json"))
         assert not (_COMPONENT / "requirements.txt").exists()
@@ -595,6 +602,7 @@ class TestArchitecturalGuards:
             "tests/conftest.py",
             "tests/unit/__init__.py",
             "tests/unit/test_cli.py",
+            "tests/unit/test_faults.py",
             "tests/unit/test_personas.py",
             "tests/unit/test_plan.py",
             "tests/unit/test_report.py",
@@ -602,6 +610,7 @@ class TestArchitecturalGuards:
             "workload_generator/__init__.py",
             "workload_generator/__main__.py",
             "workload_generator/cli.py",
+            "workload_generator/faults.py",
             "workload_generator/personas.py",
             "workload_generator/plan.py",
             "workload_generator/report.py",

@@ -23,7 +23,6 @@ Public API:
     PROFILES               persona -> profile
     MIX                    the personas and weights of the default mix
     session_queries()      the queries of one planned session
-    off_topic_query()      one off-topic query (used by a scenario)
 """
 
 from __future__ import annotations
@@ -234,8 +233,3 @@ def session_queries(persona: Persona, length: int, draw: Draw) -> tuple[str, ...
         )
 
     raise ValueError(f"unknown persona {persona!r}")
-
-
-def off_topic_query(draw: Draw) -> str:
-    """One query from the off-topic pool."""
-    return draw.choice(OFF_TOPIC_QUERIES)

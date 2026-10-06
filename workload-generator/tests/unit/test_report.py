@@ -183,10 +183,44 @@ class TestDeterminism:
             assert list(row) == [
                 "request_index", "request_id", "session_id", "persona", "scenario",
                 "query", "arrival_offset_seconds", "latency_ms", "fault", "retries",
-                "episode_id",
+                "episode_id", "retrieval_effect",
             ]
             assert list(row["latency_ms"]) == ["tool", "retrieval", "synthesis"]
+            assert row["retrieval_effect"] is None
             json.dumps(row)                              # plain data only
+
+    def test_request_row_names_the_retrieval_effect(self):
+        plan = _plan(scenario=Scenario.RETRIEVAL_QUALITY)
+        rows = [request_row(request) for request in plan.requests]
+        values = {row["retrieval_effect"] for row in rows}
+        assert values == {None, "drop-best-match"}
+        for row, request in zip(rows, plan.requests):
+            assert (row["retrieval_effect"] is not None) == (
+                request.scenario is Scenario.RETRIEVAL_QUALITY
+            )
+
+    def test_digest_covers_the_retrieval_effect(self):
+        import dataclasses
+        from workload_generator.scenarios import RetrievalEffect
+        plan = _plan(traces=3, scenario=Scenario.NORMAL)
+        changed = dataclasses.replace(plan, requests=(
+            dataclasses.replace(
+                plan.requests[0], retrieval_effect=RetrievalEffect.DROP_BEST_MATCH,
+            ),
+            *plan.requests[1:],
+        ))
+        assert plan_digest(changed) != plan_digest(plan)
+
+    def test_sample_line_shows_the_retrieval_effect(self):
+        plan = _plan(scenario=Scenario.RETRIEVAL_QUALITY)
+        degraded = next(r for r in plan.requests if r.retrieval_effect is not None)
+        healthy = next(r for r in plan.requests if r.retrieval_effect is None)
+        text = format_summary(_report(plan), [degraded, healthy])
+        first, second = [l for l in text.splitlines() if l.startswith("  #")]
+        assert first.endswith("retrieval=drop-best-match")
+        assert "retrieval=" not in second
+        # The question shown is the user's own.
+        assert degraded.query[:40] in first
 
 
 # ---------------------------------------------------------------------------

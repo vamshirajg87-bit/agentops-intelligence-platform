@@ -32,7 +32,6 @@ from workload_generator.personas import (
     RESEARCH_THREADS,
     TECHNOLOGY_QUERIES,
     Persona,
-    off_topic_query,
     session_queries,
 )
 from workload_generator.rng import Draw
@@ -224,10 +223,6 @@ class TestSessionQueries:
         with pytest.raises(ValueError):
             _session(Persona.TECHNOLOGY_LOOKUP, length)
 
-    def test_off_topic_query_comes_from_the_pool(self):
-        found = {off_topic_query(Draw(1, "test-off-topic", index)) for index in range(200)}
-        assert found == set(OFF_TOPIC_QUERIES)
-
 
 # ---------------------------------------------------------------------------
 # WP04  Pools against the demo agent
@@ -271,7 +266,7 @@ class TestPoolsAgainstTheDemoAgent:
         assert status == "success"
 
     @pytest.mark.parametrize("query", OFF_TOPIC_QUERIES)
-    def test_the_agent_knows_nothing_about_an_off_topic_query(self, demo, query):
+    def test_the_agent_knows_nothing_about_an_off_topic_question(self, demo, query):
         status, documents, top = demo.outcome(query)
         assert status == "not_found"
         # Weak retrieval: at most one document, and a poor match at that.

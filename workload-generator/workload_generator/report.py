@@ -76,6 +76,9 @@ def request_row(request: PlannedRequest) -> dict[str, Any]:
             for retry in request.retries
         ],
         "episode_id": request.episode_id,
+        "retrieval_effect": (
+            request.retrieval_effect.value if request.retrieval_effect is not None else None
+        ),
     }
 
 
@@ -232,10 +235,13 @@ def _sample_line(request: PlannedRequest) -> str:
         query = query[:_QUERY_WIDTH - 3] + "..."
     fault = f"  fault={request.fault.error_type}" if request.fault else ""
     retries = f"  retries={len(request.retries)}" if request.retries else ""
+    retrieval = (
+        f"  retrieval={request.retrieval_effect.value}" if request.retrieval_effect else ""
+    )
     return (
         f"  #{request.request_index:<6} +{request.arrival_offset_seconds:>10.3f}s  "
         f"{request.persona.value:<18} {request.scenario.value:<18} "
-        f"{query}{fault}{retries}"
+        f"{query}{fault}{retries}{retrieval}"
     )
 
 

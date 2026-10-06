@@ -32,7 +32,7 @@ short episodes of different kinds that together cover about 5% of the run.
 Standard library only.
 
 Public API:
-    Scenario, Target, ScenarioSpec, Episode
+    Scenario, Target, RetrievalEffect, ScenarioSpec, Episode
     SPECS                       scenario -> spec
     MIXED_ABNORMAL_SCENARIOS    what a mixed-production episode may be
     plan_episodes()             the episodes of one plan
@@ -70,6 +70,20 @@ class Target(Enum):
     SYNTHESIS = "research.synthesize"
 
 
+class RetrievalEffect(Enum):
+    """
+    What is planned to happen to the RESULT of the document lookup.  The
+    question asked is never changed.
+
+    DROP_BEST_MATCH  the best-matching document is missing from the result,
+                     as with a stale or incomplete index.  What remains is
+                     returned as it is, with its real scores; a result of
+                     one document becomes empty.
+    """
+
+    DROP_BEST_MATCH = "drop-best-match"
+
+
 # Error types a planned tool failure may carry.  ERROR_UNAVAILABLE is the
 # failure the demo agent already has; the others are what a generator-owned
 # wrapper around the tool will raise in a later phase.
@@ -103,8 +117,8 @@ class ScenarioSpec:
     fault_latency_ms  range of the target's latency when it fails quickly
     error_type        error the target is planned to fail with
     client_retries    the client resubmits a failed request
-    off_topic         the request's question is replaced by an off-topic one;
-                      its session and persona stay as they are
+    retrieval_effect  what happens to the result of the document lookup; the
+                      request itself, question included, is not changed
     intensity         share of the requests inside an episode that are
                       affected
     windows           episodes as (start, end) fractions of the plan
@@ -118,7 +132,7 @@ class ScenarioSpec:
     fault_latency_ms: Optional[tuple[float, float]] = None
     error_type: Optional[str] = None
     client_retries: bool = False
-    off_topic: bool = False
+    retrieval_effect: Optional[RetrievalEffect] = None
     intensity: float = 1.0
     windows: tuple[tuple[float, float], ...] = ()
 
@@ -210,10 +224,12 @@ SPECS: Mapping[Scenario, ScenarioSpec] = {
     Scenario.RETRIEVAL_QUALITY: ScenarioSpec(
         scenario=Scenario.RETRIEVAL_QUALITY,
         description=(
-            "within their sessions, users ask questions the agent has no "
-            "documents for: no failure, but little or nothing is retrieved"
+            "the document lookup answers the same questions with its best "
+            "match missing: no failure, but fewer and weaker results. "
+            "Visible in telemetry; not necessarily raised as an anomaly"
         ),
-        off_topic=True,
+        target=Target.RETRIEVAL,
+        retrieval_effect=RetrievalEffect.DROP_BEST_MATCH,
         intensity=0.8,
         windows=_ONE_INCIDENT,
     ),

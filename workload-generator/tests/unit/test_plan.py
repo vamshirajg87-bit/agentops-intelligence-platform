@@ -48,6 +48,7 @@ from workload_generator.rng import Draw, derive_hex
 from workload_generator.scenarios import (
     ERROR_MESSAGES,
     SPECS,
+    RetrievalEffect,
     Scenario,
     Target,
 )
@@ -311,6 +312,7 @@ class TestShape:
         assert names == {
             "request_index", "request_id", "session_id", "persona", "scenario", "query",
             "arrival_offset_seconds", "latency", "fault", "retries", "episode_id",
+            "retrieval_effect",
         }
 
     def test_no_trace_or_span_identifier_is_planned_yet(self):
@@ -481,16 +483,13 @@ class TestSessions:
         assert burst * 8 < statistics.fmean(gaps[Persona.RESEARCH_SESSION])
         assert burst * 8 < statistics.fmean(gaps[Persona.TECHNOLOGY_LOOKUP])
 
-    @pytest.mark.parametrize("scenario", [
-        s for s in Scenario if s is not Scenario.RETRIEVAL_QUALITY
-    ])
-    def test_queries_conform_to_the_persona_in_every_other_scenario(self, scenario):
+    @pytest.mark.parametrize("scenario", list(Scenario))
+    def test_queries_conform_to_the_persona_in_every_scenario(self, scenario):
+        # No scenario changes what a user asks.
         research = {q for thread in RESEARCH_THREADS.values() for q in thread}
         plan = _plan(scenario=scenario, traces=1500, rate=20.0)
         for request in plan.requests:
-            if request.scenario is Scenario.RETRIEVAL_QUALITY:
-                assert request.query in OFF_TOPIC_QUERIES    # mixed production only
-            elif request.persona is Persona.TECHNOLOGY_LOOKUP:
+            if request.persona is Persona.TECHNOLOGY_LOOKUP:
                 assert request.query in TECHNOLOGY_QUERIES
             elif request.persona is Persona.RESEARCH_SESSION:
                 assert request.query in research
@@ -635,7 +634,7 @@ class TestScenariosInAPlan:
         assert len(between) == 300
         assert all(r.fault is None and r.scenario is Scenario.NORMAL for r in between)
 
-    def test_retrieval_quality_changes_only_the_question(self):
+    def test_retrieval_quality_plans_only_a_retrieval_effect(self):
         normal = _plan(scenario=Scenario.NORMAL, traces=1000)
         quality = _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1000)
         affected = _affected(quality)
@@ -644,12 +643,46 @@ class TestScenariosInAPlan:
             before = normal.requests[request.request_index]
             assert request.scenario is Scenario.RETRIEVAL_QUALITY
             assert request.episode_id == "ep01-retrieval-quality"
-            assert request.query in OFF_TOPIC_QUERIES
+            assert request.retrieval_effect is RetrievalEffect.DROP_BEST_MATCH
             assert request.fault is None and request.retries == ()
+            # The user's own question, unchanged.
+            assert request.query == before.query
             # Everything else is the request the user would have sent anyway.
             assert dataclasses.replace(
-                request, query=before.query, scenario=Scenario.NORMAL, episode_id=None,
+                request, scenario=Scenario.NORMAL, episode_id=None, retrieval_effect=None,
             ) == before
+
+    def test_retrieval_quality_never_changes_a_query(self):
+        normal = _plan(scenario=Scenario.NORMAL, traces=1000)
+        quality = _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1000)
+        assert [r.query for r in quality.requests] == [r.query for r in normal.requests]
+        source = Path(plan_module.__file__).read_text(encoding="utf-8")
+        assert "off_topic" not in source and "OFF_TOPIC" not in source
+
+    def test_unaffected_requests_carry_no_retrieval_effect(self):
+        quality = _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1000)
+        for request in quality.requests:
+            assert (request.retrieval_effect is not None) == (
+                request.scenario is Scenario.RETRIEVAL_QUALITY
+            )
+
+    @pytest.mark.parametrize("scenario", [
+        s for s in Scenario
+        if s not in (Scenario.RETRIEVAL_QUALITY, Scenario.MIXED_PRODUCTION)
+    ])
+    def test_no_other_scenario_plans_a_retrieval_effect(self, scenario):
+        plan = _plan(scenario=scenario, traces=600)
+        assert {r.retrieval_effect for r in plan.requests} == {None}
+
+    def test_mixed_production_plans_the_effect_only_in_retrieval_quality_episodes(self):
+        plan = _plan(scenario=Scenario.MIXED_PRODUCTION, traces=5000, rate=50.0)
+        degraded = [r for r in plan.requests if r.retrieval_effect is not None]
+        assert degraded
+        assert {r.scenario for r in degraded} == {Scenario.RETRIEVAL_QUALITY}
+        assert all(
+            r.retrieval_effect is RetrievalEffect.DROP_BEST_MATCH
+            for r in plan.requests if r.scenario is Scenario.RETRIEVAL_QUALITY
+        )
 
     def test_a_retrieval_quality_request_stays_in_its_session(self):
         normal = _plan(scenario=Scenario.NORMAL, traces=1000)
@@ -680,26 +713,23 @@ class TestScenariosInAPlan:
             degraded = [r for r in requests if r.scenario is Scenario.RETRIEVAL_QUALITY]
             if degraded and len(degraded) < len(requests):
                 touched += 1
-                # The neighbours in the session keep their own questions.
-                for request, before in zip(requests, normal[session_id]):
-                    if request.scenario is Scenario.NORMAL:
-                        assert request.query == before.query
+            # Every request of the session, degraded or not, keeps its question.
+            assert [r.query for r in requests] == [r.query for r in normal[session_id]]
         assert touched > 20
 
     def test_a_degraded_research_session_is_still_one_session(self):
         plan = _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1500,
                      persona=Persona.RESEARCH_SESSION)
-        research = {q for thread in RESEARCH_THREADS.values() for q in thread}
         mixed = 0
         for requests in _by_session(plan).values():
             assert {r.persona for r in requests} == {Persona.RESEARCH_SESSION}
-            kinds = {r.query in research for r in requests}
-            mixed += kinds == {True, False}
-            for request in requests:
-                expected = OFF_TOPIC_QUERIES if (
-                    request.scenario is Scenario.RETRIEVAL_QUALITY
-                ) else research
-                assert request.query in expected
+            kinds = {r.retrieval_effect for r in requests}
+            mixed += len(kinds) == 2
+            # Still one line of inquiry: consecutive questions of one thread.
+            queries = tuple(r.query for r in requests)
+            (thread,) = [t for t in RESEARCH_THREADS.values() if queries[0] in t]
+            first = thread.index(queries[0])
+            assert queries == thread[first:first + len(queries)]
         assert mixed > 10
 
     def test_retrieval_quality_keeps_the_persona_distribution(self):
@@ -713,10 +743,10 @@ class TestScenariosInAPlan:
         assert first == _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1000)
         other = _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1000, run_id="other-run")
         assert _traffic(first) == _traffic(other)
-        assert [r.query for r in first.requests] != [
-            r.query for r in _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1000,
-                                   seed=43).requests
-        ]
+        which = lambda plan: [r.retrieval_effect is not None for r in plan.requests]
+        assert which(first) != which(
+            _plan(scenario=Scenario.RETRIEVAL_QUALITY, traces=1000, seed=43)
+        )
 
     def test_no_scenario_creates_a_session_of_its_own(self):
         baseline = _plan(scenario=Scenario.NORMAL, traces=600)

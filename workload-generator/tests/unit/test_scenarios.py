@@ -26,7 +26,9 @@ from workload_generator.scenarios import (
     MIXED_ABNORMAL_SCENARIOS,
     SPECS,
     Episode,
+    RetrievalEffect,
     Scenario,
+    ScenarioSpec,
     Target,
     plan_episodes,
 )
@@ -113,7 +115,7 @@ class TestMetadata:
         spec = SPECS[Scenario.NORMAL]
         assert spec.target is None and spec.error_type is None
         assert spec.latency_factor is None and spec.windows == ()
-        assert not spec.client_retries and not spec.off_topic
+        assert not spec.client_retries and spec.retrieval_effect is None
 
     @pytest.mark.parametrize("scenario, target", [
         (Scenario.SLOW_TOOL, Target.TOOL),
@@ -183,12 +185,33 @@ class TestMetadata:
         assert "CLIENT" in description and "same session" in description
         assert "agent itself never retries" in description
 
-    def test_only_retrieval_quality_swaps_in_off_topic_requests(self):
-        assert [s for s, spec in SPECS.items() if spec.off_topic] == [
+    def test_exactly_one_retrieval_effect_exists(self):
+        assert [(effect.name, effect.value) for effect in RetrievalEffect] == [
+            ("DROP_BEST_MATCH", "drop-best-match"),
+        ]
+
+    def test_only_retrieval_quality_plans_a_retrieval_effect(self):
+        assert [s for s, spec in SPECS.items() if spec.retrieval_effect is not None] == [
             Scenario.RETRIEVAL_QUALITY
         ]
         spec = SPECS[Scenario.RETRIEVAL_QUALITY]
-        assert spec.target is None and spec.error_type is None
+        assert spec.retrieval_effect is RetrievalEffect.DROP_BEST_MATCH
+        assert spec.target is Target.RETRIEVAL
+        # A degraded result, nothing else: no failure, no added time, no retry.
+        assert spec.error_type is None and spec.latency_factor is None
+        assert spec.fixed_latency_ms is None and spec.fault_latency_ms is None
+        assert not spec.client_retries
+
+    def test_no_spec_can_replace_a_question(self):
+        names = {field for field in ScenarioSpec.__dataclass_fields__}
+        assert "off_topic" not in names and "query" not in names
+        source = (_PACKAGE / "scenarios.py").read_text(encoding="utf-8")
+        assert "off_topic" not in source
+
+    def test_retrieval_quality_does_not_promise_detection(self):
+        description = SPECS[Scenario.RETRIEVAL_QUALITY].description
+        assert "Visible in telemetry" in description
+        assert "not necessarily raised as an anomaly" in description
 
     def test_intensities_are_shares(self):
         for spec in SPECS.values():

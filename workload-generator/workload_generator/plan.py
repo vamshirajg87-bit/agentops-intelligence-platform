@@ -58,7 +58,6 @@ from .personas import (
     MIX_WEIGHTS,
     PROFILES,
     Persona,
-    off_topic_query,
     session_queries,
 )
 from .rng import Draw, derive_hex
@@ -66,6 +65,7 @@ from .scenarios import (
     ERROR_MESSAGES,
     SPECS,
     Episode,
+    RetrievalEffect,
     Scenario,
     ScenarioSpec,
     Target,
@@ -198,10 +198,10 @@ class PlannedRequest:
     inside an episode and affected by it.  episode_id is set for every
     request inside an episode, affected or not.
 
-    persona is the profile of the session the request belongs to.  The query
-    comes from that persona's pool, with one exception: a request affected
-    by RETRIEVAL_QUALITY keeps its session and persona and carries an
-    off-topic question instead.
+    persona is the profile of the session the request belongs to, and the
+    query always comes from that persona's pool: no scenario changes what a
+    user asks.  retrieval_effect is what is planned to happen to the RESULT
+    of the document lookup for this request, or None.
     """
 
     request_index: int
@@ -215,6 +215,7 @@ class PlannedRequest:
     fault: Optional[PlannedFault] = None
     retries: tuple[PlannedRetry, ...] = ()
     episode_id: Optional[str] = None
+    retrieval_effect: Optional[RetrievalEffect] = None
 
 
 @dataclass(frozen=True)
@@ -354,20 +355,13 @@ def _plan_request(
     if fault is not None and spec.client_retries:
         retries = _plan_retries(config, index, fault, draw)
 
-    query = arrival.query
-    if spec.off_topic:
-        # The same user in the same session asks something the agent knows
-        # nothing about.  Only the question changes: session and persona
-        # stay, and the scenario of the request says that it was replaced.
-        query = off_topic_query(draw)
-
     return PlannedRequest(
         request_index=index,
         request_id=_identifier("req_", config, "request", index),
         session_id=_identifier("sess_", config, "session", arrival.session),
         persona=arrival.persona,
         scenario=scenario,
-        query=query,
+        query=arrival.query,
         arrival_offset_seconds=offset,
         latency=PlannedLatency(
             tool_ms=round(durations[Target.TOOL], 3),
@@ -377,6 +371,7 @@ def _plan_request(
         fault=fault,
         retries=retries,
         episode_id=episode.episode_id if episode is not None else None,
+        retrieval_effect=spec.retrieval_effect,
     )
 
 
