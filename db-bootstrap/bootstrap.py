@@ -569,9 +569,16 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def load_config(environ: Mapping[str, str]) -> Config:
+def load_config(
+    environ: Mapping[str, str], *, require_role_passwords: bool = True,
+) -> Config:
     """
     Read the configuration from an environment mapping.
+
+    require_role_passwords is True for the bootstrap, which creates the
+    application roles.  A program that creates no role passes False: the
+    role passwords are then neither required nor read, and role_passwords
+    is empty.
 
     Raises:
         ConfigError  naming the variable, never its value.
@@ -604,8 +611,9 @@ def load_config(environ: Mapping[str, str]) -> Config:
             "that owner role"
         )
 
+    role_names = tuple(ROLE_PASSWORD_ENV.values()) if require_role_passwords else ()
     passwords: dict[str, str] = {}
-    for name in (_ENV_ADMIN_PASSWORD, *ROLE_PASSWORD_ENV.values()):
+    for name in (_ENV_ADMIN_PASSWORD, *role_names):
         value = required(name)
         if _is_placeholder(value):
             raise ConfigError(
@@ -629,9 +637,7 @@ def load_config(environ: Mapping[str, str]) -> Config:
         dbname=dbname,
         admin_user=admin_user,
         admin_password=passwords[_ENV_ADMIN_PASSWORD],
-        role_passwords={
-            env_name: passwords[env_name] for env_name in ROLE_PASSWORD_ENV.values()
-        },
+        role_passwords={env_name: passwords[env_name] for env_name in role_names},
         migrations_dir=migrations_dir,
         dbt_project_dir=dbt_project_dir,
         grants_file=Path(__file__).resolve().parent / "post_dbt_grants.sql",
@@ -1019,6 +1025,20 @@ class PsqlExecutor:
         lines.append(f"\\i {_psql_path_literal(step.path)}")
         lines.append(ledger_insert_sql(position, step.name, step.checksum))
         self._write("\n".join(lines) + "\n", step.name, extra_env)
+
+    def apply_unrecorded(self, path: Path, name: str) -> None:
+        """
+        Apply one SQL file in one transaction and record nothing.
+
+        For a file that is safe to repeat and needs no psql variable.  The
+        ledger is not read and not written.  name is used in the error only.
+
+        Raises:
+            StepError  the file failed; its transaction was rolled back.
+        """
+        if _STEP_NAME_RE.fullmatch(name) is None:
+            raise ValueError("a step name holds an unexpected character")
+        self._write(f"\\i {_psql_path_literal(path)}\n", name)
 
     def record_step(self, step: Step, position: int) -> None:
         """Record a step that has no SQL file of its own."""

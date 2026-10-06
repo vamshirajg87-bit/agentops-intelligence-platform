@@ -2,9 +2,10 @@
 #
 # One-shot database bootstrap image (Phase 14.2).
 #
-# Holds psql, dbt, the migrations, the analytics project and the bootstrap
-# program.  It holds no credential: every password is supplied through the
-# environment when the container runs.
+# Holds psql, dbt, the migrations, the analytics project, the bootstrap
+# program and the analytics refresh program, which a service selects with its
+# own entry point.  It holds no credential: every password is supplied through
+# the environment when the container runs.
 #
 # Build from the repository root:
 #   docker build -f docker/bootstrap/Dockerfile -t agentops-db-bootstrap .
@@ -38,7 +39,8 @@ COPY analytics/models analytics/models
 COPY analytics/macros analytics/macros
 COPY analytics/tests analytics/tests
 COPY storage-consumer/migrations storage-consumer/migrations
-COPY db-bootstrap/bootstrap.py db-bootstrap/post_dbt_grants.sql db-bootstrap/
+COPY db-bootstrap/bootstrap.py db-bootstrap/analytics_refresh.py \
+     db-bootstrap/post_dbt_grants.sql db-bootstrap/
 
 # Run unprivileged.  dbt writes its target, logs and profile copy here, never
 # into the project.

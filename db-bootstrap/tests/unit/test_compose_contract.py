@@ -17,6 +17,7 @@ Test inventory:
     CC05  .env.example
     CC06  Legacy-database override example and ignore rule
     CC07  Validation override
+    CC08  analytics-refresh service
 """
 
 from __future__ import annotations
@@ -115,7 +116,8 @@ class TestNoCredentialInCompose:
 
     def test_every_password_value_is_a_variable_reference(self):
         found = re.findall(r"^\s*([A-Z_]*PASSWORD[A-Z_]*):\s*(.*)$", _code(_COMPOSE_TEXT), re.M)
-        assert len(found) == 10
+        # postgres 1, db-bootstrap 8, analytics-refresh 1, grafana 1
+        assert len(found) == 11
         for name, value in found:
             assert re.fullmatch(r"\$\{[A-Z_]+(:[?-][^}]*)?\}", value), name
 
@@ -383,3 +385,93 @@ class TestValidationOverride:
 
     def test_bootstrap_needs_no_override_because_it_has_no_fixed_name(self):
         assert "container_name" not in _BOOTSTRAP and "ports" not in _BOOTSTRAP
+
+
+# ---------------------------------------------------------------------------
+# CC08  analytics-refresh
+# ---------------------------------------------------------------------------
+
+_REFRESH = _service(_COMPOSE_TEXT, "analytics-refresh")
+_REFRESH_PROGRAM = "/opt/agentops/db-bootstrap/analytics_refresh.py"
+
+
+class TestAnalyticsRefreshService:
+
+    def test_belongs_to_its_own_profile_so_up_does_not_start_it(self):
+        assert 'profiles: ["analytics-refresh"]' in _REFRESH
+        # No other service is in a profile, and nothing activates this one.
+        assert _code(_COMPOSE_TEXT).count("profiles:") == 1
+        assert "COMPOSE_PROFILES" not in _COMPOSE_TEXT
+        assert "COMPOSE_PROFILES" not in _text(_ENV_EXAMPLE)
+
+    def test_no_service_depends_on_it(self):
+        for name in ("kafka", "otel-collector", "kafka-init", "postgres", "db-bootstrap",
+                     "grafana"):
+            assert "analytics-refresh" not in _service(_COMPOSE_TEXT, name)
+
+    def test_built_exactly_like_the_bootstrap_image(self):
+        assert _section(_REFRESH, "build") == _section(_BOOTSTRAP, "build")
+
+    def test_entry_point_is_the_refresh_program(self):
+        assert f'entrypoint: ["python", "{_REFRESH_PROGRAM}"]' in _REFRESH
+        assert (_REPO / "db-bootstrap" / "analytics_refresh.py").is_file()
+
+    def test_waits_for_a_healthy_postgres_only(self):
+        depends = " ".join(_section(_REFRESH, "depends_on").split())
+        assert depends == "depends_on: postgres: condition: service_healthy"
+        assert "db-bootstrap" not in _REFRESH.replace(_REFRESH_PROGRAM, "")
+
+    def test_restart_is_disabled(self):
+        assert 'restart: "no"' in _REFRESH
+
+    @pytest.mark.parametrize("key", [
+        "ports", "container_name", "volumes", "command", "privileged", "env_file",
+        "image",
+    ])
+    def test_has_none_of(self, key):
+        assert re.search(rf"^\s*{key}:", _REFRESH, re.M) is None
+
+    def test_connection_target_is_the_bootstrap_one(self):
+        refresh, boot = _environment(_REFRESH), _environment(_BOOTSTRAP)
+        for name in ("BOOTSTRAP_DB_HOST", "BOOTSTRAP_DB_PORT", "BOOTSTRAP_DB_NAME",
+                     "BOOTSTRAP_DB_ADMIN_USER", "BOOTSTRAP_DB_ADMIN_PASSWORD"):
+            assert refresh[name] == boot[name]
+
+    def test_owner_password_is_the_only_credential(self):
+        environment = _environment(_REFRESH)
+        assert set(environment) == {
+            "BOOTSTRAP_DB_HOST", "BOOTSTRAP_DB_PORT", "BOOTSTRAP_DB_NAME",
+            "BOOTSTRAP_DB_ADMIN_USER", "BOOTSTRAP_DB_ADMIN_PASSWORD",
+        }
+        assert re.fullmatch(
+            r"\$\{POSTGRES_PASSWORD:\?[^}]+\}", environment["BOOTSTRAP_DB_ADMIN_PASSWORD"],
+        )
+
+    @pytest.mark.parametrize("name", _ROLE_VARIABLES)
+    def test_no_application_role_password_is_passed(self, name):
+        assert name not in _REFRESH
+
+    def test_given_environment_is_enough_for_the_refresh_and_not_for_the_bootstrap(self):
+        environ = {
+            "BOOTSTRAP_DB_HOST": "postgres", "BOOTSTRAP_DB_PORT": "5432",
+            "BOOTSTRAP_DB_NAME": "agentops", "BOOTSTRAP_DB_ADMIN_USER": "agentops",
+            "BOOTSTRAP_DB_ADMIN_PASSWORD": "TESTONLY-owner-51c7",
+        }
+        assert set(environ) == set(_environment(_REFRESH))
+        config = bootstrap.load_config(environ, require_role_passwords=False)
+        assert dict(config.role_passwords) == {}
+        with pytest.raises(bootstrap.ConfigError, match="is not set"):
+            bootstrap.load_config(environ)
+
+    def test_on_the_platform_network(self):
+        assert "- agentops-net" in _section(_REFRESH, "networks")
+
+    def test_needs_no_validation_override(self):
+        assert "analytics-refresh" not in _code(_text(_VALIDATION))
+        assert "analytics-refresh" not in _code(_text(_LEGACY))
+
+    def test_command_is_documented_and_direct_dbt_is_discouraged(self):
+        text = " ".join(_text(_ENV_EXAMPLE).replace("#", " ").split())
+        assert "docker compose run --rm analytics-refresh" in text
+        assert "Do not run dbt directly against a platform database" in text
+        assert "docker compose run --rm analytics-refresh" in _COMPOSE_TEXT
