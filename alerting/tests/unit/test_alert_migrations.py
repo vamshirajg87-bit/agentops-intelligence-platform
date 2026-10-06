@@ -24,7 +24,8 @@ Coverage:
     9.  alert_notifier: exact grant matrix
     10. No broad or dangerous privilege
     11. No password or credential literal
-    12. No SQL in the alerting component itself
+    12. No SQL or database driver in the alerting component, except in its
+        two database boundary modules (alert_db.py, alert_store.py)
 """
 
 from __future__ import annotations
@@ -985,10 +986,33 @@ class TestNoCredentials:
 
 
 # ---------------------------------------------------------------------------
-# 12. No SQL in the alerting component
+# 12. No SQL in the alerting component outside its database boundary
 # ---------------------------------------------------------------------------
 
+#: Phase 13.4: the only alerting modules that may hold SQL or import the
+#: database driver.  Every other module is still checked.
+_DB_BOUNDARY_MODULES = frozenset({"alert_db.py", "alert_store.py"})
+
+
 class TestNoSqlOutsideMigrations:
+    def test_db_boundary_is_exactly_two_top_level_modules(self):
+        assert _DB_BOUNDARY_MODULES == {"alert_db.py", "alert_store.py"}
+
+    def test_no_python_module_below_the_top_level(self):
+        # The check below reads top-level modules only, so no module may sit
+        # in a subdirectory, where it would not be checked.
+        found = []
+        for entry in os.listdir(_ALERTING):
+            path = os.path.join(_ALERTING, entry)
+            if not os.path.isdir(path) or entry in ("tests", "__pycache__"):
+                continue
+            for root, _, names in os.walk(path):
+                found.extend(
+                    os.path.join(root, name)
+                    for name in names if name.endswith(".py")
+                )
+        assert found == []
+
     def test_no_sql_file_in_alerting(self):
         found = [
             os.path.join(root, name)
@@ -1009,7 +1033,10 @@ class TestNoSqlOutsideMigrations:
             r"GRANT\s.+\sTO|ON\s+CONFLICT)\b",
             re.S,
         )
+        assert _DB_BOUNDARY_MODULES < set(modules)
         for name in modules:
+            if name in _DB_BOUNDARY_MODULES:
+                continue
             with open(os.path.join(_ALERTING, name), encoding="utf-8") as fh:
                 source = fh.read()
             assert statement.search(source) is None, name
