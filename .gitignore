@@ -1,7 +1,10 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .env
+# Machine-specific Compose changes; see docker/compose.legacy-database.example.yml
+docker-compose.override.yml
 .vscode/
 .idea/
 .DS_Store

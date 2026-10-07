@@ -10,6 +10,8 @@ existing node function and returns that function's result unchanged.
 No agent business logic is implemented here.
 """
 
+from opentelemetry.trace import StatusCode
+
 from state import AgentState
 from agents.supervisor import (
     supervisor_start_node,
@@ -81,7 +83,17 @@ def instrumented_tool_agent(state: AgentState) -> dict:
         span.set_attribute("agent.operation", "execute")
         span.set_attribute("gen_ai.operation.name", "execute_tool")
 
-        result = tool_agent_node(state)
+        try:
+            result = tool_agent_node(state)
+        except Exception as exc:
+            # Set error.type and error.message as span ATTRIBUTES (not events)
+            # so normalization.py promotes them to the error_type / error_message
+            # columns in the DB and the Trace Viewer can surface them without
+            # needing to parse span events.
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_attribute("error.message", str(exc))
+            span.set_status(StatusCode.ERROR, str(exc))
+            raise
 
         tool_result = result.get("tool_result")
 
