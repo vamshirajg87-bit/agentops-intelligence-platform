@@ -859,6 +859,11 @@ class TestArchitecturalGuards:
         for name in ("synthetic_driver.py", "driver.py"):
             assert not (_PACKAGE / name).exists()
         assert not list(_COMPONENT.rglob("runner_config*.json"))
+        # The one JSON file selects which existing detector groups the small
+        # end-to-end test runs; it holds no threshold.
+        assert [path.relative_to(_COMPONENT).as_posix() for path in _COMPONENT.rglob("*.json")] == [
+            "detector_config.json",
+        ]
         # The one Compose file is the smoke harness's override, used only by
         # run_smoke.py for a separate, disposable stack.
         assert [path.relative_to(_COMPONENT).as_posix() for path in _COMPONENT.rglob("*.yml")] == [
@@ -993,7 +998,9 @@ class TestArchitecturalGuards:
         )
         assert files == [
             "compose.smoke.override.yml",
+            "detector_config.json",
             "requirements.txt",
+            "run_e2e.py",
             "run_smoke.py",
             "tests/__init__.py",
             "tests/conftest.py",
