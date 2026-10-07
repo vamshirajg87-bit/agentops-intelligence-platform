@@ -79,6 +79,10 @@ class TestVocabulary:
     ])
     def test_no_model_or_cost_telemetry_is_invented(self, word):
         for path in _PACKAGE.glob("*.py"):
+            if word == "provider" and path.name == "real_driver.py":
+                # There the word is OpenTelemetry's tracer provider, not a
+                # model provider; every other word still applies to the file.
+                continue
             text = path.read_text(encoding="utf-8")
             # The one place the word may appear is prose saying it is absent.
             code = "\n".join(

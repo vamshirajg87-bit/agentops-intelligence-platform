@@ -3,12 +3,15 @@ workload_generator/report.py
 
 Metrics of a PLAN, as a text summary and as JSON.
 
-Everything here describes what was planned.  Nothing was executed, so there
-is no count of completed requests, no span count, no throughput and no
-measured latency in this report; those belong to a later phase that runs a
-plan.
+A PlanReport describes what was planned and nothing else: no count of
+completed requests, no span count, no throughput, no measured latency.
 
-Standard library only.
+An ExecutionReport is a separate thing, produced only when a plan was really
+executed.  It holds what the driver itself did and observed, including what
+its local exporter returned.  It makes no statement about anything
+downstream of that exporter.
+
+Standard library only.  This module knows nothing of how a plan is executed.
 
 Public API:
     PlanReport
@@ -16,7 +19,10 @@ Public API:
     plan_digest()       one SHA-256 over every planned request
     request_row()       one planned request as plain JSON-ready data
     format_summary()    the text printed after planning
-    write_report()      PlanReport -> JSON file
+    ExecutionReport, OUTCOMES, RUN_STATUSES
+    format_execution()  the text printed after execution
+    combined_dict()     plan report + execution report as one mapping
+    write_report()      report(s) -> JSON file
 """
 
 from __future__ import annotations
@@ -245,14 +251,30 @@ def _sample_line(request: PlannedRequest) -> str:
     )
 
 
-def format_summary(report: PlanReport, sample: Sequence[PlannedRequest] = ()) -> str:
-    """The text printed after planning.  Never one line per planned request."""
+def format_summary(
+    report: PlanReport,
+    sample: Sequence[PlannedRequest] = (),
+    *,
+    plan_only: bool = True,
+) -> str:
+    """
+    The text printed after planning.  Never one line per planned request.
+
+    plan_only is False when the plan is about to be executed; the heading
+    then says so instead of saying that nothing was sent.
+    """
+    heading = (
+        "PLAN ONLY - nothing was executed and nothing was sent."
+        if plan_only else
+        "PLAN - about to be executed; the execution report follows."
+    )
+    mode_note = "recorded; nothing is executed without --send" if plan_only else "executing"
     lines = [
-        "PLAN ONLY - nothing was executed and nothing was sent.",
+        heading,
         "",
         f"run id              {report.run_id}",
         f"seed                {report.seed}",
-        f"mode                {report.mode} (recorded; no driver exists yet)",
+        f"mode                {report.mode} ({mode_note})",
         f"scenario            {report.scenario}",
         f"persona             {report.persona}",
         f"requested traces    {report.requested_traces}",
@@ -291,9 +313,152 @@ def format_summary(report: PlanReport, sample: Sequence[PlannedRequest] = ()) ->
     return "\n".join(lines) + "\n"
 
 
-def write_report(report: PlanReport, path: Path) -> Path:
+#: Outcome of one execution attempt, in the order they are reported.  Only the
+#: first two are outcomes of the WORKLOAD; the next three mean the generator
+#: or the platform did not do what the plan describes.
+OUTCOMES: tuple[str, ...] = (
+    "expected_success",
+    "expected_failure",
+    "unexpected_failure",
+    "missing_failure",
+    "reach_failure",
+    "not_started",
+)
+
+RUN_STATUSES: tuple[str, ...] = (
+    "completed",
+    "stopped_integrity",
+    "deadline_reached",
+    "export_failed",
+)
+
+#: Integrity problems listed in a report; the count is always complete.
+MAX_PROBLEMS_LISTED: int = 10
+
+
+@dataclass(frozen=True)
+class ExecutionReport:
     """
-    Write the report as JSON to a NEW file and return its path.
+    What the driver did with a plan, as far as the driver itself can know.
+
+    spans_exported_successfully counts spans for which the local exporter
+    returned success.  That is the exporter's own result; it says nothing
+    about what a collector, Kafka or a database did with them afterwards.
+    Nothing here is a statement about stored rows or detected anomalies.
+
+    attempts maps every name in OUTCOMES to a count.  problems holds the
+    first integrity problems as text.
+    """
+
+    endpoint: str
+    started: str
+    finished: str
+    elapsed_seconds: float
+    planned_requests: int
+    planned_retries: int
+    planned_submissions: int
+    started_requests: int
+    not_started_requests: int
+    attempts: Mapping[str, int]
+    executed_attempts: int
+    executed_retries: int
+    late_starts: int
+    max_start_lag_seconds: float
+    mean_start_lag_seconds: float
+    achieved_submission_rate: float
+    spans_ended: int
+    spans_exported_successfully: int
+    export_failures: int
+    flush_ok: bool
+    run_status: str
+    problems: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.run_status not in RUN_STATUSES:
+            raise ValueError(f"unknown run status {self.run_status!r}")
+        if tuple(self.attempts) != OUTCOMES:
+            raise ValueError("attempts must hold exactly the known outcomes, in order")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "executed": True,
+            "endpoint": self.endpoint,
+            "started": self.started,
+            "finished": self.finished,
+            "elapsed_seconds": self.elapsed_seconds,
+            "planned_requests": self.planned_requests,
+            "planned_retries": self.planned_retries,
+            "planned_submissions": self.planned_submissions,
+            "started_requests": self.started_requests,
+            "not_started_requests": self.not_started_requests,
+            "attempts": dict(self.attempts),
+            "executed_attempts": self.executed_attempts,
+            "executed_retries": self.executed_retries,
+            "late_starts": self.late_starts,
+            "max_start_lag_seconds": self.max_start_lag_seconds,
+            "mean_start_lag_seconds": self.mean_start_lag_seconds,
+            "achieved_submission_rate": self.achieved_submission_rate,
+            "spans_ended": self.spans_ended,
+            "spans_exported_successfully": self.spans_exported_successfully,
+            "export_failures": self.export_failures,
+            "flush_ok": self.flush_ok,
+            "run_status": self.run_status,
+            "problems": list(self.problems),
+        }
+
+
+def format_execution(execution: ExecutionReport) -> str:
+    """The text printed after a plan was executed."""
+    lines = [
+        "EXECUTION - what this driver did. Nothing here says what a collector,",
+        "Kafka or a database did with the telemetry afterwards.",
+        "",
+        f"run status          {execution.run_status}",
+        f"endpoint            {execution.endpoint}",
+        f"started             {execution.started}",
+        f"finished            {execution.finished}",
+        f"elapsed             {execution.elapsed_seconds:.3f} seconds",
+        f"planned submissions {execution.planned_submissions} "
+        f"({execution.planned_requests} requests + {execution.planned_retries} retries)",
+        f"started requests    {execution.started_requests}",
+        f"not started         {execution.not_started_requests} requests",
+        f"executed attempts   {execution.executed_attempts} "
+        f"(of which client retries: {execution.executed_retries})",
+        "attempts by outcome:",
+    ]
+    for name in OUTCOMES:
+        lines.append(f"  {name:<20} {execution.attempts[name]:>8}")
+    lines += [
+        f"late starts         {execution.late_starts} "
+        f"(max lag {execution.max_start_lag_seconds:.3f} s, "
+        f"mean lag {execution.mean_start_lag_seconds:.3f} s)",
+        f"achieved rate       {execution.achieved_submission_rate:.3f} attempts/second",
+        f"spans ended         {execution.spans_ended}",
+        f"spans exported      {execution.spans_exported_successfully} "
+        "(local exporter reported success)",
+        f"export failures     {execution.export_failures}",
+        f"flush ok            {'yes' if execution.flush_ok else 'NO'}",
+    ]
+    if execution.problems:
+        lines.append("integrity problems (first ones):")
+        lines += [f"  {problem}" for problem in execution.problems]
+    return "\n".join(lines) + "\n"
+
+
+def combined_dict(report: PlanReport, execution: ExecutionReport) -> dict[str, Any]:
+    """The plan report with what was executed added under "execution"."""
+    data = report.to_dict()
+    data["executed"] = True
+    data["execution"] = execution.to_dict()
+    return data
+
+
+def write_report(
+    report: PlanReport, path: Path, execution: Optional[ExecutionReport] = None,
+) -> Path:
+    """
+    Write the report as JSON to a NEW file and return its path.  With an
+    execution report, the file holds both.
 
     Raises:
         FileExistsError    the path already exists; nothing is overwritten.
@@ -302,7 +467,11 @@ def write_report(report: PlanReport, path: Path) -> Path:
     path = Path(path)
     if not path.parent.is_dir():
         raise FileNotFoundError(f"directory does not exist: {path.parent}")
+    text = (
+        report.to_json() if execution is None
+        else json.dumps(combined_dict(report, execution), indent=2) + "\n"
+    )
     # "x": fails rather than replaces.
     with open(path, "x", encoding="utf-8", newline="\n") as handle:
-        handle.write(report.to_json())
+        handle.write(text)
     return path

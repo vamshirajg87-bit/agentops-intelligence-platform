@@ -160,7 +160,7 @@ class TestArguments:
     def test_both_modes_are_plan_only_and_plan_the_same(self, mode):
         text = _run("--mode", mode, "--run-id", "mode-test")
         assert text.splitlines()[0].startswith("PLAN ONLY")
-        assert "no driver exists yet" in _value(text, "mode")
+        assert "nothing is executed without --send" in _value(text, "mode")
         assert _value(text, "plan digest") == _value(
             _run("--mode", "real", "--run-id", "mode-test"), "plan digest",
         )
@@ -357,13 +357,149 @@ class TestRunId:
 # WC05  --send
 # ---------------------------------------------------------------------------
 
+_ENDPOINT = "http://localhost:14317"
+
+
+def _execution(**overrides):
+    """An execution report as a driver would return it for a clean run."""
+    from workload_generator.report import OUTCOMES, ExecutionReport
+    values = dict(
+        endpoint=_ENDPOINT, started="2026-10-06T12:00:00+00:00",
+        finished="2026-10-06T12:00:20+00:00", elapsed_seconds=20.0,
+        planned_requests=100, planned_retries=0, planned_submissions=100,
+        started_requests=100, not_started_requests=0,
+        attempts={**{name: 0 for name in OUTCOMES}, "expected_success": 100},
+        executed_attempts=100, executed_retries=0, late_starts=0,
+        max_start_lag_seconds=0.0, mean_start_lag_seconds=0.0,
+        achieved_submission_rate=5.0, spans_ended=700, spans_exported_successfully=700,
+        export_failures=0, flush_ok=True, run_status="completed",
+    )
+    values.update(overrides)
+    return ExecutionReport(**values)
+
+
+class FakeRunner:
+    """Stands in for the production execution path; contacts nothing."""
+
+    def __init__(self, execution=None, error=None) -> None:
+        self.calls: list[dict] = []
+        self.execution = execution if execution is not None else _execution()
+        self.error = error
+
+    def __call__(self, plan, **kwargs):
+        self.calls.append({"plan": plan, **kwargs})
+        if self.error is not None:
+            raise self.error
+        return self.execution
+
+
+def _send(*argv: str, runner=None) -> tuple[int, str, FakeRunner]:
+    runner = runner if runner is not None else FakeRunner()
+    out = io.StringIO()
+    code = cli.main(["--send", "--endpoint", _ENDPOINT, *argv], stdout=out, runner=runner)
+    return code, out.getvalue(), runner
+
+
 class TestSendIsRefused:
 
-    def test_send_is_refused_with_a_clear_message(self, capsys):
+    def test_send_without_an_endpoint_is_refused(self, capsys):
         error = " ".join(_refused(capsys, "--send").split())
-        assert "--send is not available" in error
-        assert "execution is not implemented in Phase 14.3B" in error
-        assert "nothing can be sent" in error
+        assert "--send is not available without --endpoint" in error
+        assert "there is no default endpoint" in error
+
+    def test_synthetic_send_is_refused_and_never_falls_back(self, capsys):
+        runner = FakeRunner()
+        out = io.StringIO()
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["--send", "--mode", "synthetic", "--endpoint", _ENDPOINT],
+                     stdout=out, runner=runner)
+        assert excinfo.value.code == 2
+        error = " ".join(capsys.readouterr().err.split())
+        assert "--send is not available for --mode synthetic" in error
+        assert "synthetic execution is not implemented" in error
+        assert "does not fall back" in error
+        assert runner.calls == [] and out.getvalue() == ""
+
+    @pytest.mark.parametrize("names", [
+        ["OTEL_SDK_DISABLED"],
+        ["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_SERVICE_NAME"],
+        ["OTEL_RESOURCE_ATTRIBUTES"],
+        ["OTEL_ANYTHING_AT_ALL"],
+    ])
+    def test_send_is_refused_while_any_otel_variable_is_set(self, capsys, monkeypatch, names):
+        for name in names:
+            monkeypatch.setenv(name, "SECRET-VALUE-do-not-print")
+        runner = FakeRunner()
+        out = io.StringIO()
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["--send", "--endpoint", _ENDPOINT], stdout=out, runner=runner)
+        assert excinfo.value.code == 2
+        error = capsys.readouterr().err
+        assert "--send is not available while OpenTelemetry environment variables" in error
+        for name in names:
+            assert name in error                         # names are shown ...
+        assert "SECRET-VALUE-do-not-print" not in error  # ... values never
+        assert runner.calls == [] and out.getvalue() == ""
+
+    def test_otel_variables_do_not_affect_plan_only_mode(self, monkeypatch):
+        monkeypatch.setenv("OTEL_SDK_DISABLED", "true")
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://example.invalid:4317")
+        text = _run("--run-id", "otel-plan-only", "--seed", "3")
+        assert text.splitlines()[0].startswith("PLAN ONLY")
+        monkeypatch.delenv("OTEL_SDK_DISABLED")
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+        assert _run("--run-id", "otel-plan-only", "--seed", "3") == text
+
+    @pytest.mark.parametrize("endpoint, reason", [
+        ("http://localhost:4317", "port 4317 is refused"),
+        ("http://127.0.0.1:4318", "port 4318 is refused"),
+        ("http://[::1]:4317", "port 4317 is refused"),
+        ("http://collector.example.com:14317", "needs --allow-remote-endpoint"),
+        ("http://10.0.0.5:14317", "needs --allow-remote-endpoint"),
+        ("https://localhost:14317", "must start with http://"),
+        ("localhost:14317", "must start with http://"),
+        ("grpc://localhost:14317", "must start with http://"),
+        ("http://localhost", "must name its port explicitly"),
+        ("http://localhost:14317/v1/traces", "and nothing more"),
+        ("http://localhost:14317?x=1", "and nothing more"),
+        ("http://user:pw@localhost:14317", "must not contain credentials"),
+        ("http://localhost:notaport", "not a valid http://host:port"),
+        ("http://localhost:99999", "not a valid http://host:port"),
+        ("http://:14317", "has no host"),
+        ("", "is empty"),
+        ("http://local host:14317", "must not contain whitespace"),
+    ])
+    def test_a_refused_endpoint(self, capsys, endpoint, reason):
+        runner = FakeRunner()
+        out = io.StringIO()
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["--send", f"--endpoint={endpoint}"], stdout=out, runner=runner)
+        assert excinfo.value.code == 2
+        error = " ".join(capsys.readouterr().err.split())
+        assert "--endpoint:" in error and reason in error
+        assert "pw@" not in error                        # credentials are not echoed
+        assert runner.calls == [] and out.getvalue() == ""
+
+    @pytest.mark.parametrize("port", ["4317", "4318"])
+    def test_the_platform_ports_are_refused_even_for_a_remote_endpoint(self, capsys, port):
+        with pytest.raises(SystemExit):
+            cli.main(["--send", "--endpoint", f"http://collector.example.com:{port}",
+                      "--allow-remote-endpoint"], stdout=io.StringIO(), runner=FakeRunner())
+        assert f"port {port} is refused" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [
+        ["--endpoint", _ENDPOINT], ["--allow-remote-endpoint"],
+        ["--endpoint", _ENDPOINT, "--allow-remote-endpoint"],
+    ])
+    def test_endpoint_arguments_without_send_are_refused(self, capsys, argv):
+        error = _refused(capsys, *argv)
+        assert "only used with --send" in error and "nothing is sent anywhere" in error
+
+    def test_there_is_no_default_endpoint(self):
+        parser = cli._build_parser()
+        assert parser.get_default("endpoint") is None
+        assert parser.get_default("send") is False
+        assert parser.get_default("allow_remote_endpoint") is False
 
     @pytest.mark.parametrize("argv", [
         ["--send", "--traces", "1"],
@@ -382,6 +518,132 @@ class TestSendIsRefused:
         target = tmp_path / "plan.json"
         _refused(capsys, "--send", "--report", str(target))
         assert not target.exists()
+
+
+class TestSendExecutes:
+
+    def test_a_valid_send_executes_the_plan_once(self):
+        code, text, runner = _send("--run-id", "send-ok", "--seed", "4", "--concurrency", "3",
+                                   "--max-duration", "2m")
+        assert code == 0
+        (call,) = runner.calls
+        assert len(call["plan"].requests) == 100
+        assert call["plan"].config.run_id == "send-ok" and call["plan"].config.seed == 4
+        assert call["concurrency"] == 3 and call["max_duration_seconds"] == 120.0
+        endpoint = call["endpoint"]
+        assert (endpoint.url, endpoint.host, endpoint.port, endpoint.is_loopback) == (
+            _ENDPOINT, "localhost", 14317, True,
+        )
+        assert set(call) == {"plan", "endpoint", "concurrency", "max_duration_seconds"}
+
+    def test_the_plan_executed_is_the_plan_that_plan_only_prints(self):
+        plain = _run("--run-id", "same-plan", "--seed", "9", "--scenario", "api-500")
+        _, text, runner = _send("--run-id", "same-plan", "--seed", "9", "--scenario", "api-500")
+        assert _value(text, "plan digest") == _value(plain, "plan digest")
+        from workload_generator.report import plan_digest
+        assert plan_digest(runner.calls[0]["plan"]) == _value(plain, "plan digest")
+
+    def test_output_says_plan_then_execution_and_never_plan_only(self):
+        _, text, _ = _send()
+        lines = text.splitlines()
+        assert lines[0] == "PLAN - about to be executed; the execution report follows."
+        assert "PLAN ONLY" not in text
+        assert _value(text, "mode") == "real (executing)"
+        assert "EXECUTION - what this driver did." in text
+        assert text.index("plan digest") < text.index("EXECUTION -")
+        assert _value(text, "run status") == "completed"
+        assert _value(text, "endpoint") == _ENDPOINT
+
+    @pytest.mark.parametrize("endpoint, url", [
+        ("http://localhost:14317", "http://localhost:14317"),
+        ("http://127.0.0.1:14317/", "http://127.0.0.1:14317"),
+        ("http://[::1]:5317", "http://[::1]:5317"),
+    ])
+    def test_loopback_endpoints_are_accepted(self, endpoint, url):
+        runner = FakeRunner()
+        assert cli.main(["--send", "--endpoint", endpoint], stdout=io.StringIO(),
+                        runner=runner) == 0
+        assert runner.calls[0]["endpoint"].url == url
+        assert runner.calls[0]["endpoint"].is_loopback
+
+    def test_a_remote_endpoint_needs_the_explicit_flag(self):
+        runner = FakeRunner()
+        code = cli.main(["--send", "--endpoint", "http://collector.example.com:14317",
+                         "--allow-remote-endpoint"], stdout=io.StringIO(), runner=runner)
+        assert code == 0
+        endpoint = runner.calls[0]["endpoint"]
+        assert endpoint.host == "collector.example.com" and not endpoint.is_loopback
+
+    @pytest.mark.parametrize("status, code", [
+        ("completed", 0), ("stopped_integrity", 3), ("export_failed", 4),
+        ("deadline_reached", 5),
+    ])
+    def test_exit_code_follows_the_run_status(self, status, code):
+        actual, text, _ = _send(runner=FakeRunner(_execution(run_status=status)))
+        assert actual == code
+        assert _value(text, "run status") == status
+
+    def test_a_driver_refusal_exits_two_and_says_why(self, capsys):
+        from workload_generator.real_driver import DriverError
+        runner = FakeRunner(error=DriverError("nothing is reachable at localhost:14317"))
+        code, text, _ = _send(runner=runner)
+        assert code == 2
+        assert "error: nothing is reachable at localhost:14317" in capsys.readouterr().err
+        assert "EXECUTION" not in text
+
+    def test_an_unexpected_error_is_not_swallowed(self):
+        with pytest.raises(ZeroDivisionError):
+            _send(runner=FakeRunner(error=ZeroDivisionError()))
+
+    def test_safety_limits_still_apply_with_send(self, capsys):
+        for argv, message in (
+            (["--traces", "10001", "--rate", "100"], "requires --allow-large"),
+            (["--concurrency", "65"], "--concurrency must be between 1 and 64"),
+            (["--max-duration", "5s"], "more than --max-duration"),
+            (["--rate", "0"], "--rate must be more than 0"),
+        ):
+            runner = FakeRunner()
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main(["--send", "--endpoint", _ENDPOINT, *argv], stdout=io.StringIO(),
+                         runner=runner)
+            assert excinfo.value.code == 2 and runner.calls == []
+            assert message in capsys.readouterr().err
+
+    def test_report_with_send_holds_plan_and_execution(self, tmp_path):
+        target = tmp_path / "run.json"
+        code, text, _ = _send("--run-id", "send-report", "--report", str(target))
+        assert code == 0 and text.splitlines()[-1] == f"report written to {target}"
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data["executed"] is True and data["run_id"] == "send-report"
+        assert data["plan_digest"] == _value(text, "plan digest")
+        execution = data["execution"]
+        assert execution["run_status"] == "completed" and execution["endpoint"] == _ENDPOINT
+        assert execution["spans_ended"] == execution["spans_exported_successfully"] == 700
+
+    def test_report_is_written_for_a_stopped_run_too(self, tmp_path):
+        target = tmp_path / "run.json"
+        stopped = _execution(run_status="stopped_integrity", problems=("request 3: x",))
+        code, _, _ = _send("--report", str(target), runner=FakeRunner(stopped))
+        assert code == 3
+        assert json.loads(target.read_text(encoding="utf-8"))["execution"]["problems"] == [
+            "request 3: x"
+        ]
+
+    def test_without_a_runner_the_production_path_is_the_drivers(self):
+        source = (_PACKAGE / "cli.py").read_text(encoding="utf-8")
+        assert "runner if runner is not None else driver.run_real" in source
+
+    def test_send_through_the_module_refuses_without_contacting_anything(self):
+        # A real process, the real production path: refused before any
+        # connection is attempted.
+        for argv, message in (
+            (["--send"], "without --endpoint"),
+            (["--send", "--endpoint", "http://localhost:4317"], "port 4317 is refused"),
+            (["--send", "--mode", "synthetic", "--endpoint", _ENDPOINT], "synthetic"),
+        ):
+            completed = _module(*argv)
+            assert completed.returncode == 2 and completed.stdout == ""
+            assert message in completed.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -522,19 +784,28 @@ def _called_names(path: Path) -> set[str]:
     return found
 
 
+_DRIVER = _PACKAGE / "real_driver.py"
+# Every module but the execution driver keeps the strict rules.
+_STRICT_MODULES = [path for path in _RUNTIME_MODULES if path != _DRIVER]
+
+
 class TestArchitecturalGuards:
 
     def test_the_runtime_package_is_these_modules(self):
         assert [path.name for path in _RUNTIME_MODULES] == [
             "__init__.py", "__main__.py", "cli.py", "faults.py", "personas.py",
+            "plan.py", "real_driver.py", "report.py", "rng.py", "scenarios.py",
+        ]
+        assert [path.name for path in _STRICT_MODULES] == [
+            "__init__.py", "__main__.py", "cli.py", "faults.py", "personas.py",
             "plan.py", "report.py", "rng.py", "scenarios.py",
         ]
 
-    @pytest.mark.parametrize("path", _RUNTIME_MODULES, ids=lambda p: p.name)
+    @pytest.mark.parametrize("path", _STRICT_MODULES, ids=lambda p: p.name)
     def test_standard_library_only(self, path):
         assert _imports(path) <= _ALLOWED_IMPORTS
 
-    @pytest.mark.parametrize("path", _RUNTIME_MODULES, ids=lambda p: p.name)
+    @pytest.mark.parametrize("path", _STRICT_MODULES, ids=lambda p: p.name)
     def test_no_database_kafka_telemetry_network_or_process_import(self, path):
         assert not _imports(path) & _FORBIDDEN_IMPORTS
 
@@ -554,7 +825,7 @@ class TestArchitecturalGuards:
         assert completed.returncode == 0, completed.stderr
         assert completed.stdout.strip() == "[]"
 
-    @pytest.mark.parametrize("path", _RUNTIME_MODULES, ids=lambda p: p.name)
+    @pytest.mark.parametrize("path", _STRICT_MODULES, ids=lambda p: p.name)
     def test_nothing_waits_starts_a_process_or_opens_a_connection(self, path):
         calls = _called_names(path)
         for name in ("sleep", "run", "Popen", "system", "connect", "create_connection",
@@ -562,7 +833,7 @@ class TestArchitecturalGuards:
                      "invoke", "getenv", "load_dotenv"):
             assert name not in calls, name
 
-    @pytest.mark.parametrize("path", _RUNTIME_MODULES, ids=lambda p: p.name)
+    @pytest.mark.parametrize("path", _STRICT_MODULES, ids=lambda p: p.name)
     def test_the_environment_is_never_read(self, path):
         text = path.read_text(encoding="utf-8")
         assert "os.environ" not in text and "environ[" not in text
@@ -577,18 +848,136 @@ class TestArchitecturalGuards:
         text = (_PACKAGE / "report.py").read_text(encoding="utf-8")
         assert text.count("open(") == 1 and 'open(path, "x"' in text
 
-    def test_the_command_does_not_use_the_fault_layer_yet(self):
-        # Fault injection exists as a module; nothing executes a plan yet.
-        for path in _RUNTIME_MODULES:
+    def test_only_the_driver_uses_the_fault_layer(self):
+        for path in _STRICT_MODULES:
             if path.name != "faults.py":
                 text = path.read_text(encoding="utf-8")
                 assert ".faults" not in text and "import faults" not in text, path.name
+        assert "from .faults import" in _DRIVER.read_text(encoding="utf-8")
 
-    def test_no_driver_or_detector_file_exists_yet(self):
-        for name in ("real_driver.py", "synthetic_driver.py", "driver.py"):
+    def test_no_synthetic_driver_or_detector_file_exists_yet(self):
+        for name in ("synthetic_driver.py", "driver.py"):
             assert not (_PACKAGE / name).exists()
         assert not list(_COMPONENT.rglob("runner_config*.json"))
-        assert not (_COMPONENT / "requirements.txt").exists()
+        assert not list(_COMPONENT.rglob("*.yml")) and not list(_COMPONENT.rglob("*.yaml"))
+
+    def test_runtime_requirements_are_the_demo_applications(self):
+        lines = [
+            line.strip()
+            for line in (_COMPONENT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        assert lines == ["-r ../demo-app/requirements.txt"]
+        assert (_REPO / "demo-app" / "requirements.txt").is_file()
+        # Test tooling is not a runtime requirement.
+        assert not (_COMPONENT / "requirements-dev.txt").exists()
+
+    # -- the execution driver: the one module with wider, still bounded, rules --
+
+    @staticmethod
+    def _driver_top_level_imports() -> set[str]:
+        """What is imported when the driver module is loaded (not inside functions)."""
+        top = set()
+        for node in ast.parse(_DRIVER.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.Import):
+                top.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                top.add(node.module.split(".")[0])
+        return top
+
+    def test_the_driver_loads_with_the_standard_library_only(self):
+        assert self._driver_top_level_imports() == {
+            "__future__", "os", "socket", "threading", "time", "concurrent", "contextlib",
+            "dataclasses", "datetime", "enum", "typing", "urllib",
+        }
+
+    def test_the_driver_imports_telemetry_and_the_demo_only_inside_functions(self):
+        inside_functions = _imports(_DRIVER) - self._driver_top_level_imports()
+        assert inside_functions == {
+            "grpc", "opentelemetry", "graph", "agents", "observability",
+        }
+
+    @pytest.mark.parametrize("module", [
+        "psycopg", "psycopg2", "sqlalchemy", "sqlite3", "confluent_kafka", "kafka",
+        "subprocess", "docker", "requests", "httpx", "ssl", "asyncio", "multiprocessing",
+        "random", "secrets", "shutil",
+    ])
+    def test_the_driver_never_imports(self, module):
+        assert module not in _imports(_DRIVER)
+
+    def test_loading_the_driver_imports_no_telemetry_and_no_demo_module(self):
+        code = (
+            "import sys, workload_generator.real_driver;"
+            "bad = sorted(m for m in sys.modules if m.split('.')[0] in "
+            "('opentelemetry','grpc','langgraph','langchain_core','pydantic',"
+            "'confluent_kafka','graph','agents','observability','psycopg'));"
+            "print(bad)"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code], cwd=_COMPONENT, capture_output=True, text=True,
+            env={**{k: v for k, v in os.environ.items() if k in ("SYSTEMROOT", "PATH")},
+                 "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.strip() == "[]"
+
+    def test_the_driver_reads_the_environment_for_variable_names_only(self):
+        text = _DRIVER.read_text(encoding="utf-8")
+        assert text.count("os.environ") == 1
+        assert "source = os.environ if environ is None else environ" in text
+        for word in ("getenv", "environ[", "environ.get", ".env\"", "load_dotenv"):
+            assert word not in text
+
+    def test_the_driver_opens_exactly_one_kind_of_connection_of_its_own(self):
+        text = _DRIVER.read_text(encoding="utf-8")
+        assert text.count("socket.") == 1 and "socket.create_connection(" in text
+        calls = _called_names(_DRIVER)
+        for name in ("Popen", "system", "urlopen", "Producer", "Consumer", "open",
+                     "connect", "execute_sql", "cursor"):
+            assert name not in calls, name
+
+    def test_the_driver_has_no_default_endpoint(self):
+        text = _DRIVER.read_text(encoding="utf-8")
+        for word in ("DEFAULT_ENDPOINT", "http://localhost", "http://127.0.0.1",
+                     "localhost:4317", "localhost:4318"):
+            assert word not in text, word
+        from workload_generator import real_driver
+        assert real_driver.REFUSED_PORTS == frozenset({4317, 4318})
+        assert real_driver.LOOPBACK_HOSTS == frozenset({"localhost", "127.0.0.1", "::1"})
+
+    def test_the_driver_does_not_change_the_import_path_or_register_a_provider(self):
+        text = _DRIVER.read_text(encoding="utf-8")
+        for word in ("sys.path", "set_tracer_provider", "configure_tracing",
+                     "ConsoleSpanExporter", "CanonicalSpanExporter", "KafkaTelemetryPublisher",
+                     "AGENTOPS_DIRECT_EXPORT"):
+            assert word not in text, word
+
+    def test_the_driver_plans_nothing(self):
+        names = set()
+        for node in ast.walk(ast.parse(_DRIVER.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr)
+        for word in ("Draw", "build_plan", "plan_episodes", "SPECS", "uniform", "choice",
+                     "seed", "randint"):
+            assert word not in names, word
+
+    def test_plan_only_never_loads_the_driver(self):
+        code = (
+            "import io, sys; from workload_generator import cli;"
+            "cli.main(['--traces', '20', '--run-id', 'plan-only'], stdout=io.StringIO());"
+            "print(sorted(m for m in sys.modules if m.split('.')[0] in "
+            "('opentelemetry','grpc','langgraph','confluent_kafka','graph','agents',"
+            "'observability','socket') or m == 'workload_generator.real_driver'))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code], cwd=_COMPONENT, capture_output=True, text=True,
+            env={**{k: v for k, v in os.environ.items() if k in ("SYSTEMROOT", "PATH")},
+                 "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.strip() == "[]"
 
     def test_the_component_holds_only_code_and_tests(self):
         files = sorted(
@@ -598,8 +987,11 @@ class TestArchitecturalGuards:
             and ".pytest_cache" not in path.parts
         )
         assert files == [
+            "requirements.txt",
             "tests/__init__.py",
             "tests/conftest.py",
+            "tests/integration/__init__.py",
+            "tests/integration/test_real_driver.py",
             "tests/unit/__init__.py",
             "tests/unit/test_cli.py",
             "tests/unit/test_faults.py",
@@ -613,20 +1005,32 @@ class TestArchitecturalGuards:
             "workload_generator/faults.py",
             "workload_generator/personas.py",
             "workload_generator/plan.py",
+            "workload_generator/real_driver.py",
             "workload_generator/report.py",
             "workload_generator/rng.py",
             "workload_generator/scenarios.py",
         ]
 
-    def test_no_service_name_endpoint_or_topic_is_configured_yet(self):
-        for path in _RUNTIME_MODULES:
+    def test_no_endpoint_or_topic_is_configured_outside_the_command_and_driver(self):
+        # The command names endpoints only in its help and refusals; the
+        # driver only validates the one it is given.
+        for path in _STRICT_MODULES:
+            if path.name == "cli.py":
+                continue
             text = path.read_text(encoding="utf-8")
             for word in ("4317", "4318", "9092", "5432", "localhost", "agentops.telemetry",
                          "bootstrap.servers", "http://", "https://"):
                 assert word not in text, (path.name, word)
 
-    def test_the_demo_application_is_not_imported_by_the_runtime(self):
+    def test_no_kafka_or_database_target_anywhere(self):
         for path in _RUNTIME_MODULES:
+            text = path.read_text(encoding="utf-8")
+            for word in ("9092", "5432", "agentops.telemetry", "bootstrap.servers",
+                         "postgresql://", "PG_PASSWORD", "KAFKA_BOOTSTRAP"):
+                assert word not in text, (path.name, word)
+
+    def test_the_demo_application_is_not_imported_by_the_strict_modules(self):
+        for path in _STRICT_MODULES:
             text = path.read_text(encoding="utf-8")
             assert "sys.path" not in text
             assert "demo-app" not in text and "demo_app" not in text

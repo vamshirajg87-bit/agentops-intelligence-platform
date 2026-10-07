@@ -1329,8 +1329,16 @@ class TestGuards:
             assert word not in source, word
 
     def test_no_retry_or_workload_telemetry_attribute_is_introduced(self):
+        # Every module but the execution driver sets no span attribute at all.
+        # The driver sets the approved root-span attributes and nothing about
+        # retries or attempts.
         for path in _FAULTS.parent.glob("*.py"):
             text = path.read_text(encoding="utf-8")
+            if path.name == "real_driver.py":
+                for word in ("agentops.retry", "retry_attempt", "workload.attempt",
+                             "workload.retry"):
+                    assert word not in text, (path.name, word)
+                continue
             for word in ("agentops.workload", "agentops.retry", "retry_attempt",
                          "set_attribute"):
                 assert word not in text, (path.name, word)

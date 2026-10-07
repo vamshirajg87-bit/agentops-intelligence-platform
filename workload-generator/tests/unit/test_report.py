@@ -23,8 +23,13 @@ from workload_generator import __version__, report as report_module
 from workload_generator.personas import Persona
 from workload_generator.plan import Plan, PlanConfig, build_plan
 from workload_generator.report import (
+    OUTCOMES,
+    RUN_STATUSES,
     SAMPLE_SIZE,
+    ExecutionReport,
     build_report,
+    combined_dict,
+    format_execution,
     format_summary,
     plan_digest,
     request_row,
@@ -435,3 +440,187 @@ class TestWriteReport:
     def test_only_the_named_file_is_created(self, tmp_path):
         write_report(_report(_plan()), tmp_path / "plan.json")
         assert [p.name for p in tmp_path.iterdir()] == ["plan.json"]
+
+
+# ---------------------------------------------------------------------------
+# WR07  Execution report
+# ---------------------------------------------------------------------------
+
+def _execution(**overrides) -> ExecutionReport:
+    values = dict(
+        endpoint="http://localhost:14317", started="2026-10-06T12:00:00+00:00",
+        finished="2026-10-06T12:02:00+00:00", elapsed_seconds=119.8,
+        planned_requests=600, planned_retries=40, planned_submissions=640,
+        started_requests=600, not_started_requests=0,
+        attempts={**{name: 0 for name in OUTCOMES}, "expected_success": 520,
+                  "expected_failure": 120},
+        executed_attempts=640, executed_retries=40, late_starts=3,
+        max_start_lag_seconds=0.412, mean_start_lag_seconds=0.021,
+        achieved_submission_rate=5.342, spans_ended=4240,
+        spans_exported_successfully=4240, export_failures=0, flush_ok=True,
+        run_status="completed",
+    )
+    values.update(overrides)
+    return ExecutionReport(**values)
+
+
+class TestExecutionReport:
+
+    def test_outcome_and_status_vocabularies(self):
+        assert OUTCOMES == (
+            "expected_success", "expected_failure", "unexpected_failure",
+            "missing_failure", "reach_failure", "not_started",
+        )
+        assert RUN_STATUSES == (
+            "completed", "stopped_integrity", "deadline_reached", "export_failed",
+        )
+
+    def test_keys_of_the_execution_report(self):
+        assert list(_execution().to_dict()) == [
+            "executed", "endpoint", "started", "finished", "elapsed_seconds",
+            "planned_requests", "planned_retries", "planned_submissions",
+            "started_requests", "not_started_requests", "attempts", "executed_attempts",
+            "executed_retries", "late_starts", "max_start_lag_seconds",
+            "mean_start_lag_seconds", "achieved_submission_rate", "spans_ended",
+            "spans_exported_successfully", "export_failures", "flush_ok", "run_status",
+            "problems",
+        ]
+
+    def test_values_round_trip_through_json(self):
+        execution = _execution(problems=("request 3 attempt 0 (req_x): reach_failure: y",))
+        data = json.loads(json.dumps(execution.to_dict()))
+        assert data["executed"] is True
+        assert data["attempts"] == dict(execution.attempts)
+        assert list(data["attempts"]) == list(OUTCOMES)
+        assert data["problems"] == list(execution.problems)
+        assert data["flush_ok"] is True and data["run_status"] == "completed"
+
+    @pytest.mark.parametrize("status", ["finished", "ok", "", "COMPLETED"])
+    def test_an_unknown_run_status_is_rejected(self, status):
+        with pytest.raises(ValueError):
+            _execution(run_status=status)
+
+    @pytest.mark.parametrize("attempts", [
+        {}, {"expected_success": 1},
+        {name: 0 for name in reversed(OUTCOMES)},
+        {**{name: 0 for name in OUTCOMES}, "persisted": 1},
+    ])
+    def test_attempts_must_hold_exactly_the_known_outcomes(self, attempts):
+        with pytest.raises(ValueError):
+            _execution(attempts=attempts)
+
+    @pytest.mark.parametrize("word", [
+        "collector", "accepted", "received", "delivered", "persisted", "stored", "kafka",
+        "rows", "ingested", "detected", "anomal",
+    ])
+    def test_no_field_claims_anything_downstream_of_the_exporter(self, word):
+        for key in _execution().to_dict():
+            assert word not in key.lower(), key
+
+    def test_export_fields_use_the_precise_names(self):
+        keys = set(_execution().to_dict())
+        assert {"spans_ended", "spans_exported_successfully", "export_failures",
+                "flush_ok"} <= keys
+        assert not {"spans_sent", "spans_delivered", "spans_accepted"} & keys
+
+    def test_summary_text_states_its_own_limits(self):
+        text = format_execution(_execution())
+        lines = text.splitlines()
+        assert lines[0].startswith("EXECUTION - what this driver did.")
+        assert "Nothing here says what a collector" in lines[0]
+        assert "did with the telemetry afterwards." in lines[1]
+        (exported,) = [l for l in lines if l.startswith("spans exported")]
+        assert exported.split()[2] == "4240"
+        assert "(local exporter reported success)" in exported
+        for phrase in ("collector accepted", "delivered", "persisted", "stored"):
+            assert phrase not in text.lower()
+
+    def test_summary_text_shows_every_reported_value(self):
+        text = format_execution(_execution())
+        value = lambda label: next(
+            l[len(label):].strip() for l in text.splitlines() if l.startswith(label + " ")
+        )
+        assert value("run status") == "completed"
+        assert value("endpoint") == "http://localhost:14317"
+        assert value("elapsed") == "119.800 seconds"
+        assert value("planned submissions") == "640 (600 requests + 40 retries)"
+        assert value("started requests") == "600"
+        assert value("not started") == "0 requests"
+        assert value("executed attempts") == "640 (of which client retries: 40)"
+        assert value("late starts") == "3 (max lag 0.412 s, mean lag 0.021 s)"
+        assert value("achieved rate") == "5.342 attempts/second"
+        assert value("spans ended") == "4240"
+        assert value("export failures") == "0"
+        assert value("flush ok") == "yes"
+        for name in OUTCOMES:
+            (line,) = [l for l in text.splitlines() if l.startswith(f"  {name} ")]
+            assert int(line.split()[1]) == _execution().attempts[name]
+
+    def test_a_failed_flush_is_conspicuous(self):
+        text = format_execution(_execution(flush_ok=False, run_status="export_failed"))
+        assert "flush ok            NO" in text
+        assert "run status          export_failed" in text
+
+    def test_integrity_problems_are_listed_only_when_there_are_some(self):
+        assert "integrity problems" not in format_execution(_execution())
+        text = format_execution(_execution(
+            run_status="stopped_integrity",
+            problems=("request 7 attempt 0 (req_a): missing_failure: planned X",),
+        ))
+        assert text.splitlines()[-2] == "integrity problems (first ones):"
+        assert text.splitlines()[-1] == (
+            "  request 7 attempt 0 (req_a): missing_failure: planned X"
+        )
+
+    def test_summary_is_ascii_and_bounded(self):
+        text = format_execution(_execution(problems=tuple(f"p{i}" for i in range(10))))
+        assert text.isascii() and len(text.splitlines()) < 45
+
+    def test_combined_report_keeps_the_plan_and_adds_the_execution(self):
+        plan = _plan()
+        report = _report(plan)
+        combined = combined_dict(report, _execution())
+        assert list(combined)[:-1] == list(report.to_dict())
+        assert list(combined)[-1] == "execution"
+        assert combined["executed"] is True
+        assert combined["execution"] == _execution().to_dict()
+        for key, value in report.to_dict().items():
+            if key != "executed":
+                assert combined[key] == value
+        # The plan report on its own is unchanged and still says "not executed".
+        assert report.to_dict()["executed"] is False
+
+    def test_report_file_with_execution(self, tmp_path):
+        report = _report(_plan())
+        path = write_report(report, tmp_path / "run.json", _execution())
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data == combined_dict(report, _execution())
+        assert b"\r" not in path.read_bytes()
+
+    def test_report_file_with_execution_never_overwrites(self, tmp_path):
+        target = tmp_path / "run.json"
+        target.write_text("keep me", encoding="utf-8")
+        with pytest.raises(FileExistsError):
+            write_report(_report(_plan()), target, _execution())
+        assert target.read_text(encoding="utf-8") == "keep me"
+
+    def test_the_report_module_does_not_know_the_driver(self):
+        source = Path(report_module.__file__).read_text(encoding="utf-8")
+        assert "real_driver" not in source and "opentelemetry" not in source
+
+    def test_plan_summary_heading_depends_on_what_follows(self):
+        plan = _plan()
+        report = _report(plan)
+        assert format_summary(report).splitlines()[0] == (
+            "PLAN ONLY - nothing was executed and nothing was sent."
+        )
+        executing = format_summary(report, plan_only=False)
+        assert executing.splitlines()[0] == (
+            "PLAN - about to be executed; the execution report follows."
+        )
+        assert "PLAN ONLY" not in executing
+        # Apart from the heading and the mode note the two are the same.
+        strip = lambda text: [
+            l for l in text.splitlines()[1:] if not l.startswith("mode ")
+        ]
+        assert strip(executing) == strip(format_summary(report))
