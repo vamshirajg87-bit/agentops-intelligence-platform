@@ -859,7 +859,12 @@ class TestArchitecturalGuards:
         for name in ("synthetic_driver.py", "driver.py"):
             assert not (_PACKAGE / name).exists()
         assert not list(_COMPONENT.rglob("runner_config*.json"))
-        assert not list(_COMPONENT.rglob("*.yml")) and not list(_COMPONENT.rglob("*.yaml"))
+        # The one Compose file is the smoke harness's override, used only by
+        # run_smoke.py for a separate, disposable stack.
+        assert [path.relative_to(_COMPONENT).as_posix() for path in _COMPONENT.rglob("*.yml")] == [
+            "compose.smoke.override.yml",
+        ]
+        assert not list(_COMPONENT.rglob("*.yaml"))
 
     def test_runtime_requirements_are_the_demo_applications(self):
         lines = [
@@ -987,7 +992,9 @@ class TestArchitecturalGuards:
             and ".pytest_cache" not in path.parts
         )
         assert files == [
+            "compose.smoke.override.yml",
             "requirements.txt",
+            "run_smoke.py",
             "tests/__init__.py",
             "tests/conftest.py",
             "tests/integration/__init__.py",
