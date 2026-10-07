@@ -68,7 +68,8 @@ jobs:
             scripts \
             storage-consumer \
             stream-processor \
-            trace-viewer
+            trace-viewer \
+            workload-generator
 
       # Each component runs in its own pytest process: components reuse module
       # names such as config and main. Every suite runs even if an earlier one
@@ -111,3 +112,11 @@ jobs:
       - name: Test db-bootstrap
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: python -m pytest db-bootstrap/tests -q -rs -p no:cacheprovider
+
+      # Workload generator: planning, fault injection and the execution
+      # driver, with every exporter and socket replaced inside the tests.
+      # Nothing is sent. The two live harnesses (run_smoke.py, run_e2e.py)
+      # need Docker and are never run here.
+      - name: Test workload-generator
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest workload-generator/tests -q -rs -p no:cacheprovider
