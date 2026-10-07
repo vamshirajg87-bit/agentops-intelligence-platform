@@ -789,9 +789,11 @@ def group_lag(group: str, topic: str) -> Optional[int]:
 
 
 def start_host_services() -> None:
+    # The broker is published on 127.0.0.1 only.  "localhost" may resolve to
+    # ::1 first, and a Kafka client that tries it waits and can fail a commit.
     section("stream processor")
     start_host_process("stream-processor", "stream-processor", host_environment(
-        KAFKA_BOOTSTRAP_SERVERS=f"localhost:{KAFKA_PORT}",
+        KAFKA_BOOTSTRAP_SERVERS=f"127.0.0.1:{KAFKA_PORT}",
         CONSUMER_GROUP_ID=GROUP_STREAM,
         CONSUMER_AUTO_OFFSET_RESET="earliest",
         TOPIC_OTLP_TRACES=TOPIC_RAW,
@@ -799,14 +801,14 @@ def start_host_services() -> None:
         TOPIC_DLQ=TOPIC_DLQ,
     ))
     wait_started("stream-processor", (
-        f"bootstrap : localhost:{KAFKA_PORT}", f"group     : {GROUP_STREAM}",
+        f"bootstrap : 127.0.0.1:{KAFKA_PORT}", f"group     : {GROUP_STREAM}",
         f"input     : {TOPIC_RAW}", f"trusted   : {TOPIC_SPANS}", f"dlq       : {TOPIC_DLQ}",
     ))
     say("alive; configuration points to the isolated broker")
 
     section("storage consumer")
     start_host_process("storage-consumer", "storage-consumer", host_environment(
-        KAFKA_BOOTSTRAP_SERVERS=f"localhost:{KAFKA_PORT}",
+        KAFKA_BOOTSTRAP_SERVERS=f"127.0.0.1:{KAFKA_PORT}",
         CONSUMER_GROUP_ID=GROUP_STORAGE,
         CONSUMER_AUTO_OFFSET_RESET="earliest",
         TOPIC_SPANS=TOPIC_SPANS,
@@ -817,7 +819,7 @@ def start_host_services() -> None:
         PG_PASSWORD=RUN.generated["POSTGRES_PASSWORD"],
     ))
     wait_started("storage-consumer", (
-        f"bootstrap  : localhost:{KAFKA_PORT}", f"group      : {GROUP_STORAGE}",
+        f"bootstrap  : 127.0.0.1:{KAFKA_PORT}", f"group      : {GROUP_STORAGE}",
         f"topic      : {TOPIC_SPANS}", f"pg host    : 127.0.0.1:{POSTGRES_PORT}",
         "pg database: agentops",
     ))
