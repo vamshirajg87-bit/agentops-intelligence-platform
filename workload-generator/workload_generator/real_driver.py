@@ -82,7 +82,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 from .faults import Attempt, Effects, FaultInjector, attempts
@@ -648,6 +648,66 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#: At most this many entries in the start-lag diagnostic of one run.
+START_LAG_LIMIT: int = 10000
+
+
+def _finite_nonnegative(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value == value and value != float("inf") and value >= 0.0)
+
+
+def build_start_lags(
+    plan: Plan, results: Sequence[AttemptResult], *, limit: int = START_LAG_LIMIT,
+) -> dict[str, Any]:
+    """
+    Diagnostic only: [request_index, planned_offset_s, start_lag_s] for the
+    first attempt of every started request (failed ones included; retries
+    and requests never started left out), in request-index order.
+
+    Built from the results the run already recorded, after it ended: no
+    clock is read and nothing in the dispatcher or the workers changes.  The
+    late-start count does not depend on it.  An entry whose lag or planned
+    offset is missing or invalid, or whose request index repeats, is left
+    out and named in truncated_reason; beyond `limit` entries the first ones
+    are kept and truncated_reason is "limit".
+    """
+    offsets = {request.request_index: request.arrival_offset_seconds
+               for request in plan.requests}
+    started = sorted(
+        (r for r in results if r.attempt == 0 and r.outcome is not Outcome.NOT_STARTED),
+        key=lambda r: r.request_index,
+    )
+    reasons: list[str] = []
+    seen: set[int] = set()
+    entries: list[list[Any]] = []
+    for result in started:
+        index = result.request_index
+        if index in seen:
+            reasons.append("duplicate request index")
+            continue
+        seen.add(index)
+        if not _finite_nonnegative(result.start_lag_seconds):
+            reasons.append("missing or invalid start lag")
+            continue
+        offset = offsets.get(index)
+        if not _finite_nonnegative(offset):
+            reasons.append("missing or invalid planned offset")
+            continue
+        entries.append([index, round(offset, 6), round(result.start_lag_seconds, 6)])
+    if len(entries) > limit:
+        entries = entries[:limit]
+        reasons.append("limit")
+    reasons = list(dict.fromkeys(reasons))
+    complete = not reasons and len(entries) == len(started)
+    return {
+        "limit": limit, "expected": len(started), "recorded": len(entries),
+        "complete": complete,
+        "truncated_reason": None if complete else ("; ".join(reasons) or "incomplete"),
+        "entries": entries,
+    }
+
+
 def _report(
     plan: Plan,
     results: list[AttemptResult],
@@ -714,6 +774,7 @@ def _report(
         flush_ok=flush_ok,
         run_status=status,
         problems=problems,
+        start_lags=build_start_lags(plan, results),
     )
 
 

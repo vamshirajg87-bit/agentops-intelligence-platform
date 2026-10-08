@@ -880,10 +880,12 @@ class TestScheduler:
                                              "max_start_lag_seconds": 0.4,
                                              "mean_start_lag_seconds": 0.05})["metrics"][
             "scheduler"]
-        assert {k: v["value"] for k, v in sched.items()} == {
+        fields = ("late_starts", "started_requests", "not_started_requests",
+                  "max_start_lag_seconds", "mean_start_lag_seconds")
+        assert {k: sched[k]["value"] for k in fields} == {
             "late_starts": 3, "started_requests": 98, "not_started_requests": 2,
             "max_start_lag_seconds": 0.4, "mean_start_lag_seconds": 0.05}
-        assert {v["kind"] for v in sched.values()} == {"MEASURED"}
+        assert {sched[k]["kind"] for k in fields} == {"MEASURED"}
 
     def test_genuine_zero_stays_zero(self):
         late = _assembled()["metrics"]["scheduler"]["late_starts"]
@@ -1228,3 +1230,137 @@ class TestHistoricalRep1:
         import hashlib
         digest = hashlib.sha256(HISTORICAL_RESULT.read_bytes()).hexdigest()
         assert digest.startswith(HISTORICAL_SHA256_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# Phase 14.4B3I-5 start-lag diagnostic (observational only)
+# ---------------------------------------------------------------------------
+
+def _diag(entries=None, **overrides):
+    entries = [[i, round(0.2 * i, 6), lag] for i, lag in enumerate(
+        [0.001, 0.12, 0.0, 0.25, 0.05, 0.101])] if entries is None else entries
+    value = {"limit": 10000, "expected": len(entries), "recorded": len(entries),
+             "complete": True, "truncated_reason": None, "entries": entries}
+    value.update(overrides)
+    return value
+
+
+def _with_diag(diag, **driver_overrides):
+    return _assembled(driver_overrides={"start_lags": diag, **driver_overrides})
+
+
+class TestStartLagDiagnosticInResults:
+    def test_complete_diagnostic_gives_measured_percentiles(self):
+        result = _with_diag(_diag())
+        sched = result["metrics"]["scheduler"]
+        lags = [0.001, 0.12, 0.0, 0.25, 0.05, 0.101]
+        for q in (50, 95, 99):
+            assert sched[f"start_lag_p{q}"]["kind"] == "MEASURED"
+            assert sched[f"start_lag_p{q}"]["value"] == pytest.approx(M.percentile(lags, q))
+            assert sched[f"start_lag_p{q}"]["n"] == 6
+
+    def test_late_indices_use_the_driver_threshold_strictly(self):
+        evidence = _with_diag(_diag())["stop"]["generator_bound_evidence"]
+        diag = evidence["start_lag_diagnostic"]
+        assert diag["late_request_indices"] == [1, 3, 5]      # 0.12, 0.25, 0.101 > 0.1
+        assert diag["late_threshold_seconds"] == 0.1 and diag["usable"] is True
+
+    def test_threshold_matches_the_driver(self):
+        sys.path.insert(0, str(_REPO / "workload-generator"))
+        try:
+            from workload_generator import real_driver
+        finally:
+            sys.path.remove(str(_REPO / "workload-generator"))
+        assert RB.DRIVER_LATE_START_SECONDS == real_driver.LATE_START_SECONDS
+
+    @pytest.mark.parametrize("diag, reason", [
+        (_diag(complete=False, truncated_reason="limit"), "limit"),
+        (_diag(complete=False, truncated_reason="missing or invalid start lag"),
+         "missing or invalid start lag"),
+        (_diag(recorded=5), "recorded does not equal the number of entries"),
+        (_diag(expected=7), "recorded does not equal expected"),
+        (_diag(entries=[[0, 0.0, 0.1], [0, 0.2, 0.1]]), "not strictly increasing"),
+        (_diag(entries=[[0, 0.0, -0.1]]), "non-finite or negative"),
+        (_diag(entries=[[0, 0.0, float("nan")]]), "non-finite or negative"),
+        (_diag(entries=[[0, 0.0]]), "malformed entry"),
+        ({"entries": []}, "malformed diagnostic object"),
+    ])
+    def test_unusable_diagnostic_suppresses_percentiles(self, diag, reason):
+        result = _with_diag(diag)
+        sched = result["metrics"]["scheduler"]
+        for q in (50, 95, 99):
+            assert sched[f"start_lag_p{q}"]["kind"] == "NOT_MEASURED"
+            assert sched[f"start_lag_p{q}"]["value"] is None
+            assert reason in sched[f"start_lag_p{q}"]["reason"]
+        stored = result["stop"]["generator_bound_evidence"]["start_lag_diagnostic"]
+        assert stored["usable"] is False and stored["late_request_indices"] is None
+
+    def test_absent_diagnostic_is_not_measured(self):
+        result = _assembled()                                  # no start_lags key
+        sched = result["metrics"]["scheduler"]
+        assert sched["start_lag_p95"]["kind"] == "NOT_MEASURED"
+        assert "no start-lag diagnostic" in sched["start_lag_p95"]["reason"]
+        assert result["stop"]["generator_bound_evidence"]["start_lag_diagnostic"] is None
+
+    def test_series_key_stays_null(self):
+        for diag in (_diag(), _diag(complete=False, truncated_reason="limit"), None):
+            evidence = _with_diag(diag)["stop"]["generator_bound_evidence"]
+            assert evidence["start_lag_series"] is None
+
+    def test_diagnostic_is_never_passed_to_a_decision(self, monkeypatch):
+        bound_calls, growing_calls = [], []
+        real_bound, real_growing = M.generator_bound, M.lag_growing
+
+        def spy_bound(**kwargs):
+            bound_calls.append(kwargs)
+            return real_bound(**kwargs)
+
+        def spy_growing(series, **kwargs):
+            growing_calls.append(list(series))
+            return real_growing(series, **kwargs)
+
+        monkeypatch.setattr(M, "generator_bound", spy_bound)
+        monkeypatch.setattr(M, "lag_growing", spy_growing)
+        _with_diag(_diag())
+        assert len(bound_calls) == 1
+        assert "start_lag_series" not in bound_calls[0]       # the default () is used
+        # The only lag_growing inputs are the Kafka lag samples (none here).
+        assert growing_calls == [[], []]
+
+    @pytest.mark.parametrize("late", [0, 5, 6, 10])
+    def test_verdict_invariant_across_diagnostic_states(self, late):
+        verdicts = set()
+        for diag in (_diag(), _diag(complete=False, truncated_reason="limit"),
+                     _diag(entries=[[0, 0.0, 0.5]] * 2), None):
+            result = _with_diag(diag, late_starts=late)
+            verdicts.add((result["verdict"], result["stop"]["generator_bound"],
+                          tuple(result["verdict_reasons"])))
+        assert len(verdicts) == 1
+        expected = "GENERATOR_BOUND" if late > 5 else "VALID"
+        assert next(iter(verdicts))[0] == expected
+
+    def test_reproduction_from_json_ignores_the_diagnostic(self):
+        result = json.loads(json.dumps(_with_diag(_diag(), late_starts=6)))
+        evidence = result["stop"]["generator_bound_evidence"]
+        bound, _ = RB.generator_bound_from_evidence(
+            evidence, late_fraction=evidence["late_fraction"],
+            lag_growth_samples=evidence["lag_growth_samples"])
+        assert bound is True and result["verdict"] == "GENERATOR_BOUND"
+
+    def test_old_result_shape_without_diagnostic_validates(self):
+        older = json.loads(json.dumps(_assembled()))
+        evidence = older["stop"]["generator_bound_evidence"]
+        del evidence["start_lag_diagnostic"]
+        for q in (50, 95, 99):
+            del older["metrics"]["scheduler"][f"start_lag_p{q}"]
+        M.validate_result(older)
+
+    def test_historical_results_unchanged_if_present(self):
+        import hashlib
+        expected = {"bm-smoke-r0005-c32-rep1-20261008T174815.json": "e2f98781f555d31c",
+                    "bm-smoke-r0005-c32-rep2-20261008T190552.json": "088c501ca0db9acb"}
+        base = HISTORICAL_RESULT.parent
+        for name, prefix in expected.items():
+            path = base / name
+            if path.exists():
+                assert hashlib.sha256(path.read_bytes()).hexdigest().startswith(prefix)

@@ -483,7 +483,7 @@ class TestExecutionReport:
             "executed_retries", "late_starts", "max_start_lag_seconds",
             "mean_start_lag_seconds", "achieved_submission_rate", "spans_ended",
             "spans_exported_successfully", "export_failures", "flush_ok", "run_status",
-            "problems",
+            "problems", "start_lags",
         ]
 
     def test_values_round_trip_through_json(self):
@@ -494,6 +494,26 @@ class TestExecutionReport:
         assert list(data["attempts"]) == list(OUTCOMES)
         assert data["problems"] == list(execution.problems)
         assert data["flush_ok"] is True and data["run_status"] == "completed"
+
+    def test_start_lags_default_to_none(self):
+        assert _execution().start_lags is None
+        assert _execution().to_dict()["start_lags"] is None
+
+    def test_start_lags_serialize_and_round_trip(self):
+        lags = {"limit": 10000, "expected": 2, "recorded": 2, "complete": True,
+                "truncated_reason": None,
+                "entries": [(0, 0.0, 0.001234), (1, 0.25, 0.150001)]}
+        data = json.loads(json.dumps(_execution(start_lags=lags).to_dict()))
+        assert data["start_lags"] == {**lags, "entries": [[0, 0.0, 0.001234],
+                                                          [1, 0.25, 0.150001]]}
+
+    def test_start_lags_do_not_change_the_other_fields(self):
+        lags = {"limit": 10000, "expected": 0, "recorded": 0, "complete": True,
+                "truncated_reason": None, "entries": []}
+        with_lags = _execution(start_lags=lags).to_dict()
+        without = _execution().to_dict()
+        assert {k: v for k, v in with_lags.items() if k != "start_lags"} == {
+            k: v for k, v in without.items() if k != "start_lags"}
 
     @pytest.mark.parametrize("status", ["finished", "ok", "", "COMPLETED"])
     def test_an_unknown_run_status_is_rejected(self, status):

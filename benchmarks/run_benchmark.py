@@ -593,7 +593,95 @@ def _scheduler(driver: Optional[Mapping[str, Any]]) -> tuple[dict[str, Any], dic
     planned = (evidence["started_requests"] or 0) + (evidence["not_started_requests"] or 0)
     evidence["evaluated"] = (evidence["late_starts"] is not None
                              and evidence["started_requests"] is not None and planned > 0)
+    _start_lag_diagnostic(driver, metrics, evidence)
     return metrics, evidence
+
+
+#: The driver's own late-start threshold (real_driver.LATE_START_SECONDS);
+#: used only to list which recorded requests the driver counted as late.
+DRIVER_LATE_START_SECONDS: float = 0.1
+_DIAGNOSTIC_KEYS = frozenset({"limit", "expected", "recorded", "complete", "truncated_reason",
+                              "entries"})
+
+
+def _diagnostic_problems(raw: Any) -> list[str]:
+    """Why a start-lag diagnostic cannot be used; empty when it can."""
+    if not isinstance(raw, Mapping) or set(raw) != _DIAGNOSTIC_KEYS:
+        return ["malformed diagnostic object"]
+    entries = raw["entries"]
+    if not isinstance(entries, list):
+        return ["entries are not a list"]
+    problems: list[str] = []
+    previous = -1
+    for entry in entries:
+        if (not isinstance(entry, (list, tuple)) or len(entry) != 3
+                or isinstance(entry[0], bool) or not isinstance(entry[0], int)):
+            problems.append("malformed entry")
+            break
+        index, offset, lag = entry
+        if index <= previous:
+            problems.append("request indices not strictly increasing")
+            break
+        previous = index
+        for value in (offset, lag):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                problems.append("non-finite or negative value")
+                break
+        if problems:
+            break
+    if raw["recorded"] != len(entries):
+        problems.append("recorded does not equal the number of entries")
+    if raw["complete"] is not True:
+        problems.append(f"incomplete: {raw.get('truncated_reason') or 'no reason given'}")
+    elif raw["recorded"] != raw["expected"]:
+        problems.append("recorded does not equal expected")
+    return problems
+
+
+def _start_lag_diagnostic(driver: Optional[Mapping[str, Any]], metrics: dict[str, Any],
+                          evidence: dict[str, Any]) -> None:
+    """
+    Copy the driver's start-lag diagnostic into the evidence and, only when it
+    is complete and valid, add start-lag percentiles.  Observational only:
+    nothing here is passed to a generator-bound or growing-lag decision, and
+    start_lag_series stays None.
+    """
+    raw = _get(driver, "start_lags")
+    source, unit = "driver report start_lags", "s"
+    if raw is None:
+        evidence["start_lag_diagnostic"] = None
+        reason = ("no driver report" if driver is None
+                  else "the driver report has no start-lag diagnostic")
+        for q in M.PERCENTILES:
+            metrics[f"start_lag_p{q}"] = M.not_measured(unit, source, reason).to_dict()
+        return
+    problems = _diagnostic_problems(raw)
+    usable = not problems
+    entries = [list(e) for e in raw.get("entries", [])] if isinstance(raw, Mapping) and \
+        isinstance(raw.get("entries"), list) else []
+    lags = [e[2] for e in entries] if usable else []
+    evidence["start_lag_diagnostic"] = {
+        **({k: raw[k] for k in _DIAGNOSTIC_KEYS if k != "entries"}
+           if isinstance(raw, Mapping) and set(raw) == _DIAGNOSTIC_KEYS else {}),
+        "entries": entries if not problems or isinstance(raw, Mapping) else [],
+        "usable": usable, "problems": problems,
+        "late_threshold_seconds": DRIVER_LATE_START_SECONDS,
+        "late_request_indices": ([e[0] for e in entries if e[2] > DRIVER_LATE_START_SECONDS]
+                                 if usable else None),
+    }
+    if usable and lags:
+        found = M.percentiles(lags)
+        for q in M.PERCENTILES:
+            metrics[f"start_lag_p{q}"] = M.Metric(
+                found[f"p{q}"], unit, "MEASURED", source,
+                "percentile (linear) of the per-request start lags of the started first "
+                "attempts; driver monotonic clock", None, len(lags)).to_dict()
+    else:
+        reason = ("no started request" if usable else "diagnostic not usable: "
+                  + "; ".join(problems))
+        for q in M.PERCENTILES:
+            metrics[f"start_lag_p{q}"] = M.not_measured(unit, source, reason).to_dict()
 
 
 def generator_bound_from_evidence(

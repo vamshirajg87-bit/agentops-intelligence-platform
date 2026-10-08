@@ -32,6 +32,8 @@ Test inventory:
 from __future__ import annotations
 
 import dataclasses
+import inspect
+import json
 import socket
 import sys
 import threading
@@ -1436,3 +1438,130 @@ class TestRealWaiting:
             assert planned_ms - 5.0 <= milliseconds(name) <= planned_ms + 400.0, name
         assert milliseconds("agentops.request") >= 140.0
         assert 0.1 <= report.elapsed_seconds < 5.0
+
+
+# ---------------------------------------------------------------------------
+# RD15  Start-lag diagnostic (observational only)
+# ---------------------------------------------------------------------------
+
+def _result(index, attempt=0, outcome=None, lag=0.0):
+    outcome = real_driver.Outcome.EXPECTED_SUCCESS if outcome is None else outcome
+    return real_driver.AttemptResult(index, attempt, f"req_{index}_{attempt}", outcome, "", lag)
+
+
+class TestStartLagDiagnostic:
+
+    def test_complete_series_in_request_order(self):
+        plan = _plan(traces=6)
+        results = [_result(i, lag=0.01 * i) for i in (4, 0, 5, 2, 1, 3)]  # completion order
+        lags = real_driver.build_start_lags(plan, results)
+        assert lags["complete"] is True and lags["truncated_reason"] is None
+        assert lags["expected"] == lags["recorded"] == 6 and lags["limit"] == 10000
+        assert [entry[0] for entry in lags["entries"]] == [0, 1, 2, 3, 4, 5]
+        for index, offset, lag in lags["entries"]:
+            assert offset == round(plan.requests[index].arrival_offset_seconds, 6)
+            assert lag == round(0.01 * index, 6)
+
+    def test_order_is_deterministic(self):
+        plan = _plan(traces=8)
+        results = [_result(i, lag=0.001 * i) for i in range(8)]
+        first = real_driver.build_start_lags(plan, results)
+        second = real_driver.build_start_lags(plan, list(reversed(results)))
+        assert first == second
+
+    def test_failed_first_attempts_in_retries_and_unstarted_out(self):
+        plan = _plan(traces=4)
+        results = [
+            _result(0),
+            _result(1, outcome=real_driver.Outcome.EXPECTED_FAILURE, lag=0.2),
+            _result(1, attempt=1, lag=None),                       # a client retry
+            _result(2, outcome=real_driver.Outcome.UNEXPECTED_FAILURE, lag=0.05),
+            _result(3, outcome=real_driver.Outcome.NOT_STARTED, lag=None),
+        ]
+        lags = real_driver.build_start_lags(plan, results)
+        assert [entry[0] for entry in lags["entries"]] == [0, 1, 2]
+        assert lags["expected"] == 3 and lags["complete"] is True
+
+    def test_overflow_keeps_the_first_entries(self):
+        plan = _plan(traces=10)
+        results = [_result(i, lag=0.001) for i in reversed(range(10))]
+        lags = real_driver.build_start_lags(plan, results, limit=4)
+        assert [entry[0] for entry in lags["entries"]] == [0, 1, 2, 3]
+        assert lags["recorded"] == 4 and lags["expected"] == 10
+        assert lags["complete"] is False and lags["truncated_reason"] == "limit"
+
+    @pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), -0.001, "0.1", True])
+    def test_missing_or_malformed_lag(self, bad):
+        plan = _plan(traces=3)
+        lags = real_driver.build_start_lags(plan, [_result(0), _result(1, lag=bad), _result(2)])
+        assert [entry[0] for entry in lags["entries"]] == [0, 2]
+        assert lags["complete"] is False
+        assert lags["truncated_reason"] == "missing or invalid start lag"
+        assert lags["expected"] == 3 and lags["recorded"] == 2
+
+    def test_duplicate_index(self):
+        plan = _plan(traces=3)
+        lags = real_driver.build_start_lags(plan, [_result(0), _result(1), _result(1, lag=0.5)])
+        assert [entry[0] for entry in lags["entries"]] == [0, 1]
+        assert lags["complete"] is False and "duplicate request index" in lags["truncated_reason"]
+
+    def test_unknown_request_index(self):
+        plan = _plan(traces=2)
+        lags = real_driver.build_start_lags(plan, [_result(0), _result(7)])
+        assert lags["complete"] is False
+        assert "missing or invalid planned offset" in lags["truncated_reason"]
+
+    def test_no_started_request(self):
+        plan = _plan(traces=2)
+        lags = real_driver.build_start_lags(
+            plan, [_result(0, outcome=real_driver.Outcome.NOT_STARTED, lag=None)])
+        assert lags == {"limit": 10000, "expected": 0, "recorded": 0, "complete": True,
+                        "truncated_reason": None, "entries": []}
+
+    def test_a_run_reports_a_complete_series_consistent_with_its_counts(self, demo):
+        plan = _plan(traces=60, rate=100.0)              # saturated: many late starts
+        report, _, _ = _execute(plan, demo, concurrency=1)
+        _clean(report)
+        lags = report.start_lags
+        assert lags["complete"] is True and lags["expected"] == report.started_requests == 60
+        late = sum(1 for _, _, lag in lags["entries"] if lag > real_driver.LATE_START_SECONDS)
+        assert late == report.late_starts
+        assert max(lag for _, _, lag in lags["entries"]) == pytest.approx(
+            report.max_start_lag_seconds, abs=0.001)
+
+    def test_late_start_accounting_is_unchanged(self, demo):
+        # The same run, its counts taken with and without the diagnostic.
+        plan = _plan(traces=40, rate=50.0)
+        report, _, _ = _execute(plan, demo, concurrency=1)
+        without = dataclasses.replace(report, start_lags=None)
+        for name in ("late_starts", "max_start_lag_seconds", "mean_start_lag_seconds",
+                     "started_requests", "not_started_requests", "run_status"):
+            assert getattr(without, name) == getattr(report, name)
+
+    def test_spare_capacity_gives_zero_lags(self, demo):
+        class ArrivalTime(FakeTime):
+            def sleep(self, seconds: float) -> None:
+                if not threading.current_thread().name.startswith("workload"):
+                    super().sleep(seconds)
+
+        plan = _plan(traces=10)
+        spaced = Plan(
+            config=plan.config,
+            requests=tuple(dataclasses.replace(r, arrival_offset_seconds=2.0 * i)
+                           for i, r in enumerate(plan.requests)),
+            episodes=(), session_count=plan.session_count,
+        )
+        report, _, _ = _execute(spaced, demo, concurrency=2, fake=ArrivalTime())
+        assert report.start_lags["complete"] is True
+        assert [entry[2] for entry in report.start_lags["entries"]] == [0.0] * 10
+        assert [entry[1] for entry in report.start_lags["entries"]] == [2.0 * i for i in range(10)]
+
+    def test_json_round_trip(self, demo):
+        report, _, _ = _execute(_plan(traces=5), demo)
+        data = json.loads(json.dumps(report.to_dict()))
+        assert data["start_lags"] == report.to_dict()["start_lags"]
+        assert data["start_lags"]["entries"] == [list(e) for e in report.start_lags["entries"]]
+
+    def test_dispatcher_untouched(self):
+        source = inspect.getsource(real_driver._dispatch)
+        assert "start_lags" not in source and "build_start_lags" not in source

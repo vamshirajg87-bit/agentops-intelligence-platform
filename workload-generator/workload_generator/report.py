@@ -372,6 +372,10 @@ class ExecutionReport:
     flush_ok: bool
     run_status: str
     problems: tuple[str, ...] = ()
+    #: Diagnostic only: per-request start lags of the started first attempts,
+    #: built by the execution driver after the run.  None when not
+    #: recorded.  Nothing in the late-start count depends on it.
+    start_lags: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.run_status not in RUN_STATUSES:
@@ -404,6 +408,10 @@ class ExecutionReport:
             "flush_ok": self.flush_ok,
             "run_status": self.run_status,
             "problems": list(self.problems),
+            "start_lags": None if self.start_lags is None else {
+                **self.start_lags,
+                "entries": [list(entry) for entry in self.start_lags["entries"]],
+            },
         }
 
 
