@@ -10,6 +10,7 @@ prove that.
 from __future__ import annotations
 
 import copy
+import importlib.abc
 import importlib.util
 import io
 import json
@@ -32,6 +33,47 @@ import run_benchmark as RB  # noqa: E402
 
 LADDER = json.loads((_BENCH / "ladder.json").read_text(encoding="utf-8"))
 STOPS = LADDER["stop_limits"]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed isolation: whatever LIVE_ENABLED says, no test can reach the
+# real harness, a process, a socket or Docker.
+# ---------------------------------------------------------------------------
+
+_HARNESS_MODULES = ("run_smoke", "run_e2e")
+#: The real cell body, for tests that drive it with an injected fake harness.
+REAL_EXECUTE_CELL = RB.execute_cell
+
+
+class _BlockHarness(importlib.abc.MetaPathFinder):
+    """Refuses to import the D3/E2E harness modules during the tests."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name in _HARNESS_MODULES:
+            raise ImportError(f"{name} is blocked in the benchmark tests")
+        return None
+
+
+class LiveAccessAttempt(AssertionError):
+    """A test reached something live."""
+
+
+@pytest.fixture(autouse=True)
+def fail_closed(monkeypatch):
+    def refuse(what):
+        def call(*args, **kwargs):
+            raise LiveAccessAttempt(f"{what} attempted: {args[:1]}")
+        return call
+
+    for name in _HARNESS_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BlockHarness(), *sys.meta_path])
+    monkeypatch.setattr(RB, "execute_cell", refuse("the real execute_cell"))
+    for name in ("Popen", "run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(subprocess, name, refuse(f"subprocess.{name}"))
+    monkeypatch.setattr(os, "system", refuse("os.system"))
+    monkeypatch.setattr(socket, "create_connection", refuse("a network connection"))
+    monkeypatch.setattr(socket.socket, "connect", refuse("a socket connection"))
 
 
 def _metric(**overrides):
@@ -867,7 +909,8 @@ class TestSafety:
         for forbidden in ("run_smoke", "run_e2e", "psycopg", "confluent_kafka", "opentelemetry",
                           "grpc", "docker", "workload_generator"):
             assert not any(m == forbidden or m.startswith(forbidden + ".") for m in loaded)
-        assert module.LIVE_ENABLED is False
+        # Importing has no live side effect whatever the gate's value.
+        assert isinstance(module.LIVE_ENABLED, bool)
 
     def test_metrics_module_has_no_io_imports(self):
         text = (_BENCH / "metrics.py").read_text(encoding="utf-8")
@@ -883,12 +926,15 @@ class TestSafety:
         assert "bm-smoke-r0005-c32-rep1" in text and "b-smoke-r0010-c32-m3" in text
         assert not (tmp_path / "out").exists()
 
-    def test_live_is_refused_before_anything_starts(self, no_live_access, tmp_path, capsys):
+    def test_live_is_refused_before_anything_starts(self, no_live_access, tmp_path, capsys,
+                                                    monkeypatch):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", False)
         code = RB.main(["--level", "SMOKE", "--live", "--output-dir", str(tmp_path)])
         assert code == 2 and "not enabled" in capsys.readouterr().err
         assert "run_smoke" not in sys.modules
 
-    def test_run_cell_is_unreachable(self, no_live_access, tmp_path):
+    def test_run_cell_is_unreachable(self, no_live_access, tmp_path, monkeypatch):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", False)
         cell = RB.plan_cells(LADDER, "SMOKE", rates=[5], repetitions=1)[0]
         with pytest.raises(RB.LiveDisabled):
             RB.run_cell(cell, LADDER, expect_head=None, output_dir=tmp_path)

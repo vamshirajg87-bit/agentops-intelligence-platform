@@ -9,6 +9,8 @@ telemetry is used: the `no_live_access` fixture makes any attempt fail.
 from __future__ import annotations
 
 import dataclasses
+import importlib.abc
+import os
 import json
 import socket
 import subprocess
@@ -32,10 +34,51 @@ SHA = "b" * 40
 GB = 1024 ** 3
 
 
+# ---------------------------------------------------------------------------
+# Fail-closed isolation: whatever LIVE_ENABLED says, no test can reach the
+# real harness, a process, a socket or Docker.
+# ---------------------------------------------------------------------------
+
+_HARNESS_MODULES = ("run_smoke", "run_e2e")
+#: The real cell body, for tests that drive it with an injected fake harness.
+REAL_EXECUTE_CELL = RB.execute_cell
+
+
+class _BlockHarness(importlib.abc.MetaPathFinder):
+    """Refuses to import the D3/E2E harness modules during the tests."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name in _HARNESS_MODULES:
+            raise ImportError(f"{name} is blocked in the benchmark tests")
+        return None
+
+
+class LiveAccessAttempt(AssertionError):
+    """A test reached something live."""
+
+
+@pytest.fixture(autouse=True)
+def fail_closed(monkeypatch):
+    def refuse(what):
+        def call(*args, **kwargs):
+            raise LiveAccessAttempt(f"{what} attempted: {args[:1]}")
+        return call
+
+    for name in _HARNESS_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BlockHarness(), *sys.meta_path])
+    monkeypatch.setattr(RB, "execute_cell", refuse("the real execute_cell"))
+    for name in ("Popen", "run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(subprocess, name, refuse(f"subprocess.{name}"))
+    monkeypatch.setattr(os, "system", refuse("os.system"))
+    monkeypatch.setattr(socket, "create_connection", refuse("a network connection"))
+    monkeypatch.setattr(socket.socket, "connect", refuse("a socket connection"))
+
+
 @pytest.fixture(autouse=True)
 def no_live_access(monkeypatch):
     def refuse(*args, **kwargs):
-        raise AssertionError(f"live access attempted: {args[:1]}")
+        raise LiveAccessAttempt(f"live access attempted: {args[:1]}")
 
     monkeypatch.setattr(socket, "create_connection", refuse)
     monkeypatch.setattr(socket.socket, "connect", refuse)
@@ -238,7 +281,7 @@ def _run(tmp_path, *, smoke=None, e2e=None, cell=None, disk=500 * GB, clock=None
     smoke = smoke or FakeSmoke(tmp_path)
     e2e = e2e or FakeE2E(smoke)
     ticks = iter(range(10 ** 6))
-    result, path, clean = RB.execute_cell(
+    result, path, clean = REAL_EXECUTE_CELL(
         cell or _cell(), ladder or LADDER, smoke=smoke, e2e=e2e, expect_head=None,
         output_dir=out or (tmp_path / "results"), disk_free=lambda: disk,
         clock=clock or (lambda: float(next(ticks))),
@@ -430,10 +473,11 @@ class TestCleanup:
 
 
 class TestLiveStaysDisabled:
-    def test_live_enabled_is_false(self):
-        assert RB.LIVE_ENABLED is False
+    def test_gate_is_a_boolean(self):
+        assert isinstance(RB.LIVE_ENABLED, bool)
 
     def test_run_cell_refuses_before_importing_the_harness(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", False)
         monkeypatch.setattr(RB, "execute_cell", lambda *a, **k: pytest.fail("reached"))
         for name in ("run_smoke", "run_e2e"):
             monkeypatch.delitem(sys.modules, name, raising=False)
@@ -441,7 +485,8 @@ class TestLiveStaysDisabled:
             RB.run_cell(_cell(), LADDER, expect_head=None, output_dir=tmp_path)
         assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
 
-    def test_cli_live_refused(self, tmp_path, capsys):
+    def test_cli_live_refused(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", False)
         assert RB.main(["--level", "SMOKE", "--live", "--output-dir", str(tmp_path)]) == 2
         assert "not enabled" in capsys.readouterr().err
 
@@ -607,9 +652,12 @@ class TestLiveCli:
         assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
 
 
-class TestGateStillClosed:
-    def test_committed_gate_is_closed(self):
-        assert RB.LIVE_ENABLED is False
+class TestGateClosed:
+    """The gate's refusal, tested with the gate forced closed in memory."""
+
+    @pytest.fixture(autouse=True)
+    def closed(self, monkeypatch):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", False)
 
     def test_exact_cell_is_still_refused_by_the_gate(self, tmp_path, capsys):
         code = RB.main([*APPROVED, "--live", "--authorize", "bm-smoke-r0005-c32-rep1",
@@ -628,3 +676,87 @@ class TestGateStillClosed:
     def test_authorize_without_live_is_rejected(self):
         with pytest.raises(SystemExit):
             RB.main([*APPROVED, "--authorize", "bm-smoke-r0005-c32-rep1"])
+
+# ---------------------------------------------------------------------------
+# Both gate states, in memory only: nothing reaches the real harness
+# ---------------------------------------------------------------------------
+
+EXACT = [*APPROVED, "--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD]
+
+
+@pytest.fixture(params=[False, True], ids=["gate-closed", "gate-open"])
+def gate(request, monkeypatch):
+    monkeypatch.setattr(RB, "LIVE_ENABLED", request.param)
+    return request.param
+
+
+class TestIsolationGuards:
+    def test_guards_are_active(self, tmp_path):
+        with pytest.raises(LiveAccessAttempt):
+            subprocess.run(["docker", "ps"])
+        with pytest.raises(LiveAccessAttempt):
+            subprocess.Popen(["git", "status"])
+        with pytest.raises(LiveAccessAttempt):
+            subprocess.check_output(["docker", "info"])
+        with pytest.raises(LiveAccessAttempt):
+            os.system("docker ps")
+        with pytest.raises(LiveAccessAttempt):
+            socket.create_connection(("127.0.0.1", 15432))
+        with pytest.raises(LiveAccessAttempt):
+            RB.execute_cell(_cell(), LADDER, smoke=None, e2e=None, expect_head=HEAD,
+                            output_dir=tmp_path, disk_free=lambda: 0)
+        for name in ("run_smoke", "run_e2e"):
+            with pytest.raises(ImportError, match="blocked"):
+                __import__(name)
+
+    def test_fake_harness_path_is_explicit(self):
+        assert REAL_EXECUTE_CELL is not RB.execute_cell
+
+
+class TestBothGateStates:
+    def test_real_run_cell_never_reaches_the_harness(self, gate, tmp_path):
+        cell = _approved_cells()[0]
+        expected = ImportError if gate else RB.LiveDisabled
+        with pytest.raises(expected):
+            RB.run_cell(cell, LADDER, expect_head=HEAD, output_dir=tmp_path)
+        assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
+
+    def test_exact_command_never_reaches_infrastructure(self, gate, tmp_path, capsys):
+        args = [*EXACT, "--live", "--output-dir", str(tmp_path / "out")]
+        if gate:
+            # Authorized and open: the real run_cell is entered and stops at
+            # the blocked harness import, before any process or container.
+            with pytest.raises(ImportError, match="blocked"):
+                RB.main(args)
+        else:
+            assert RB.main(args) == 2 and "not enabled" in capsys.readouterr().err
+        assert not (tmp_path / "out").exists()
+
+    @pytest.mark.parametrize("extra", [
+        [],
+        ["--authorize", "bm-smoke-r0005-c32-rep1"],
+        ["--expect-head", HEAD],
+        ["--authorize", "bm-smoke-r0010-c32-rep1", "--expect-head", HEAD],
+    ])
+    def test_authorization_is_still_required(self, gate, tmp_path, capsys, extra):
+        code = RB.main([*APPROVED, "--live", "--output-dir", str(tmp_path), *extra])
+        err = capsys.readouterr().err
+        assert code == 2 and "nothing was started" in err
+        assert ("not enabled" in err) is (not gate)
+
+    def test_other_cells_refused_by_run_cell_when_open(self, gate, tmp_path):
+        cell = _approved_cells(rates=[10])[0]
+        expected = RB.BenchmarkError if gate else RB.LiveDisabled
+        with pytest.raises(expected):
+            RB.run_cell(cell, LADDER, expect_head=HEAD, output_dir=tmp_path)
+
+    def test_plan_mode_is_identical(self, gate, tmp_path):
+        import io
+        out = io.StringIO()
+        assert RB.main([*APPROVED, "--output-dir", str(tmp_path / "o")], stdout=out) == 0
+        assert out.getvalue().startswith("PLAN ONLY") and not (tmp_path / "o").exists()
+
+    def test_fake_harness_cell_still_runs_offline(self, gate, tmp_path):
+        result, path, clean, smoke = _run(tmp_path)
+        assert clean and result["verdict"] == "VALID" and path.is_file()
+        assert smoke.calls[-1] == "cleanup"
