@@ -65,7 +65,7 @@ import metrics as M  # noqa: E402
 
 #: Live execution is not reachable in this version.  Changing it is a
 #: reviewed step of its own.
-LIVE_ENABLED: bool = False
+LIVE_ENABLED: bool = True
 
 DEFAULT_CONFIG: Path = HERE / "ladder.json"
 DEFAULT_OUTPUT: Path = Path(tempfile.gettempdir()) / "agentops-benchmarks"
