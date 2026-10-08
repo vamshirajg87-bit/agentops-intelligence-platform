@@ -276,36 +276,55 @@ class TestClock:
 # ---------------------------------------------------------------------------
 
 class TestGeneratorBound:
-    def test_not_bound(self):
-        assert M.generator_bound(requested_rate=100, achieved_rate=99, late_starts=5,
-                                 started_requests=100) == (False, ())
+    """O1: only the scheduler's own evidence makes a run GENERATOR_BOUND."""
 
-    def test_exactly_95_percent_is_not_bound(self):
-        assert not M.generator_bound(requested_rate=100, achieved_rate=95, late_starts=0,
-                                     started_requests=100)[0]
-
-    def test_below_95_percent_is_bound(self):
-        bound, reasons = M.generator_bound(requested_rate=100, achieved_rate=94.9,
-                                           late_starts=0, started_requests=100)
-        assert bound and "achieved" in reasons[0]
+    def test_on_time_scheduler_is_not_bound(self):
+        assert M.generator_bound(late_starts=5, started_requests=100) == (False, ())
 
     def test_late_starts_exactly_5_percent_is_not_bound(self):
-        assert not M.generator_bound(requested_rate=10, achieved_rate=10, late_starts=5,
-                                     started_requests=100)[0]
+        assert not M.generator_bound(late_starts=5, started_requests=100)[0]
 
     def test_late_starts_over_5_percent_is_bound(self):
-        bound, reasons = M.generator_bound(requested_rate=10, achieved_rate=10, late_starts=6,
-                                           started_requests=100)
+        bound, reasons = M.generator_bound(late_starts=6, started_requests=100)
         assert bound and "late" in reasons[0]
 
-    def test_both_reasons(self):
-        assert len(M.generator_bound(requested_rate=10, achieved_rate=1, late_starts=50,
-                                     started_requests=100)[1]) == 2
+    def test_growing_start_lag_is_bound(self):
+        bound, reasons = M.generator_bound(
+            late_starts=0, started_requests=100,
+            start_lag_series=[0.01, 0.02, 0.05, 0.09, 0.2, 0.4])
+        assert bound and "start lag grew" in reasons[0]
+
+    def test_start_lag_that_does_not_keep_growing_is_not_bound(self):
+        assert not M.generator_bound(
+            late_starts=0, started_requests=100,
+            start_lag_series=[0.01, 0.02, 0.05, 0.09, 0.2, 0.1, 0.3])[0]
+        assert not M.generator_bound(late_starts=0, started_requests=100,
+                                     start_lag_series=[0.01, 0.02, 0.05, 0.09, 0.2])[0]
+
+    def test_requests_never_started_or_deadline_is_bound(self):
+        assert M.generator_bound(late_starts=0, started_requests=90,
+                                 not_started_requests=10)[0]
+        assert M.generator_bound(late_starts=0, started_requests=100,
+                                 deadline_reached=True)[0]
+
+    def test_throughput_is_not_an_input(self):
+        """Low achieved throughput from run, export or flush overhead alone
+        cannot make a run GENERATOR_BOUND: the rule has no throughput input."""
+        with pytest.raises(TypeError):
+            M.generator_bound(late_starts=0, started_requests=100, requested_rate=5,
+                              achieved_rate=1)
+
+    def test_several_reasons(self):
+        assert len(M.generator_bound(late_starts=50, started_requests=90,
+                                     not_started_requests=10, deadline_reached=True)[1]) == 3
 
     @pytest.mark.parametrize("kwargs", [
-        dict(requested_rate=0, achieved_rate=1, late_starts=0, started_requests=1),
-        dict(requested_rate=1, achieved_rate=1, late_starts=0, started_requests=0),
-        dict(requested_rate=1, achieved_rate=1, late_starts=3, started_requests=2),
+        dict(late_starts=0, started_requests=0),
+        dict(late_starts=3, started_requests=2),
+        dict(late_starts=-1, started_requests=2),
+        dict(late_starts=0, started_requests=2, deadline_reached="yes"),
+        dict(late_starts=0, started_requests=2, start_lag_series=[0.1, float("nan")]),
+        dict(late_starts=0, started_requests=2, lag_growth_samples=1),
     ])
     def test_unjudgeable_inputs(self, kwargs):
         with pytest.raises(M.MetricError):
@@ -713,13 +732,21 @@ class TestAssembleResult:
         result = RB.assemble_result(_evidence(canonical_records=705), STOPS)
         assert result["verdict"] == "INVALID"
 
-    def test_generator_bound(self):
-        result = RB.assemble_result(_evidence(driver=_driver(achieved_submission_rate=4.0)),
-                                    STOPS)
+    def test_generator_bound_from_late_starts(self):
+        result = RB.assemble_result(_evidence(driver=_driver(late_starts=6)), STOPS)
         assert result["verdict"] == "GENERATOR_BOUND"
         assert result["claims"]["load_source_limit_only"]
         assert not result["claims"]["platform_throughput"]
         assert any("load source" in item for item in result["limitations"])
+
+    def test_low_achieved_throughput_alone_is_not_generator_bound(self):
+        """Overhead (last request, export, flush) lowers executed / elapsed;
+        with the scheduler on time the run stays VALID, and the low
+        throughput is still reported as it was."""
+        result = RB.assemble_result(_evidence(driver=_driver(
+            achieved_submission_rate=1.0, elapsed_seconds=100.0, late_starts=0)), STOPS)
+        assert result["verdict"] == "VALID" and not result["stop"]["generator_bound"]
+        assert result["metrics"]["throughput"]["requests_per_second"]["value"] == pytest.approx(1.0)
 
     def test_lag_growth_stops(self):
         lags = [(i * 10, {"raw": i, "canonical": 0}) for i in range(1, 8)]
@@ -793,7 +820,7 @@ class TestValidateResult:
 
     def test_generator_bound_cannot_claim_capacity(self):
         result = json.loads(json.dumps(RB.assemble_result(
-            _evidence(driver=_driver(achieved_submission_rate=1.0)), STOPS)))
+            _evidence(driver=_driver(late_starts=50)), STOPS)))
         result["verdict"] = "VALID"
         with pytest.raises(M.MetricError, match="contradicts"):
             M.validate_result(result)

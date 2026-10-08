@@ -475,8 +475,12 @@ class CellEvidence:
     lag_samples: Sequence[tuple[float, Any]] = ()
     resource_samples: Sequence[tuple[float, Any]] = ()
     drain_seconds: Optional[float] = None
-    refresh_seconds: Optional[float] = None
+    refresh_seconds: Optional[float] = None           # wall clock around the refresh
+    refresh_dbt_seconds: Optional[float] = None       # dbt's own duration, when printed
     detector_ms: Optional[Mapping[str, float]] = None
+    disk_free_bytes: Optional[int] = None
+    projected_need_bytes: Optional[int] = None
+    cleanup_verified: Optional[bool] = None
     process_exits: Sequence[str] = ()
     stop_reasons: Sequence[str] = ()
     failure: Optional[str] = None
@@ -533,6 +537,8 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
         integrity_ok = None
         gates.append({"name": "evidence complete", "ok": False,
                       "evidence": "driver report, offsets or database counts missing"})
+        if evidence.failure is not None:
+            gates.append({"name": "run completed", "ok": False, "evidence": evidence.failure})
     else:
         rec = M.reconcile(
             planned_spans=cell.planned_spans, spans_ended=driver["spans_ended"],
@@ -614,7 +620,8 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
             k: v.to_dict() for k, v in M.latency_metrics(
                 persistence_ms, unit="ms", kind="DERIVED",
                 source="ingested_at (database clock) - end_time (host clock)",
-                method="per span; valid only within the recorded clock skew",
+                method="per span; includes the driver's export batching delay (up to "
+                       "500 ms); valid only within the recorded clock skew",
                 window=window_db, reason_if_empty="no spans read").items()}
     else:
         reason = ("clock skew not measured" if clock_valid is None
@@ -660,10 +667,16 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
         metrics["analytics"]["detector_ms"] = M.not_measured("ms", "detector", reason).to_dict()
     else:
         metrics["analytics"]["refresh_seconds"] = (M.Metric(
-            evidence.refresh_seconds, "s", "MEASURED", "dbt log",
-            "dbt 'Finished running ... in X seconds'", None, 1).to_dict()
+            evidence.refresh_seconds, "s", "OBSERVATION", "harness wall clock",
+            "around `run --rm analytics-refresh`, container start included", None, 1).to_dict()
             if evidence.refresh_seconds is not None else
-            M.not_measured("s", "dbt log", "refresh duration not read").to_dict())
+            M.not_measured("s", "harness wall clock", "the refresh did not run").to_dict())
+        metrics["analytics"]["refresh_dbt_seconds"] = (M.Metric(
+            evidence.refresh_dbt_seconds, "s", "MEASURED", "dbt output",
+            "dbt 'Finished running ... in X seconds'", None, 1).to_dict()
+            if evidence.refresh_dbt_seconds is not None else
+            M.not_measured("s", "dbt output",
+                           "dbt's own duration did not appear in the refresh output").to_dict())
         metrics["analytics"]["detector_ms"] = (
             {group: M.Metric(value, "ms", "MEASURED", "detector log", "duration_ms per group",
                              None, 1).to_dict()
@@ -684,15 +697,36 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
     for name, series in (("raw", raw_lag), ("canonical", canonical_lag)):
         if M.lag_growing(series, run=int(stops["lag_growth_samples"])):
             stop_reasons.append(f"{name} lag grew across {stops['lag_growth_samples']} samples")
+    memory = [
+        M.MemorySample(row["name"], row["memory_used_bytes"], row["memory_limit_bytes"])
+        for _, rows in evidence.resource_samples for row in (rows or [])
+        if row.get("memory_limit_bytes")
+    ]
+    for reason in M.resource_stops(
+            memory=memory, disk_free_bytes=evidence.disk_free_bytes,
+            projected_need_bytes=evidence.projected_need_bytes,
+            memory_fraction=stops["memory_fraction"],
+            disk_free_min_bytes=int(stops["disk_free_min_gb"] * 1024 ** 3),
+            disk_projection_factor=stops["disk_projection_factor"]):
+        if reason not in stop_reasons:
+            stop_reasons.append(reason)
+    if evidence.cleanup_verified is False and "cleanup not verified" not in stop_reasons:
+        stop_reasons.append("cleanup not verified")
+    # The scheduler's own evidence decides whether the load source was the
+    # limit; the achieved throughput (wall time includes the final flush)
+    # is reported but never used for this.
     bound, bound_reasons = False, ()
-    if driver is not None and driver.get("started_requests"):
+    if driver is not None and (driver.get("started_requests") or
+                               driver.get("not_started_requests")):
         bound, bound_reasons = M.generator_bound(
-            requested_rate=cell.rate,
-            achieved_rate=driver.get("achieved_submission_rate", 0.0),
             late_starts=driver.get("late_starts", 0),
-            started_requests=driver["started_requests"],
-            rate_fraction=stops["generator_rate_fraction"],
-            late_fraction=stops["late_start_fraction"])
+            started_requests=driver.get("started_requests", 0),
+            not_started_requests=driver.get("not_started_requests", 0),
+            deadline_reached=driver.get("run_status") == "deadline_reached",
+            late_fraction=stops["late_start_fraction"],
+            lag_growth_samples=int(stops["lag_growth_samples"]))
+        limitations.append("start lag is available only as a maximum and a mean; the "
+                           "growing-start-lag rule had no series to judge")
     value = M.verdict(integrity_ok=integrity_ok, stop_reasons=stop_reasons,
                       generator_bound_run=bound)
     if value == "GENERATOR_BOUND":
@@ -744,30 +778,102 @@ def _require_live() -> None:
             "live benchmark execution is not enabled in this version; nothing was started")
 
 
+#: A rough planning budget per span for disk: the stored row with its
+#: indexes, the raw and canonical topic records and the collector's debug
+#: log line.  Used only for the preflight stop rule, never reported.
+DISK_BUDGET_PER_SPAN_BYTES: int = 16 * 1024
+#: Fixed disk the cell needs whatever its size: images, the temporary
+#: environment, the empty database and broker.
+DISK_FIXED_BYTES: int = 3 * 1024 ** 3
+#: Written to the output directory when a cell's cleanup could not be
+#: verified.  While it exists no further live cell starts.
+CLEANUP_MARKER: str = "CLEANUP_UNVERIFIED"
+REFRESH_TIMEOUT_SECONDS: float = 600.0
+
+
+class _Stop(BenchmarkError):
+    """A stop rule fired; the cell ends as STOPPED with these reasons."""
+
+    def __init__(self, reasons: Sequence[str]) -> None:
+        super().__init__("; ".join(reasons))
+        self.reasons = list(reasons)
+
+
+def projected_need_bytes(cell: Cell) -> int:
+    spans = (cell.warmup_requests + cell.requests) * M.SPANS_PER_HEALTHY_REQUEST
+    return DISK_FIXED_BYTES + spans * DISK_BUDGET_PER_SPAN_BYTES
+
+
+def _parse_time(text: str) -> float:
+    return datetime.fromisoformat(text).timestamp()
+
+
 def run_cell(cell: Cell, ladder: Mapping[str, Any], *, expect_head: Optional[str],
-             output_dir: Path) -> dict[str, Any]:
+             output_dir: Path) -> tuple[dict[str, Any], Path, bool]:
     """
-    One cell on a fresh isolated stack.  Structure only until a reviewed step
-    enables it: the D3 harness provides the stack, readiness, the exact
-    stage reconciliation and the cleanup; this adds timing, sampling and the
-    result.
+    One cell on a fresh isolated stack, for real.  Refused unless live
+    execution is enabled; the D3 harness and the E2E helpers are imported
+    only after that check.
     """
     _require_live()
     if not cell.live_allowed:
         raise BenchmarkError(f"level {cell.level} is not allowed live")
-    sys.path.insert(0, str(REPO / "workload-generator"))
-    import run_smoke as smoke  # noqa: E402  imported only here, never at module load
+    if str(REPO / "workload-generator") not in sys.path:
+        sys.path.insert(0, str(REPO / "workload-generator"))
+    import run_e2e as e2e  # noqa: E402  imported only here, never at module load
+    import run_smoke as smoke  # noqa: E402
 
+    import shutil
+    return execute_cell(cell, ladder, smoke=smoke, e2e=e2e, expect_head=expect_head,
+                        output_dir=output_dir,
+                        disk_free=lambda: shutil.disk_usage(REPO.anchor or "/").free)
+
+
+def execute_cell(
+    cell: Cell, ladder: Mapping[str, Any], *, smoke: Any, e2e: Any,
+    expect_head: Optional[str], output_dir: Path, disk_free: Callable[[], int],
+    clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
+    sampler_factory: Callable[..., Any] = None,
+) -> tuple[dict[str, Any], Path, bool]:
+    """
+    The body of one cell, with the harness passed in (the real run_smoke
+    and run_e2e modules when live; fakes in the offline tests).
+
+    Order: preflight -> stack -> warm-up (excluded) -> clock probe ->
+    samplers on -> measured run (exact D3 reconciliation and drain) ->
+    samplers off -> offsets, driver report, database, clock probe ->
+    [analytics refresh, detector] -> cleanup (always) -> result written
+    outside the repository.  Nothing is retried.  Returns the result, its
+    path and whether cleanup was verified.
+    """
     defaults, stops = ladder["defaults"], ladder["stop_limits"]
+    make_sampler = PeriodicSampler if sampler_factory is None else sampler_factory
     smoke.RATE, smoke.SEED, smoke.CONCURRENCY = cell.rate, cell.seed, cell.concurrency
     smoke.T_DRAIN = float(defaults["drain_limit_seconds"])
     smoke.SETTLE_SECONDS = float(defaults["settle_seconds"])
-    evidence = CellEvidence(cell=cell, git_sha=smoke.git("rev-parse", "HEAD").strip(),
-                            git_dirty=bool(smoke.repository_state()), started=time.time(),
-                            finished=time.time())
-    lag_sampler = resource_sampler = None
+    budget, start = float(defaults["cell_budget_seconds"]), clock()
+    evidence = CellEvidence(cell=cell, git_sha="0" * 40, git_dirty=True, started=wall(),
+                            finished=wall())
+    samplers: list[Any] = []
+    refresh_built = False
+
+    def within_budget(step: str) -> None:
+        if clock() - start > budget:
+            raise _Stop([f"cell budget of {budget:.0f} s exceeded before {step}"])
+
     try:
+        evidence.git_sha = smoke.git("rev-parse", "HEAD").strip()
+        evidence.git_dirty = bool(smoke.repository_state())
         smoke.check_repository(expect_head)
+        evidence.disk_free_bytes = int(disk_free())
+        evidence.projected_need_bytes = projected_need_bytes(cell)
+        preflight = M.resource_stops(
+            disk_free_bytes=evidence.disk_free_bytes,
+            projected_need_bytes=evidence.projected_need_bytes,
+            disk_free_min_bytes=int(stops["disk_free_min_gb"] * 1024 ** 3),
+            disk_projection_factor=stops["disk_projection_factor"])
+        if preflight:
+            raise _Stop(["preflight: " + reason for reason in preflight])
         smoke.check_ports()
         smoke.record_docker_state()
         evidence.machine = collect_machine_baseline(
@@ -777,56 +883,123 @@ def run_cell(cell: Cell, ladder: Mapping[str, Any], *, expect_head: Optional[str
         smoke.create_workspace()
         smoke.create_virtual_environment()
         smoke.check_render()
+        within_budget("the stack")
         smoke.start_kafka()
         smoke.create_topics()
         smoke.start_postgres()
         smoke.run_bootstrap()
+        if cell.refresh_and_detector:
+            refresh_built = True  # set first: a failed build may still leave an image
+            e2e.build_refresh_image()
         smoke.start_collector()
         smoke.start_host_services()
         offsets = smoke.check_baseline()
+        within_budget("the warm-up run")
         offsets = smoke.run_stage(_stage(smoke, cell, warmup=True), offsets)
+        within_budget("the measured run")
         evidence.clock_before = _clock(smoke)
-        lag_sampler = PeriodicSampler(lambda: {
+        ids = [line for line in smoke.compose("ps", "-q").split() if line.strip()]
+        if not ids:
+            raise BenchmarkError("no container of the isolated project is running")
+        lag = make_sampler(lambda: {
             "raw": smoke.group_lag(smoke.GROUP_STREAM, smoke.TOPIC_RAW),
             "canonical": smoke.group_lag(smoke.GROUP_STORAGE, smoke.TOPIC_SPANS)},
             defaults["sample_interval_seconds"])
-        resource_sampler = PeriodicSampler(lambda: parse_docker_stats(smoke.checked(
+        resources = make_sampler(lambda: parse_docker_stats(smoke.checked(
             ["docker", "stats", "--no-stream", "--format",
-             "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}"], timeout=smoke.T_COMMAND,
-            what="docker stats")), defaults["sample_interval_seconds"])
-        lag_sampler.start()
-        resource_sampler.start()
+             "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}", *ids],
+            timeout=smoke.T_COMMAND, what="docker stats")), defaults["sample_interval_seconds"])
+        samplers = [lag, resources]
+        for sampler in samplers:
+            sampler.start()
         before = dict(offsets)
-        measured = _stage(smoke, cell, warmup=False)
-        after = smoke.run_stage(measured, offsets)
+        after = smoke.run_stage(_stage(smoke, cell, warmup=False), offsets)
+        stage_end = wall()
+        for sampler in samplers:
+            sampler.stop()
         evidence.canonical_records = after[smoke.TOPIC_SPANS] - before[smoke.TOPIC_SPANS]
         evidence.raw_records = after[smoke.TOPIC_RAW] - before[smoke.TOPIC_RAW]
         evidence.dlq_records = after[smoke.TOPIC_DLQ] - before[smoke.TOPIC_DLQ]
-        report = json.loads((smoke.RUN.temp / f"{cell.measured_run_id}.json").read_text(
+        report = json.loads((Path(smoke.RUN.temp) / f"{cell.measured_run_id}.json").read_text(
             encoding="utf-8"))
         evidence.driver = report["execution"]
+        drained = stage_end - _parse_time(evidence.driver["finished"])
+        evidence.drain_seconds = drained if drained >= 0 else None
         evidence.database = json.loads(smoke.psql(run_metrics_sql(cell.measured_run_id)))
         evidence.clock_after = _clock(smoke)
-    except LiveDisabled:
-        raise
-    except Exception as exc:
+        smoke.check_host_processes()
+        if cell.refresh_and_detector:
+            within_budget("the analytics refresh")
+            ledger = e2e.ledger_fingerprint()
+            started = clock()
+            refresh = smoke.run(e2e.refresh_command("run", "--rm", "-T", e2e.REFRESH_SERVICE),
+                                timeout=REFRESH_TIMEOUT_SECONDS, what="analytics refresh")
+            elapsed = clock() - started
+            if refresh.returncode != 0:
+                raise BenchmarkError(f"the analytics refresh failed (exit {refresh.returncode})")
+            if e2e.ledger_fingerprint() != ledger:
+                raise BenchmarkError("the analytics refresh changed the bootstrap ledger")
+            evidence.refresh_seconds = elapsed
+            evidence.refresh_dbt_seconds = parse_dbt_seconds(refresh.stdout + refresh.stderr)
+            within_budget("the detector")
+            groups, _summary = e2e.run_detector("benchmark")
+            evidence.detector_ms = {
+                f"{g['signal_path']}/{g['operation_name']}": float(g["duration_ms"])
+                for g in groups if g.get("duration_ms") is not None}
+        smoke.check_normal_stack("after the cell")
+    except _Stop as stop:
+        evidence.stop_reasons = list(evidence.stop_reasons) + stop.reasons
+    except Exception as exc:  # recorded as evidence; the cell is never retried
         evidence.failure = f"{type(exc).__name__}: {exc}"
     finally:
-        for sampler in (lag_sampler, resource_sampler):
-            if sampler is not None:
-                sampler.stop()
-        if lag_sampler is not None:
-            evidence.lag_samples = list(lag_sampler.samples)
-        if resource_sampler is not None:
-            evidence.resource_samples = list(resource_sampler.samples)
-        evidence.finished = time.time()
-        if not smoke.cleanup():
-            evidence.stop_reasons = list(evidence.stop_reasons) + ["cleanup not verified"]
-    evidence.limitations.append(
-        "refresh and detector timing are not part of this version's live flow")
+        clean = _cleanup(smoke, e2e, samplers, refresh_built, evidence)
+    evidence.lag_samples = list(samplers[0].samples) if samplers else []
+    evidence.resource_samples = list(samplers[1].samples) if len(samplers) > 1 else []
+    evidence.finished = wall()
+    evidence.cleanup_verified = clean
+    if cell.refresh_and_detector is False:
+        evidence.limitations.append(f"no analytics refresh or detector at level {cell.level}")
+    evidence.limitations.append("resource and lag stops are judged after the measured run; "
+                                "a running stage is never interrupted")
     result = assemble_result(evidence, stops)
-    write_result(result, output_dir)
-    return result
+    path = write_result(result, output_dir)
+    if not clean:
+        _mark_cleanup_unverified(output_dir, cell)
+    return result, path, clean
+
+
+def _cleanup(smoke: Any, e2e: Any, samplers: Sequence[Any], refresh_built: bool,
+             evidence: CellEvidence) -> bool:
+    """Samplers, host processes, the refresh profile, then the stack.  Every
+    step runs even when an earlier one fails; True only if all succeeded and
+    the harness verified the stack is gone and the normal stack unchanged."""
+    ok = True
+    for step, action in (
+        ("samplers", lambda: [sampler.stop() for sampler in samplers]),
+        ("host processes", smoke.stop_host_processes),
+        ("refresh profile", e2e.remove_profile_resources if refresh_built else (lambda: None)),
+    ):
+        try:
+            action()
+        except Exception as exc:
+            ok = False
+            evidence.limitations.append(f"cleanup step {step} failed: {type(exc).__name__}")
+    try:
+        verified = smoke.cleanup() is True
+    except Exception as exc:
+        verified = False
+        evidence.limitations.append(f"cleanup failed: {type(exc).__name__}")
+    return ok and verified
+
+
+def _mark_cleanup_unverified(output_dir: Path, cell: Cell) -> None:
+    output_dir = Path(output_dir).resolve()
+    if output_dir == REPO or REPO in output_dir.parents:
+        raise BenchmarkError("results are never written inside the repository")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / CLEANUP_MARKER).write_text(
+        f"cleanup of {cell.benchmark_id} was not verified; inspect Docker and delete this "
+        "file before the next live run\n", encoding="utf-8")
 
 
 def _stage(smoke: Any, cell: Cell, *, warmup: bool) -> Any:
@@ -862,6 +1035,8 @@ def _clock(smoke: Any) -> list[M.ClockSample]:
 def _plan_text(cells: Sequence[Cell], output_dir: Path) -> str:
     lines = ["PLAN ONLY - nothing was started, nothing was sent.",
              f"results would be written to: {output_dir}"]
+    if (output_dir / CLEANUP_MARKER).exists():
+        lines.append(f"WARNING: {CLEANUP_MARKER} is present there; live runs are blocked")
     for cell in cells:
         lines.append(
             f"{cell.benchmark_id}: {cell.requests} requests ({cell.planned_spans} spans) at "
@@ -907,9 +1082,17 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
     except LiveDisabled as exc:
         sys.stderr.write(f"run_benchmark: error: {exc}\n")
         return 2
+    if (output_dir / CLEANUP_MARKER).exists():  # pragma: no cover - live only
+        sys.stderr.write(f"run_benchmark: error: {output_dir / CLEANUP_MARKER} exists: an "
+                         "earlier cleanup was not verified; nothing was started\n")
+        return 2
     for cell in cells:  # pragma: no cover - unreachable while LIVE_ENABLED is False
-        result = run_cell(cell, ladder, expect_head=args.expect_head, output_dir=output_dir)
-        out.write(f"{cell.benchmark_id}: {result['verdict']}\n")
+        result, path, clean = run_cell(cell, ladder, expect_head=args.expect_head,
+                                       output_dir=output_dir)
+        out.write(f"{cell.benchmark_id}: {result['verdict']} -> {path}\n")
+        if not clean:
+            out.write("stopping: cleanup was not verified; no further cell starts\n")
+            return 1
         if result["verdict"] != "VALID":
             out.write("stopping the ladder: a cell was not VALID\n")
             return 1

@@ -382,32 +382,52 @@ def clock_check(
 # ---------------------------------------------------------------------------
 
 def generator_bound(
-    *, requested_rate: float, achieved_rate: float, late_starts: int, started_requests: int,
-    rate_fraction: float = GENERATOR_RATE_FRACTION,
+    *, late_starts: int, started_requests: int, not_started_requests: int = 0,
+    deadline_reached: bool = False, start_lag_series: Sequence[float] = (),
     late_fraction: float = LATE_START_FRACTION,
+    lag_growth_samples: int = LAG_GROWTH_SAMPLES,
 ) -> tuple[bool, tuple[str, ...]]:
     """
-    True when the load source, not the platform, limited the run: it
-    achieved less than rate_fraction of the requested rate, or more than
-    late_fraction of its requests started late.
+    True when the load source's SCHEDULER could not keep the planned start
+    times, so the run describes the load source rather than the platform:
+
+        more than late_fraction of the started requests started late
+        (the driver's own definition of late), or
+        planned requests never started, or the deadline was reached, or
+        the start lag grew across lag_growth_samples consecutive samples
+        (when such a series is available).
+
+    The achieved throughput (requests / wall time) is deliberately NOT used:
+    it includes the last request's run time and the final flush, so a short
+    run on time would look slow.  It is reported separately.
     """
-    requested_rate = _finite(requested_rate, "requested_rate")
-    achieved_rate = _finite(achieved_rate, "achieved_rate")
     late_starts = _count(late_starts, "late_starts")
     started_requests = _count(started_requests, "started_requests")
-    if requested_rate <= 0.0:
-        raise MetricError("requested_rate must be positive")
-    if started_requests == 0:
-        raise MetricError("no request started: the load source cannot be judged")
+    not_started_requests = _count(not_started_requests, "not_started_requests")
+    if not isinstance(deadline_reached, bool):
+        raise MetricError("deadline_reached must be true or false")
+    if started_requests == 0 and not_started_requests == 0:
+        raise MetricError("no request was planned to start: the load source cannot be judged")
     if late_starts > started_requests:
         raise MetricError("more late starts than started requests")
     reasons = []
-    if achieved_rate < rate_fraction * requested_rate:
-        reasons.append(f"achieved {achieved_rate:.3f}/s < {rate_fraction:.0%} of "
-                       f"requested {requested_rate:.3f}/s")
-    share = late_starts / started_requests
-    if share > late_fraction:
-        reasons.append(f"{share:.1%} of requests started late > {late_fraction:.0%}")
+    if started_requests:
+        share = late_starts / started_requests
+        if share > late_fraction:
+            reasons.append(f"{share:.1%} of requests started late > {late_fraction:.0%}")
+    if not_started_requests:
+        reasons.append(f"{not_started_requests} planned requests never started")
+    if deadline_reached:
+        reasons.append("the deadline was reached before every request started")
+    lags = [_finite(value, "start lag") for value in start_lag_series]
+    if lag_growth_samples < 2:
+        raise MetricError("lag_growth_samples must be at least 2")
+    streak = 1
+    for previous, current in zip(lags, lags[1:]):
+        streak = streak + 1 if current > previous else 1
+        if streak >= lag_growth_samples:
+            reasons.append(f"start lag grew across {lag_growth_samples} consecutive samples")
+            break
     return bool(reasons), tuple(reasons)
 
 
