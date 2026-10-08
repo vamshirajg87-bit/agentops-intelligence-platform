@@ -731,8 +731,8 @@ class TestAssembleResult:
         assert result["verdict"] == "VALID" and result["integrity"]["ok"] is True
         assert result["claims"]["platform_throughput"] and result["claims"]["persistence_latency"]
         tp = result["metrics"]["throughput"]
-        assert tp["spans_persisted_per_second"]["value"] == pytest.approx(35.0)
-        assert tp["spans_persisted_per_second"]["kind"] == "MEASURED"
+        assert tp["spans_persisted_per_second"]["value"] == pytest.approx(699 / 20.0)
+        assert tp["spans_persisted_per_second"]["kind"] == "DERIVED"
         assert tp["spans_generated_per_second"]["kind"] == "DERIVED"
         assert result["metrics"]["latency"]["request_ms"]["p50"]["value"] == pytest.approx(249.5)
         assert result["metrics"]["latency"]["persistence_ms"]["p95"]["kind"] == "DERIVED"

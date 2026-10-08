@@ -328,7 +328,9 @@ class TestSuccess:
         assert detector["trace_latency/agentops.request"]["value"] == 12.5
         (tmp_path / "b").mkdir()
         lag = _run(tmp_path / "b")[0]["metrics"]["lag"]
-        assert lag["drain_seconds"]["kind"] == "OBSERVATION" and lag["drain_seconds"]["value"] == 3
+        assert lag["stage_tail_seconds"]["kind"] == "OBSERVATION"
+        assert lag["stage_tail_seconds"]["value"] == 3
+        assert lag["drain_seconds"]["kind"] == "NOT_MEASURED"
 
     def test_resource_sampling_is_limited_to_project_containers(self, tmp_path):
         _, _, _, smoke = _run(tmp_path)
@@ -760,3 +762,193 @@ class TestBothGateStates:
         result, path, clean, smoke = _run(tmp_path)
         assert clean and result["verdict"] == "VALID" and path.is_file()
         assert smoke.calls[-1] == "cleanup"
+
+# ---------------------------------------------------------------------------
+# Phase 14.4B3F measurement corrections
+# ---------------------------------------------------------------------------
+
+def _assembled(driver_overrides=None, db_overrides=None, drop=(), **evidence):
+    smoke_driver = {"started": "2026-01-01T00:00:00+00:00",
+                    "finished": "2026-01-01T00:00:20+00:00", "elapsed_seconds": 20.0,
+                    "executed_attempts": 100, "started_requests": 100,
+                    "not_started_requests": 0, "spans_ended": 700,
+                    "spans_exported_successfully": 700, "export_failures": 0,
+                    "flush_ok": True, "run_status": "completed", "problems": [],
+                    "achieved_submission_rate": 5.0, "late_starts": 0,
+                    "max_start_lag_seconds": 0.04, "mean_start_lag_seconds": 0.01}
+    smoke_driver.update(driver_overrides or {})
+    for name in drop:
+        smoke_driver.pop(name)
+    database = {"rows": 700, "distinct_spans": 700, "roots": 100, "first_ingested": 5000.0,
+                "last_ingested": 5020.0, "request_ms": [250.0] * 100,
+                "persistence_ms": [40.0] * 700, "per_second": [35] * 20}
+    database.update(db_overrides or {})
+    values = dict(cell=_cell(), git_sha=SHA, git_dirty=False, started=1000.0, finished=1100.0,
+                  driver=smoke_driver, canonical_records=700, raw_records=140, dlq_records=0,
+                  database=database, clock_before=[M.ClockSample(1000.0, 1000.001, 1000.002)],
+                  clock_after=[M.ClockSample(1001.0, 1001.001, 1001.002)],
+                  stage_tail_seconds=37.9)
+    values.update(evidence)
+    result = RB.assemble_result(RB.CellEvidence(**values), LADDER["stop_limits"])
+    M.validate_result(result)
+    return result
+
+
+class TestStageTail:
+    def test_stage_tail_is_an_observation_with_the_exact_method(self):
+        tail = _assembled()["metrics"]["lag"]["stage_tail_seconds"]
+        assert tail["kind"] == "OBSERVATION" and tail["value"] == 37.9
+        assert tail["method"] == ("Driver finished -> run_stage returned; includes consumer "
+                                  "drain, settle period and reconciliation.")
+
+    def test_pure_drain_is_not_measured_and_never_estimated(self):
+        drain = _assembled()["metrics"]["lag"]["drain_seconds"]
+        assert drain["kind"] == "NOT_MEASURED" and drain["value"] is None
+        assert "does not expose an isolated drain duration" in drain["reason"]
+
+    def test_older_field_name_is_read_as_the_stage_tail(self):
+        result = _assembled(stage_tail_seconds=None, drain_seconds=12.0)
+        assert result["metrics"]["lag"]["stage_tail_seconds"]["value"] == 12.0
+        assert result["metrics"]["lag"]["drain_seconds"]["kind"] == "NOT_MEASURED"
+
+    def test_missing_tail_is_not_measured(self):
+        tail = _assembled(stage_tail_seconds=None)["metrics"]["lag"]["stage_tail_seconds"]
+        assert tail["kind"] == "NOT_MEASURED" and tail["value"] is None
+
+    def test_live_cell_records_the_tail(self, tmp_path):
+        result = _run(tmp_path)[0]
+        assert result["metrics"]["lag"]["stage_tail_seconds"]["value"] == 3
+
+
+class TestPersistedRate:
+    def test_formula_is_n_minus_one_over_span(self):
+        rate = _assembled()["metrics"]["throughput"]["spans_persisted_per_second"]
+        assert rate["kind"] == "DERIVED" and rate["value"] == pytest.approx(699 / 20.0)
+        assert rate["n"] == 700 and "(rows - 1)" in rate["method"]
+        assert rate["window"]["clock"] == "database"
+
+    def test_two_rows(self):
+        result = _assembled(db_overrides={"rows": 2, "distinct_spans": 2,
+                                          "last_ingested": 5000.5})
+        value = result["metrics"]["throughput"]["spans_persisted_per_second"]
+        assert value["value"] == pytest.approx(2.0)
+
+    @pytest.mark.parametrize("overrides, reason", [
+        ({"rows": 1, "distinct_spans": 1}, "at least 2"),
+        ({"rows": 0, "distinct_spans": 0}, "at least 2"),
+        ({"last_ingested": 5000.0}, "one instant"),
+        ({"last_ingested": 4999.0}, "one instant"),
+        ({"first_ingested": None}, "not read"),
+    ])
+    def test_edge_cases_are_not_measured(self, overrides, reason):
+        rate = _assembled(db_overrides=overrides)["metrics"]["throughput"][
+            "spans_persisted_per_second"]
+        assert rate["kind"] == "NOT_MEASURED" and rate["value"] is None
+        assert reason in rate["reason"]
+
+    def test_generated_and_request_rates_unchanged(self):
+        tp = _assembled()["metrics"]["throughput"]
+        assert tp["spans_generated_per_second"]["kind"] == "DERIVED"
+        assert tp["spans_generated_per_second"]["value"] == 35.0
+        assert tp["requests_per_second"]["value"] == 5.0
+
+
+class TestScheduler:
+    def test_values_copied_from_the_driver(self):
+        sched = _assembled(driver_overrides={"late_starts": 3, "started_requests": 98,
+                                             "not_started_requests": 2,
+                                             "max_start_lag_seconds": 0.4,
+                                             "mean_start_lag_seconds": 0.05})["metrics"][
+            "scheduler"]
+        assert {k: v["value"] for k, v in sched.items()} == {
+            "late_starts": 3, "started_requests": 98, "not_started_requests": 2,
+            "max_start_lag_seconds": 0.4, "mean_start_lag_seconds": 0.05}
+        assert {v["kind"] for v in sched.values()} == {"MEASURED"}
+
+    def test_genuine_zero_stays_zero(self):
+        late = _assembled()["metrics"]["scheduler"]["late_starts"]
+        assert late["kind"] == "MEASURED" and late["value"] == 0
+
+    @pytest.mark.parametrize("field", ["late_starts", "not_started_requests",
+                                       "max_start_lag_seconds", "mean_start_lag_seconds"])
+    def test_missing_field_is_not_measured_not_zero(self, field):
+        result = _assembled(drop=(field,))
+        metric = result["metrics"]["scheduler"][field]
+        assert metric["kind"] == "NOT_MEASURED" and metric["value"] is None
+        evidence = result["stop"]["generator_bound_evidence"]
+        assert evidence[field] is None and field in evidence["missing"]
+
+    def test_missing_late_starts_means_not_evaluated(self):
+        result = _assembled(drop=("late_starts",))
+        evidence = result["stop"]["generator_bound_evidence"]
+        assert evidence["evaluated"] is False and result["stop"]["generator_bound"] is False
+        assert any("not evaluated" in item for item in result["limitations"])
+
+    def test_no_driver_report(self):
+        result = _assembled(driver=None, canonical_records=None)
+        assert all(m["kind"] == "NOT_MEASURED" for m in result["metrics"]["scheduler"].values())
+        assert result["stop"]["generator_bound_evidence"]["evaluated"] is False
+
+    def test_run_status_and_no_series_recorded(self):
+        evidence = _assembled(driver_overrides={"run_status": "deadline_reached"})[
+            "stop"]["generator_bound_evidence"]
+        assert evidence["run_status"] == "deadline_reached"
+        assert evidence["start_lag_series"] is None
+
+    @pytest.mark.parametrize("overrides, bound, verdict", [
+        ({}, False, "VALID"),
+        ({"late_starts": 5}, False, "VALID"),
+        ({"late_starts": 6}, True, "GENERATOR_BOUND"),
+        ({"not_started_requests": 1}, True, "GENERATOR_BOUND"),
+        # Also fails the driver-status integrity gate: INVALID takes precedence.
+        ({"run_status": "deadline_reached"}, True, "INVALID"),
+    ])
+    def test_decision_reproducible_from_the_json(self, overrides, bound, verdict):
+        result = json.loads(json.dumps(_assembled(driver_overrides=overrides)))
+        evidence = result["stop"]["generator_bound_evidence"]
+        again, reasons = RB.generator_bound_from_evidence(
+            evidence, late_fraction=evidence["late_fraction"],
+            lag_growth_samples=evidence["lag_growth_samples"])
+        assert again == result["stop"]["generator_bound"] == evidence["generator_bound"] == bound
+        assert list(reasons) == [r for r in result["verdict_reasons"]
+                                 if r not in result["stop"]["reasons"]]
+        assert result["verdict"] == verdict == M.verdict(
+            integrity_ok=result["integrity"]["ok"], stop_reasons=result["stop"]["reasons"],
+            generator_bound_run=again)
+
+
+class TestHistoricalCompatibility:
+    def _historical(self):
+        """A result shaped as written before 14.4B3F: drain_seconds as an
+        OBSERVATION, persisted rate MEASURED, no scheduler section and no
+        generator-bound evidence."""
+        result = json.loads(json.dumps(_assembled()))
+        lag = result["metrics"]["lag"]
+        lag["drain_seconds"] = {**lag.pop("stage_tail_seconds"),
+                                "method": "end of driver run -> lag 0 and counts stable"}
+        rate = result["metrics"]["throughput"]["spans_persisted_per_second"]
+        rate.update(kind="MEASURED", value=700 / 20.0,
+                    method="rows / (last - first ingested_at)")
+        del result["metrics"]["scheduler"]
+        del result["stop"]["generator_bound_evidence"]
+        return result
+
+    def test_older_results_still_validate(self):
+        M.validate_result(self._historical())
+
+    def test_validation_does_not_rewrite_older_results(self):
+        older = self._historical()
+        snapshot = json.dumps(older, sort_keys=True)
+        M.validate_result(older)
+        assert json.dumps(older, sort_keys=True) == snapshot
+
+
+class TestCorrectionsKeepSafety:
+    def test_authorization_and_isolation_unchanged(self, tmp_path, monkeypatch, capsys):
+        assert RB.APPROVED_LIVE_CELL["benchmark_id"] == "bm-smoke-r0005-c32-rep1"
+        assert RB.APPROVED_LIVE_CELL["repetition"] == 1
+        with pytest.raises(LiveAccessAttempt):
+            subprocess.run(["docker", "ps"])
+        monkeypatch.setattr(RB, "LIVE_ENABLED", False)
+        assert RB.main([*EXACT, "--live", "--output-dir", str(tmp_path)]) == 2
+        assert "not enabled" in capsys.readouterr().err

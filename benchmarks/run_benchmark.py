@@ -501,6 +501,89 @@ def _get(source: Optional[Mapping[str, Any]], key: str) -> Any:
     return None if source is None else source.get(key)
 
 
+STAGE_TAIL_METHOD: str = ("Driver finished -> run_stage returned; includes consumer drain, "
+                          "settle period and reconciliation.")
+SCHEDULER_COUNTS: tuple[str, ...] = ("late_starts", "started_requests", "not_started_requests")
+SCHEDULER_SECONDS: tuple[str, ...] = ("max_start_lag_seconds", "mean_start_lag_seconds")
+
+
+def _persisted_rate(db: Optional[Mapping[str, Any]],
+                    window: Optional[Mapping[str, str]]) -> dict[str, Any]:
+    """
+    (n - 1) / (last - first ingested_at): n insert timestamps bound n - 1
+    intervals.  Both timestamps are epoch seconds from the database clock.
+    Fewer than 2 rows, or a span that is not positive, has no rate.
+    """
+    source = "telemetry_spans.ingested_at"
+    rows = _get(db, "rows")
+    first, last = _get(db, "first_ingested"), _get(db, "last_ingested")
+    if rows is None or first is None or last is None:
+        return M.not_measured("spans/s", source, "rows or ingested_at bounds not read").to_dict()
+    if rows < 2:
+        return M.not_measured("spans/s", source,
+                              f"{rows} row(s): a rate needs at least 2").to_dict()
+    span = last - first
+    if not span > 0:
+        return M.not_measured("spans/s", source,
+                              "the first and last rows share one instant").to_dict()
+    return M.Metric(
+        M.rate(rows - 1, span), "spans/s", "DERIVED", source,
+        "(rows - 1) / (max(ingested_at) - min(ingested_at)), in seconds of the database "
+        "clock: n insert timestamps bound n - 1 intervals", window, rows).to_dict()
+
+
+def _scheduler(driver: Optional[Mapping[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    The measured run's scheduler evidence, from the driver's own report.
+
+    Returns (metrics, evidence).  A field the report lacks is NOT_MEASURED
+    and None in the evidence, never 0.  evidence["evaluated"] says whether
+    the generator-bound rule can be judged: it needs late_starts and
+    started_requests, and at least one planned request.
+    """
+    metrics: dict[str, Any] = {}
+    evidence: dict[str, Any] = {"start_lag_series": None, "missing": []}
+    for name in SCHEDULER_COUNTS + SCHEDULER_SECONDS:
+        value = _get(driver, name)
+        evidence[name] = value
+        unit = "requests" if name in SCHEDULER_COUNTS else "s"
+        if value is None:
+            evidence["missing"].append(name)
+            reason = ("no driver report" if driver is None
+                      else f"the driver report has no {name}")
+            metrics[name] = M.not_measured(unit, "driver report", reason).to_dict()
+        else:
+            metrics[name] = M.Metric(value, unit, "MEASURED", "driver report",
+                                     "the driver's own value for the measured run", None,
+                                     1).to_dict()
+    evidence["run_status"] = _get(driver, "run_status")
+    if evidence["run_status"] is None:
+        evidence["missing"].append("run_status")
+    planned = (evidence["started_requests"] or 0) + (evidence["not_started_requests"] or 0)
+    evidence["evaluated"] = (evidence["late_starts"] is not None
+                             and evidence["started_requests"] is not None and planned > 0)
+    return metrics, evidence
+
+
+def generator_bound_from_evidence(
+    evidence: Mapping[str, Any], *, late_fraction: float, lag_growth_samples: int,
+) -> tuple[bool, tuple[str, ...]]:
+    """
+    The generator-bound decision from recorded scheduler evidence alone, so
+    a result can be re-checked from its JSON.  Not evaluated -> (False, ()).
+    A missing not_started_requests or run_status adds no evidence: each can
+    only make a run GENERATOR_BOUND, never clear it.  There is no start-lag
+    series.
+    """
+    if not evidence.get("evaluated"):
+        return False, ()
+    return M.generator_bound(
+        late_starts=evidence["late_starts"], started_requests=evidence["started_requests"],
+        not_started_requests=evidence.get("not_started_requests") or 0,
+        deadline_reached=evidence.get("run_status") == "deadline_reached",
+        late_fraction=late_fraction, lag_growth_samples=lag_growth_samples)
+
+
 def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
@@ -524,6 +607,12 @@ class CellEvidence:
     clock_after: Sequence[M.ClockSample] = ()
     lag_samples: Sequence[tuple[float, Any]] = ()
     resource_samples: Sequence[tuple[float, Any]] = ()
+    #: Driver finished -> run_stage returned: consumer drain, the settle
+    #: period and the reconciliation queries together.
+    stage_tail_seconds: Optional[float] = None
+    #: Older name of stage_tail_seconds, which is what it always held; read
+    #: only when stage_tail_seconds is unset.  A pure drain time is never
+    #: available: the frozen harness does not expose one.
     drain_seconds: Optional[float] = None
     refresh_seconds: Optional[float] = None           # wall clock around the refresh
     refresh_dbt_seconds: Optional[float] = None       # dbt's own duration, when printed
@@ -647,16 +736,7 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
                            ("spans_generated_per_second", "spans/s")):
             metrics["throughput"][name] = M.not_measured(
                 unit, "driver report", "no driver report with a positive elapsed time").to_dict()
-    if db is not None and db.get("first_ingested") is not None and \
-            db["last_ingested"] > db["first_ingested"]:
-        span = db["last_ingested"] - db["first_ingested"]
-        metrics["throughput"]["spans_persisted_per_second"] = M.Metric(
-            M.rate(db["rows"], span), "spans/s", "MEASURED", "telemetry_spans.ingested_at",
-            "rows / (last - first ingested_at)", window_db, db["rows"]).to_dict()
-    else:
-        metrics["throughput"]["spans_persisted_per_second"] = M.not_measured(
-            "spans/s", "telemetry_spans.ingested_at",
-            "no rows, or all rows stored within one instant").to_dict()
+    metrics["throughput"]["spans_persisted_per_second"] = _persisted_rate(db, window_db)
 
     request_ms = list(db.get("request_ms") or []) if db is not None else []
     metrics["latency"]["request_ms"] = {
@@ -694,11 +774,18 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
         for group in ("raw", "canonical"):
             metrics["lag"][f"{group}_max"] = M.not_measured(
                 "records", "kafka-consumer-groups", "no lag samples taken").to_dict()
-    metrics["lag"]["drain_seconds"] = (M.Metric(
-        evidence.drain_seconds, "s", "OBSERVATION", "harness wall clock",
-        "end of driver run -> lag 0 and counts stable", None, 1).to_dict()
-        if evidence.drain_seconds is not None else
-        M.not_measured("s", "harness wall clock", "drain not reached").to_dict())
+    tail = (evidence.stage_tail_seconds if evidence.stage_tail_seconds is not None
+            else evidence.drain_seconds)
+    metrics["lag"]["stage_tail_seconds"] = (M.Metric(
+        tail, "s", "OBSERVATION", "harness wall clock", STAGE_TAIL_METHOD, None, 1).to_dict()
+        if tail is not None else
+        M.not_measured("s", "harness wall clock",
+                       "the measured stage did not return").to_dict())
+    metrics["lag"]["drain_seconds"] = M.not_measured(
+        "s", "run_smoke.run_stage",
+        "the frozen harness does not expose an isolated drain duration; see "
+        "stage_tail_seconds").to_dict()
+    metrics["scheduler"], scheduler_evidence = _scheduler(driver)
 
     memory_peaks: dict[str, int] = {}
     for _, rows in evidence.resource_samples:
@@ -765,18 +852,18 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
     # The scheduler's own evidence decides whether the load source was the
     # limit; the achieved throughput (wall time includes the final flush)
     # is reported but never used for this.
-    bound, bound_reasons = False, ()
-    if driver is not None and (driver.get("started_requests") or
-                               driver.get("not_started_requests")):
-        bound, bound_reasons = M.generator_bound(
-            late_starts=driver.get("late_starts", 0),
-            started_requests=driver.get("started_requests", 0),
-            not_started_requests=driver.get("not_started_requests", 0),
-            deadline_reached=driver.get("run_status") == "deadline_reached",
-            late_fraction=stops["late_start_fraction"],
-            lag_growth_samples=int(stops["lag_growth_samples"]))
+    bound, bound_reasons = generator_bound_from_evidence(
+        scheduler_evidence, late_fraction=stops["late_start_fraction"],
+        lag_growth_samples=int(stops["lag_growth_samples"]))
+    scheduler_evidence["late_fraction"] = stops["late_start_fraction"]
+    scheduler_evidence["lag_growth_samples"] = int(stops["lag_growth_samples"])
+    scheduler_evidence["generator_bound"] = bound
+    if scheduler_evidence["evaluated"]:
         limitations.append("start lag is available only as a maximum and a mean; the "
                            "growing-start-lag rule had no series to judge")
+    else:
+        limitations.append("generator-bound check not evaluated: the driver report lacks "
+                           + ", ".join(scheduler_evidence["missing"] or ["a report"]))
     value = M.verdict(integrity_ok=integrity_ok, stop_reasons=stop_reasons,
                       generator_bound_run=bound)
     if value == "GENERATOR_BOUND":
@@ -796,7 +883,8 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
         "integrity": {"ok": integrity_ok, "gates": gates},
         "verdict": value,
         "verdict_reasons": list(bound_reasons) + stop_reasons,
-        "stop": {"reasons": stop_reasons, "generator_bound": bound},
+        "stop": {"reasons": stop_reasons, "generator_bound": bound,
+                 "generator_bound_evidence": scheduler_evidence},
         "claims": M.claim_eligibility(value, clock_valid),
         "limitations": limitations,
     }
@@ -977,8 +1065,8 @@ def execute_cell(
         report = json.loads((Path(smoke.RUN.temp) / f"{cell.measured_run_id}.json").read_text(
             encoding="utf-8"))
         evidence.driver = report["execution"]
-        drained = stage_end - _parse_time(evidence.driver["finished"])
-        evidence.drain_seconds = drained if drained >= 0 else None
+        tail = stage_end - _parse_time(evidence.driver["finished"])
+        evidence.stage_tail_seconds = tail if tail >= 0 else None
         evidence.database = json.loads(smoke.psql(run_metrics_sql(cell.measured_run_id)))
         evidence.clock_after = _clock(smoke)
         smoke.check_host_processes()
