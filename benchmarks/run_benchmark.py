@@ -147,12 +147,61 @@ class Cell:
         }
 
 
+#: The only cell live execution may run (Phase 14.4B3).  Every field must
+#: match, the warm-up must be given explicitly, and --authorize must name it.
+APPROVED_LIVE_CELL: Mapping[str, Any] = {
+    "benchmark_id": "bm-smoke-r0005-c32-rep1", "level": "SMOKE", "requests": 100,
+    "rate": 5, "concurrency": 32, "repetition": 1, "warmup_requests": 25,
+}
+MAX_WARMUP_REQUESTS: int = 10000
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def check_live_authorization(
+    cells: Sequence[Cell], *, authorize: Optional[str], expect_head: Optional[str],
+    warmup_requests: Optional[int],
+) -> Cell:
+    """
+    The one cell live execution may run, or BenchmarkError.  Pure: it is
+    decided before anything is imported or started.  The actual HEAD is
+    compared with expect_head by the harness's first step, before any
+    infrastructure.
+    """
+    approved = APPROVED_LIVE_CELL
+    if authorize is None:
+        raise BenchmarkError("--live needs --authorize <benchmark id>")
+    if authorize != approved["benchmark_id"]:
+        raise BenchmarkError(f"--authorize {authorize!r} is not the approved cell "
+                             f"{approved['benchmark_id']}")
+    if expect_head is None or not _SHA_RE.fullmatch(expect_head):
+        raise BenchmarkError("--live needs --expect-head with a full 40-character commit")
+    if warmup_requests != approved["warmup_requests"]:
+        raise BenchmarkError(f"--live needs --warmup-requests {approved['warmup_requests']}")
+    if len(cells) != 1:
+        raise BenchmarkError(f"--live runs exactly one cell; {len(cells)} are planned")
+    cell = cells[0]
+    found = {"benchmark_id": cell.benchmark_id, "level": cell.level, "requests": cell.requests,
+             "rate": cell.rate, "concurrency": cell.concurrency,
+             "repetition": cell.repetition, "warmup_requests": cell.warmup_requests}
+    wrong = sorted(key for key, value in approved.items() if found[key] != value)
+    if wrong:
+        raise BenchmarkError("the planned cell differs from the approved one in "
+                             + ", ".join(f"{k} ({found[k]} != {approved[k]})" for k in wrong))
+    return cell
+
+
 def plan_cells(
     ladder: Mapping[str, Any], level: str, *, rates: Optional[Sequence[int]] = None,
     repetitions: Optional[int] = None, concurrency: Optional[int] = None,
+    warmup_requests: Optional[int] = None,
 ) -> list[Cell]:
     """The cells of one level, in the order they would run: each rate in
-    ascending order, its repetitions one after another."""
+    ascending order, its repetitions one after another.  warmup_requests
+    replaces the ladder's rate x warmup_seconds when given."""
+    if warmup_requests is not None and (
+            isinstance(warmup_requests, bool) or not isinstance(warmup_requests, int)
+            or not 1 <= warmup_requests <= MAX_WARMUP_REQUESTS):
+        raise BenchmarkError(f"warm-up requests must be 1-{MAX_WARMUP_REQUESTS}")
     found = [lv for lv in ladder["levels"] if lv["name"] == level]
     if not found:
         raise BenchmarkError(f"unknown level {level!r}")
@@ -173,7 +222,8 @@ def plan_cells(
             cell = Cell(
                 level=level, rate=rate, concurrency=conc, repetition=repetition,
                 requests=spec["target_requests"], seed=defaults["seed"],
-                warmup_requests=max(1, int(rate * defaults["warmup_seconds"])),
+                warmup_requests=(max(1, int(rate * defaults["warmup_seconds"]))
+                                 if warmup_requests is None else warmup_requests),
                 live_allowed=spec["live_allowed"],
                 refresh_and_detector=spec["refresh_and_detector"],
             )
@@ -816,6 +866,10 @@ def run_cell(cell: Cell, ladder: Mapping[str, Any], *, expect_head: Optional[str
     only after that check.
     """
     _require_live()
+    approved = APPROVED_LIVE_CELL
+    if (cell.benchmark_id, cell.warmup_requests) != (approved["benchmark_id"],
+                                                     approved["warmup_requests"]):
+        raise BenchmarkError(f"{cell.benchmark_id} is not the approved live cell")
     if not cell.live_allowed:
         raise BenchmarkError(f"level {cell.level} is not allowed live")
     if str(REPO / "workload-generator") not in sys.path:
@@ -1059,9 +1113,14 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
     parser.add_argument("--repetitions", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT), metavar="DIR")
+    parser.add_argument("--warmup-requests", type=int, default=None, metavar="N",
+                        help="warm-up requests per cell (default: rate x the ladder's "
+                             "warmup_seconds)")
     parser.add_argument("--expect-head", default=None, metavar="COMMIT")
+    parser.add_argument("--authorize", default=None, metavar="BENCHMARK_ID",
+                        help="with --live: the one approved cell's id")
     parser.add_argument("--live", action="store_true",
-                        help="run the cells for real (disabled in this version)")
+                        help="run the approved cell for real (disabled in this version)")
     args = parser.parse_args(argv)
 
     output_dir = Path(args.output_dir).resolve()
@@ -1070,17 +1129,28 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
     try:
         ladder = load_ladder(Path(args.config))
         cells = plan_cells(ladder, args.level, rates=args.rate, repetitions=args.repetitions,
-                           concurrency=args.concurrency)
+                           concurrency=args.concurrency, warmup_requests=args.warmup_requests)
     except BenchmarkError as exc:
         parser.error(str(exc))
 
     if not args.live:
+        if args.authorize is not None:
+            parser.error("--authorize is only used with --live")
         out.write(_plan_text(cells, output_dir))
         return 0
+    # The fail-closed gate first, then the exact-cell authorization; both
+    # before anything is imported or started.
     try:
         _require_live()
     except LiveDisabled as exc:
         sys.stderr.write(f"run_benchmark: error: {exc}\n")
+        return 2
+    try:
+        check_live_authorization(cells, authorize=args.authorize,
+                                 expect_head=args.expect_head,
+                                 warmup_requests=args.warmup_requests)
+    except BenchmarkError as exc:
+        sys.stderr.write(f"run_benchmark: error: {exc}; nothing was started\n")
         return 2
     if (output_dir / CLEANUP_MARKER).exists():  # pragma: no cover - live only
         sys.stderr.write(f"run_benchmark: error: {output_dir / CLEANUP_MARKER} exists: an "

@@ -457,3 +457,174 @@ class TestLiveStaysDisabled:
         out = io.StringIO()
         assert RB.main(["--level", "SMALL", "--output-dir", str(tmp_path / "o")], stdout=out) == 0
         assert out.getvalue().startswith("PLAN ONLY") and not (tmp_path / "o").exists()
+
+
+# ---------------------------------------------------------------------------
+# Exact-cell live authorization (Phase 14.4B3)
+# ---------------------------------------------------------------------------
+
+HEAD = "8" * 40
+APPROVED = ["--level", "SMOKE", "--rate", "5", "--repetitions", "1", "--concurrency", "32",
+            "--warmup-requests", "25"]
+
+
+def _approved_cells(level="SMOKE", **overrides):
+    kwargs = dict(rates=[5], repetitions=1, concurrency=32, warmup_requests=25)
+    kwargs.update(overrides)
+    return RB.plan_cells(LADDER, level, **kwargs)
+
+
+class TestLiveAuthorization:
+    def test_exact_approved_cell(self):
+        cell = RB.check_live_authorization(
+            _approved_cells(), authorize="bm-smoke-r0005-c32-rep1", expect_head=HEAD,
+            warmup_requests=25)
+        assert (cell.benchmark_id, cell.requests, cell.rate, cell.concurrency,
+                cell.repetition, cell.warmup_requests) == (
+            "bm-smoke-r0005-c32-rep1", 100, 5, 32, 1, 25)
+
+    @pytest.mark.parametrize("authorize", [None, "", "bm-smoke-r0010-c32-rep1",
+                                           "bm-small-r0005-c32-rep1"])
+    def test_missing_or_wrong_authorization(self, authorize):
+        with pytest.raises(RB.BenchmarkError, match="authorize"):
+            RB.check_live_authorization(_approved_cells(), authorize=authorize,
+                                        expect_head=HEAD, warmup_requests=25)
+
+    @pytest.mark.parametrize("head", [None, "", "812ff80", "Z" * 40, HEAD + "0"])
+    def test_missing_or_malformed_head(self, head):
+        with pytest.raises(RB.BenchmarkError, match="expect-head"):
+            RB.check_live_authorization(_approved_cells(), authorize="bm-smoke-r0005-c32-rep1",
+                                        expect_head=head, warmup_requests=25)
+
+    @pytest.mark.parametrize("warmup", [None, 24, 26, 150])
+    def test_wrong_warmup_argument(self, warmup):
+        with pytest.raises(RB.BenchmarkError, match="warmup-requests 25"):
+            RB.check_live_authorization(_approved_cells(), authorize="bm-smoke-r0005-c32-rep1",
+                                        expect_head=HEAD, warmup_requests=warmup)
+
+    def test_planned_warmup_must_match_too(self):
+        with pytest.raises(RB.BenchmarkError, match="warmup_requests"):
+            RB.check_live_authorization(_approved_cells(warmup_requests=30),
+                                        authorize="bm-smoke-r0005-c32-rep1",
+                                        expect_head=HEAD, warmup_requests=25)
+
+    @pytest.mark.parametrize("overrides, field", [
+        (dict(rates=[10]), "benchmark_id"),
+        (dict(concurrency=16), "concurrency"),
+        (dict(rates=[10], level="SMALL"), "level"),
+    ])
+    def test_wrong_cell_fields(self, overrides, field):
+        with pytest.raises(RB.BenchmarkError, match=field):
+            RB.check_live_authorization(_approved_cells(**overrides),
+                                        authorize="bm-smoke-r0005-c32-rep1",
+                                        expect_head=HEAD, warmup_requests=25)
+
+    def test_wrong_repetition(self):
+        second = dataclasses.replace(_approved_cells()[0], repetition=2)
+        with pytest.raises(RB.BenchmarkError, match="repetition"):
+            RB.check_live_authorization([second], authorize="bm-smoke-r0005-c32-rep1",
+                                        expect_head=HEAD, warmup_requests=25)
+
+    @pytest.mark.parametrize("overrides", [dict(repetitions=2), dict(rates=[5, 10])])
+    def test_multiple_planned_cells(self, overrides):
+        with pytest.raises(RB.BenchmarkError, match="exactly one cell"):
+            RB.check_live_authorization(_approved_cells(**overrides),
+                                        authorize="bm-smoke-r0005-c32-rep1",
+                                        expect_head=HEAD, warmup_requests=25)
+
+    def test_warmup_override_validation_and_default(self):
+        assert RB.plan_cells(LADDER, "SMOKE", rates=[5], repetitions=1)[0].warmup_requests == 150
+        assert _approved_cells()[0].warmup_requests == 25
+        for bad in (0, -1, RB.MAX_WARMUP_REQUESTS + 1, True, 2.5):
+            with pytest.raises(RB.BenchmarkError, match="warm-up"):
+                RB.plan_cells(LADDER, "SMOKE", warmup_requests=bad)
+
+
+class TestLiveCli:
+    """The CLI with the gate opened in memory only, and run_cell replaced:
+    nothing is imported or started."""
+
+    @pytest.fixture
+    def gate_open(self, monkeypatch, tmp_path):
+        calls = []
+        monkeypatch.setattr(RB, "LIVE_ENABLED", True)
+        monkeypatch.setattr(RB, "run_cell", lambda cell, ladder, **kw: calls.append(
+            (cell.benchmark_id, kw["expect_head"])) or ({"verdict": "VALID"}, tmp_path / "r", True))
+        for name in ("run_smoke", "run_e2e"):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+        return calls
+
+    def _main(self, tmp_path, *extra):
+        return RB.main([*APPROVED, "--live", "--output-dir", str(tmp_path / "out"), *extra],
+                       stdout=__import__("io").StringIO())
+
+    def test_exact_cell_reaches_run_cell_once(self, gate_open, tmp_path):
+        code = self._main(tmp_path, "--authorize", "bm-smoke-r0005-c32-rep1",
+                          "--expect-head", HEAD)
+        assert code == 0 and gate_open == [("bm-smoke-r0005-c32-rep1", HEAD)]
+
+    @pytest.mark.parametrize("extra", [
+        [],
+        ["--authorize", "bm-smoke-r0005-c32-rep1"],
+        ["--expect-head", HEAD],
+        ["--authorize", "bm-smoke-r0010-c32-rep1", "--expect-head", HEAD],
+        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD, "--rate", "10"],
+        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
+         "--repetitions", "2"],
+        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
+         "--concurrency", "16"],
+        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
+         "--warmup-requests", "26"],
+    ])
+    def test_everything_else_refused_before_anything_starts(self, gate_open, tmp_path, extra,
+                                                           capsys):
+        assert self._main(tmp_path, *extra) == 2
+        assert gate_open == [] and "nothing was started" in capsys.readouterr().err
+        assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
+
+    def test_wrong_level_refused(self, gate_open, tmp_path, capsys):
+        code = RB.main(["--level", "SMALL", "--rate", "10", "--repetitions", "1",
+                        "--concurrency", "32", "--warmup-requests", "25", "--live",
+                        "--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
+                        "--output-dir", str(tmp_path)])
+        assert code == 2 and gate_open == []
+
+    def test_cleanup_marker_still_blocks(self, gate_open, tmp_path, capsys):
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / RB.CLEANUP_MARKER).write_text("x", encoding="utf-8")
+        code = self._main(tmp_path, "--authorize", "bm-smoke-r0005-c32-rep1",
+                          "--expect-head", HEAD)
+        assert code == 2 and gate_open == [] and "cleanup" in capsys.readouterr().err
+
+    def test_run_cell_refuses_other_cells_before_imports(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", True)
+        monkeypatch.setattr(RB, "execute_cell", lambda *a, **k: pytest.fail("reached"))
+        for name in ("run_smoke", "run_e2e"):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+        for cell in (_approved_cells(warmup_requests=150)[0], _approved_cells(rates=[10])[0]):
+            with pytest.raises(RB.BenchmarkError, match="not the approved live cell"):
+                RB.run_cell(cell, LADDER, expect_head=HEAD, output_dir=tmp_path)
+        assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
+
+
+class TestGateStillClosed:
+    def test_committed_gate_is_closed(self):
+        assert RB.LIVE_ENABLED is False
+
+    def test_exact_cell_is_still_refused_by_the_gate(self, tmp_path, capsys):
+        code = RB.main([*APPROVED, "--live", "--authorize", "bm-smoke-r0005-c32-rep1",
+                        "--expect-head", HEAD, "--output-dir", str(tmp_path)])
+        assert code == 2 and "not enabled" in capsys.readouterr().err
+        assert "run_smoke" not in sys.modules
+
+    def test_plan_mode_with_override_has_no_side_effects(self, tmp_path):
+        import io
+        out = io.StringIO()
+        assert RB.main([*APPROVED, "--output-dir", str(tmp_path / "o")], stdout=out) == 0
+        text = out.getvalue()
+        assert "warm-up 25 requests" in text and text.count("bm-") == 1
+        assert not (tmp_path / "o").exists()
+
+    def test_authorize_without_live_is_rejected(self):
+        with pytest.raises(SystemExit):
+            RB.main([*APPROVED, "--authorize", "bm-smoke-r0005-c32-rep1"])
