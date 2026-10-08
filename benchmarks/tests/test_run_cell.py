@@ -511,73 +511,80 @@ class TestLiveStaysDisabled:
 # ---------------------------------------------------------------------------
 
 HEAD = "8" * 40
-APPROVED = ["--level", "SMOKE", "--rate", "5", "--repetitions", "1", "--concurrency", "32",
+APPROVED = ["--level", "SMOKE", "--rate", "5", "--repetition", "2", "--concurrency", "32",
             "--warmup-requests", "25"]
 
 
 def _approved_cells(level="SMOKE", **overrides):
-    kwargs = dict(rates=[5], repetitions=1, concurrency=32, warmup_requests=25)
+    kwargs = dict(rates=[5], repetition=2, concurrency=32, warmup_requests=25)
+    if "repetitions" in overrides:
+        kwargs.pop("repetition")
     kwargs.update(overrides)
     return RB.plan_cells(LADDER, level, **kwargs)
 
 
+def _authorize(cells, authorize="bm-smoke-r0005-c32-rep2", expect_head=HEAD,
+               warmup_requests=25, repetition=2):
+    return RB.check_live_authorization(cells, authorize=authorize, expect_head=expect_head,
+                                       warmup_requests=warmup_requests, repetition=repetition)
+
+
 class TestLiveAuthorization:
     def test_exact_approved_cell(self):
-        cell = RB.check_live_authorization(
-            _approved_cells(), authorize="bm-smoke-r0005-c32-rep1", expect_head=HEAD,
-            warmup_requests=25)
+        cell = _authorize(_approved_cells())
         assert (cell.benchmark_id, cell.requests, cell.rate, cell.concurrency,
                 cell.repetition, cell.warmup_requests) == (
-            "bm-smoke-r0005-c32-rep1", 100, 5, 32, 1, 25)
+            "bm-smoke-r0005-c32-rep2", 100, 5, 32, 2, 25)
+        cell = _authorize(_approved_cells(repetition=3), authorize="bm-smoke-r0005-c32-rep3",
+                          repetition=3)
+        assert (cell.benchmark_id, cell.repetition) == ("bm-smoke-r0005-c32-rep3", 3)
 
-    @pytest.mark.parametrize("authorize", [None, "", "bm-smoke-r0010-c32-rep1",
-                                           "bm-small-r0005-c32-rep1"])
+    @pytest.mark.parametrize("authorize", [None, "", "bm-smoke-r0010-c32-rep2",
+                                           "bm-small-r0005-c32-rep2",
+                                           "bm-smoke-r0005-c32-rep1",
+                                           "bm-smoke-r0005-c32-rep4"])
     def test_missing_or_wrong_authorization(self, authorize):
         with pytest.raises(RB.BenchmarkError, match="authorize"):
-            RB.check_live_authorization(_approved_cells(), authorize=authorize,
-                                        expect_head=HEAD, warmup_requests=25)
+            _authorize(_approved_cells(), authorize=authorize)
 
     @pytest.mark.parametrize("head", [None, "", "812ff80", "Z" * 40, HEAD + "0"])
     def test_missing_or_malformed_head(self, head):
         with pytest.raises(RB.BenchmarkError, match="expect-head"):
-            RB.check_live_authorization(_approved_cells(), authorize="bm-smoke-r0005-c32-rep1",
-                                        expect_head=head, warmup_requests=25)
+            _authorize(_approved_cells(), expect_head=head)
 
     @pytest.mark.parametrize("warmup", [None, 24, 26, 150])
     def test_wrong_warmup_argument(self, warmup):
         with pytest.raises(RB.BenchmarkError, match="warmup-requests 25"):
-            RB.check_live_authorization(_approved_cells(), authorize="bm-smoke-r0005-c32-rep1",
-                                        expect_head=HEAD, warmup_requests=warmup)
+            _authorize(_approved_cells(), warmup_requests=warmup)
 
     def test_planned_warmup_must_match_too(self):
         with pytest.raises(RB.BenchmarkError, match="warmup_requests"):
-            RB.check_live_authorization(_approved_cells(warmup_requests=30),
-                                        authorize="bm-smoke-r0005-c32-rep1",
-                                        expect_head=HEAD, warmup_requests=25)
+            _authorize(_approved_cells(warmup_requests=30))
 
-    @pytest.mark.parametrize("overrides, field", [
-        (dict(rates=[10]), "benchmark_id"),
-        (dict(concurrency=16), "concurrency"),
-        (dict(rates=[10], level="SMALL"), "level"),
+    @pytest.mark.parametrize("overrides", [
+        dict(rates=[10]), dict(concurrency=16), dict(rates=[10], level="SMALL"),
+        dict(repetition=3),
     ])
-    def test_wrong_cell_fields(self, overrides, field):
-        with pytest.raises(RB.BenchmarkError, match=field):
-            RB.check_live_authorization(_approved_cells(**overrides),
-                                        authorize="bm-smoke-r0005-c32-rep1",
-                                        expect_head=HEAD, warmup_requests=25)
+    def test_wrong_cell_is_not_the_authorized_one(self, overrides):
+        # rate, concurrency, level and repetition are all part of the id.
+        with pytest.raises(RB.BenchmarkError, match="is not bm-smoke-r0005-c32-rep2"):
+            _authorize(_approved_cells(**overrides))
 
-    def test_wrong_repetition(self):
-        second = dataclasses.replace(_approved_cells()[0], repetition=2)
+    @pytest.mark.parametrize("repetition", [None, 1, 3])
+    def test_repetition_must_be_selected_and_match(self, repetition):
         with pytest.raises(RB.BenchmarkError, match="repetition"):
-            RB.check_live_authorization([second], authorize="bm-smoke-r0005-c32-rep1",
-                                        expect_head=HEAD, warmup_requests=25)
+            _authorize(_approved_cells(), repetition=repetition)
+
+    def test_rep1_is_refused_with_otherwise_correct_parameters(self):
+        rep1 = _approved_cells(repetition=1)
+        with pytest.raises(RB.BenchmarkError, match="not an approved live cell"):
+            _authorize(rep1, authorize="bm-smoke-r0005-c32-rep1", repetition=1)
+        assert not RB.is_approved_live_cell(rep1[0])
 
     @pytest.mark.parametrize("overrides", [dict(repetitions=2), dict(rates=[5, 10])])
     def test_multiple_planned_cells(self, overrides):
         with pytest.raises(RB.BenchmarkError, match="exactly one cell"):
-            RB.check_live_authorization(_approved_cells(**overrides),
-                                        authorize="bm-smoke-r0005-c32-rep1",
-                                        expect_head=HEAD, warmup_requests=25)
+            _authorize(_approved_cells(**overrides))
 
     def test_warmup_override_validation_and_default(self):
         assert RB.plan_cells(LADDER, "SMOKE", rates=[5], repetitions=1)[0].warmup_requests == 150
@@ -595,8 +602,14 @@ class TestLiveCli:
     def gate_open(self, monkeypatch, tmp_path):
         calls = []
         monkeypatch.setattr(RB, "LIVE_ENABLED", True)
-        monkeypatch.setattr(RB, "run_cell", lambda cell, ladder, **kw: calls.append(
-            (cell.benchmark_id, kw["expect_head"])) or ({"verdict": "VALID"}, tmp_path / "r", True))
+
+        def fake_run_cell(cell, ladder, **kw):
+            calls.append((cell.benchmark_id, kw["expect_head"]))
+            path = kw["output_dir"] / f"{cell.benchmark_id}-fake.json"
+            path.write_text("{}", encoding="utf-8")
+            return {"verdict": "VALID"}, path, True
+
+        monkeypatch.setattr(RB, "run_cell", fake_run_cell)
         for name in ("run_smoke", "run_e2e"):
             monkeypatch.delitem(sys.modules, name, raising=False)
         return calls
@@ -606,21 +619,21 @@ class TestLiveCli:
                        stdout=__import__("io").StringIO())
 
     def test_exact_cell_reaches_run_cell_once(self, gate_open, tmp_path):
-        code = self._main(tmp_path, "--authorize", "bm-smoke-r0005-c32-rep1",
+        code = self._main(tmp_path, "--authorize", "bm-smoke-r0005-c32-rep2",
                           "--expect-head", HEAD)
-        assert code == 0 and gate_open == [("bm-smoke-r0005-c32-rep1", HEAD)]
+        assert code == 0 and gate_open == [("bm-smoke-r0005-c32-rep2", HEAD)]
 
     @pytest.mark.parametrize("extra", [
         [],
-        ["--authorize", "bm-smoke-r0005-c32-rep1"],
+        ["--authorize", "bm-smoke-r0005-c32-rep2"],
         ["--expect-head", HEAD],
         ["--authorize", "bm-smoke-r0010-c32-rep1", "--expect-head", HEAD],
-        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD, "--rate", "10"],
-        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
-         "--repetitions", "2"],
-        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
+        ["--authorize", "bm-smoke-r0005-c32-rep2", "--expect-head", HEAD, "--rate", "10"],
+        ["--authorize", "bm-smoke-r0005-c32-rep3", "--expect-head", HEAD],
+        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD],
+        ["--authorize", "bm-smoke-r0005-c32-rep2", "--expect-head", HEAD,
          "--concurrency", "16"],
-        ["--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
+        ["--authorize", "bm-smoke-r0005-c32-rep2", "--expect-head", HEAD,
          "--warmup-requests", "26"],
     ])
     def test_everything_else_refused_before_anything_starts(self, gate_open, tmp_path, extra,
@@ -630,16 +643,16 @@ class TestLiveCli:
         assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
 
     def test_wrong_level_refused(self, gate_open, tmp_path, capsys):
-        code = RB.main(["--level", "SMALL", "--rate", "10", "--repetitions", "1",
+        code = RB.main(["--level", "SMALL", "--rate", "10", "--repetition", "2",
                         "--concurrency", "32", "--warmup-requests", "25", "--live",
-                        "--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD,
+                        "--authorize", "bm-smoke-r0005-c32-rep2", "--expect-head", HEAD,
                         "--output-dir", str(tmp_path)])
         assert code == 2 and gate_open == []
 
     def test_cleanup_marker_still_blocks(self, gate_open, tmp_path, capsys):
         (tmp_path / "out").mkdir()
         (tmp_path / "out" / RB.CLEANUP_MARKER).write_text("x", encoding="utf-8")
-        code = self._main(tmp_path, "--authorize", "bm-smoke-r0005-c32-rep1",
+        code = self._main(tmp_path, "--authorize", "bm-smoke-r0005-c32-rep2",
                           "--expect-head", HEAD)
         assert code == 2 and gate_open == [] and "cleanup" in capsys.readouterr().err
 
@@ -648,8 +661,9 @@ class TestLiveCli:
         monkeypatch.setattr(RB, "execute_cell", lambda *a, **k: pytest.fail("reached"))
         for name in ("run_smoke", "run_e2e"):
             monkeypatch.delitem(sys.modules, name, raising=False)
-        for cell in (_approved_cells(warmup_requests=150)[0], _approved_cells(rates=[10])[0]):
-            with pytest.raises(RB.BenchmarkError, match="not the approved live cell"):
+        for cell in (_approved_cells(warmup_requests=150)[0], _approved_cells(rates=[10])[0],
+                     _approved_cells(repetition=1)[0], _approved_cells(repetition=4)[0]):
+            with pytest.raises(RB.BenchmarkError, match="not an approved live cell"):
                 RB.run_cell(cell, LADDER, expect_head=HEAD, output_dir=tmp_path)
         assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
 
@@ -662,7 +676,7 @@ class TestGateClosed:
         monkeypatch.setattr(RB, "LIVE_ENABLED", False)
 
     def test_exact_cell_is_still_refused_by_the_gate(self, tmp_path, capsys):
-        code = RB.main([*APPROVED, "--live", "--authorize", "bm-smoke-r0005-c32-rep1",
+        code = RB.main([*APPROVED, "--live", "--authorize", "bm-smoke-r0005-c32-rep2",
                         "--expect-head", HEAD, "--output-dir", str(tmp_path)])
         assert code == 2 and "not enabled" in capsys.readouterr().err
         assert "run_smoke" not in sys.modules
@@ -677,13 +691,13 @@ class TestGateClosed:
 
     def test_authorize_without_live_is_rejected(self):
         with pytest.raises(SystemExit):
-            RB.main([*APPROVED, "--authorize", "bm-smoke-r0005-c32-rep1"])
+            RB.main([*APPROVED, "--authorize", "bm-smoke-r0005-c32-rep2"])
 
 # ---------------------------------------------------------------------------
 # Both gate states, in memory only: nothing reaches the real harness
 # ---------------------------------------------------------------------------
 
-EXACT = [*APPROVED, "--authorize", "bm-smoke-r0005-c32-rep1", "--expect-head", HEAD]
+EXACT = [*APPROVED, "--authorize", "bm-smoke-r0005-c32-rep2", "--expect-head", HEAD]
 
 
 @pytest.fixture(params=[False, True], ids=["gate-closed", "gate-open"])
@@ -725,18 +739,24 @@ class TestBothGateStates:
 
     def test_exact_command_never_reaches_infrastructure(self, gate, tmp_path, capsys):
         args = [*EXACT, "--live", "--output-dir", str(tmp_path / "out")]
+        out = tmp_path / "out"
         if gate:
-            # Authorized and open: the real run_cell is entered and stops at
-            # the blocked harness import, before any process or container.
+            # Authorized and open: ownership and the ledger entry are taken,
+            # then the real run_cell stops at the blocked harness import,
+            # before any process or container.  The records stay.
             with pytest.raises(ImportError, match="blocked"):
                 RB.main(args)
+            assert (out / RB.OWNER_FILE).is_file()
+            assert (out / "ledger" / "bm-smoke-r0005-c32-rep2.started").is_file()
+            assert not (out / "ledger" / "bm-smoke-r0005-c32-rep2.done").exists()
+            assert not list(out.glob("bm-*.json"))
         else:
             assert RB.main(args) == 2 and "not enabled" in capsys.readouterr().err
-        assert not (tmp_path / "out").exists()
+            assert not out.exists()
 
     @pytest.mark.parametrize("extra", [
         [],
-        ["--authorize", "bm-smoke-r0005-c32-rep1"],
+        ["--authorize", "bm-smoke-r0005-c32-rep2"],
         ["--expect-head", HEAD],
         ["--authorize", "bm-smoke-r0010-c32-rep1", "--expect-head", HEAD],
     ])
@@ -945,10 +965,266 @@ class TestHistoricalCompatibility:
 
 class TestCorrectionsKeepSafety:
     def test_authorization_and_isolation_unchanged(self, tmp_path, monkeypatch, capsys):
-        assert RB.APPROVED_LIVE_CELL["benchmark_id"] == "bm-smoke-r0005-c32-rep1"
-        assert RB.APPROVED_LIVE_CELL["repetition"] == 1
+        assert sorted(RB.APPROVED_LIVE_CELLS) == ["bm-smoke-r0005-c32-rep2",
+                                                 "bm-smoke-r0005-c32-rep3"]
+        assert [c["repetition"] for c in RB.APPROVED_LIVE_CELLS.values()] == [2, 3]
         with pytest.raises(LiveAccessAttempt):
             subprocess.run(["docker", "ps"])
         monkeypatch.setattr(RB, "LIVE_ENABLED", False)
         assert RB.main([*EXACT, "--live", "--output-dir", str(tmp_path)]) == 2
         assert "not enabled" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Phase 14.4B3H2 repetition selection, run ledger and ownership
+# ---------------------------------------------------------------------------
+
+HISTORICAL_RESULT = Path(r"C:\Users\Vamshi Raj Goud\AppData\Local\Temp\agentops-benchmarks"
+                         r"\bm-smoke-r0005-c32-rep1-20261008T174815.json")
+HISTORICAL_SHA256_PREFIX = "e2f98781f555d31c"
+
+
+def _rep_args(n, *extra):
+    return ["--level", "SMOKE", "--rate", "5", "--repetition", str(n), "--concurrency", "32",
+            "--warmup-requests", "25", "--live", "--authorize", f"bm-smoke-r0005-c32-rep{n}",
+            "--expect-head", HEAD, *extra]
+
+
+class TestRepetitionSelector:
+    @pytest.mark.parametrize("n", [2, 3])
+    def test_one_repetition_planned_alone(self, n):
+        cells = RB.plan_cells(LADDER, "SMOKE", rates=[5], repetition=n, concurrency=32,
+                              warmup_requests=25)
+        assert [(c.benchmark_id, c.warmup_run_id, c.measured_run_id) for c in cells] == [
+            (f"bm-smoke-r0005-c32-rep{n}", f"b-smoke-r0005-c32-w{n}",
+             f"b-smoke-r0005-c32-m{n}")]
+
+    @pytest.mark.parametrize("bad", [0, 11, -1, True, 2.0])
+    def test_bounds(self, bad):
+        with pytest.raises(RB.BenchmarkError, match="repetition"):
+            RB.plan_cells(LADDER, "SMOKE", repetition=bad)
+
+    def test_conflicts_with_repetitions(self):
+        with pytest.raises(RB.BenchmarkError, match="exclude each other"):
+            RB.plan_cells(LADDER, "SMOKE", repetition=2, repetitions=3)
+        with pytest.raises(SystemExit):
+            RB.main(["--level", "SMOKE", "--repetition", "2", "--repetitions", "3"])
+
+    def test_plan_mode_without_selector_unchanged(self):
+        import io
+        out = io.StringIO()
+        assert RB.main(["--level", "SMOKE", "--rate", "5", "--output-dir",
+                        str(Path(__import__("tempfile").gettempdir()) / "unused-bm")],
+                       stdout=out) == 0
+        assert out.getvalue().count("bm-smoke-r0005-c32-rep") == 3
+
+    def test_plan_mode_with_selector(self, tmp_path):
+        import io
+        out = io.StringIO()
+        assert RB.main(["--level", "SMOKE", "--rate", "5", "--repetition", "3",
+                        "--output-dir", str(tmp_path / "o")], stdout=out) == 0
+        assert out.getvalue().count("bm-") == 1 and "rep3" in out.getvalue()
+        assert not (tmp_path / "o").exists()
+
+
+def _claim(tmp_path, n=2, **kw):
+    cell = _approved_cells(repetition=n)[0]
+    return cell, RB.claim_run(tmp_path, cell, head=HEAD, arguments={"repetition": n},
+                              now=lambda: 1_800_000_000.0, pid=lambda: 4242, **kw)
+
+
+class TestLedger:
+    def test_claim_records_owner_and_started(self, tmp_path):
+        cell, started = _claim(tmp_path)
+        owner = json.loads((tmp_path / RB.OWNER_FILE).read_text(encoding="utf-8"))
+        record = json.loads(started.read_text(encoding="utf-8"))
+        assert started == tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.started"
+        assert owner == record
+        assert record["benchmark_id"] == cell.benchmark_id and record["git_head"] == HEAD
+        assert record["pid"] == 4242 and record["started_utc"].startswith("2027-01-15T")
+        assert record["arguments"] == {"repetition": 2}
+
+    def test_duplicate_started_refused(self, tmp_path):
+        cell, started = _claim(tmp_path)
+        (tmp_path / RB.OWNER_FILE).unlink()      # as after a released run
+        with pytest.raises(RB.BenchmarkError, match="was started before"):
+            _claim(tmp_path)
+        assert started.is_file()                 # never deleted
+        assert not (tmp_path / RB.OWNER_FILE).exists()  # the refused claim released its own
+
+    def test_existing_result_refused(self, tmp_path):
+        (tmp_path / "bm-smoke-r0005-c32-rep2-20261009T000000.json").write_text("{}")
+        with pytest.raises(RB.BenchmarkError, match="already exists"):
+            _claim(tmp_path)
+        assert not (tmp_path / "ledger").exists() and not (tmp_path / RB.OWNER_FILE).exists()
+
+    def test_creation_failure_blocks(self, tmp_path, monkeypatch):
+        real = RB._exclusive_json
+
+        def failing(path, payload):
+            if path.name.endswith(".started"):
+                raise PermissionError("denied")
+            return real(path, payload)
+
+        monkeypatch.setattr(RB, "_exclusive_json", failing)
+        with pytest.raises(RB.BenchmarkError, match="cannot create"):
+            _claim(tmp_path)
+        assert not (tmp_path / RB.OWNER_FILE).exists()
+
+    def test_owner_creation_failure_blocks(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(RB, "_exclusive_json",
+                            lambda path, payload: (_ for _ in ()).throw(OSError("disk")))
+        with pytest.raises(RB.BenchmarkError, match="cannot create"):
+            _claim(tmp_path)
+
+    def test_simultaneous_ownership_conflict(self, tmp_path):
+        _claim(tmp_path, n=2)
+        with pytest.raises(RB.BenchmarkError, match="owns this output directory"):
+            _claim(tmp_path, n=3)
+        assert not (tmp_path / "ledger" / "bm-smoke-r0005-c32-rep3.started").exists()
+
+    def test_ledger_never_inside_repository(self):
+        with pytest.raises(RB.BenchmarkError, match="never written inside the repository"):
+            _claim(_REPO / "benchmarks")
+        assert not (_REPO / "benchmarks" / RB.OWNER_FILE).exists()
+
+
+class TestFinish:
+    def _result_file(self, tmp_path, verdict="VALID"):
+        path = tmp_path / "bm-smoke-r0005-c32-rep2-x.json"
+        path.write_text(json.dumps({"verdict": verdict}), encoding="utf-8")
+        return path
+
+    def test_done_records_hash_and_intended_status(self, tmp_path):
+        cell, _ = _claim(tmp_path)
+        path = self._result_file(tmp_path)
+        released = RB.finish_run(tmp_path, cell, result={"verdict": "VALID"}, result_path=path,
+                                 cleanup_verified=True, intended_status=0)
+        done = json.loads((tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.done").read_text())
+        import hashlib
+        assert done["result_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert done["verdict"] == "VALID" and done["cleanup_verified"] is True
+        assert done["intended_return_status"] == 0
+        assert "not here" in done["intended_return_status_note"]
+        assert not any("exit_code" in key for key in done)   # no OS exit code invented
+        assert released and not (tmp_path / RB.OWNER_FILE).exists()
+        assert (tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.started").is_file()
+
+    def test_cleanup_uncertainty_keeps_ownership(self, tmp_path):
+        cell, _ = _claim(tmp_path)
+        path = self._result_file(tmp_path, "STOPPED")
+        released = RB.finish_run(tmp_path, cell, result={"verdict": "STOPPED"},
+                                 result_path=path, cleanup_verified=False, intended_status=1)
+        assert not released and (tmp_path / RB.OWNER_FILE).is_file()
+        done = json.loads((tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.done").read_text())
+        assert done["cleanup_verified"] is False and done["intended_return_status"] == 1
+
+    def test_recording_failure_keeps_ownership(self, tmp_path):
+        cell, _ = _claim(tmp_path)
+        with pytest.raises(OSError):
+            RB.finish_run(tmp_path, cell, result={"verdict": "VALID"},
+                          result_path=tmp_path / "missing.json", cleanup_verified=True,
+                          intended_status=0)
+        assert (tmp_path / RB.OWNER_FILE).is_file()
+        assert not (tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.done").exists()
+
+    def test_done_cannot_be_written_twice(self, tmp_path):
+        cell, _ = _claim(tmp_path)
+        path = self._result_file(tmp_path)
+        RB.finish_run(tmp_path, cell, result={"verdict": "VALID"}, result_path=path,
+                      cleanup_verified=False, intended_status=1)
+        with pytest.raises(FileExistsError):
+            RB.finish_run(tmp_path, cell, result={"verdict": "VALID"}, result_path=path,
+                          cleanup_verified=True, intended_status=0)
+
+
+class TestLiveFlowWithLedger:
+    """main() with the gate open in memory and run_cell replaced."""
+
+    @pytest.fixture
+    def open_gate(self, monkeypatch):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", True)
+        state = {"calls": [], "clean": True, "verdict": "VALID", "raise": None}
+
+        def fake_run_cell(cell, ladder, **kw):
+            state["calls"].append(cell.benchmark_id)
+            if state["raise"]:
+                raise state["raise"]
+            path = kw["output_dir"] / f"{cell.benchmark_id}-fake.json"
+            path.write_text(json.dumps({"verdict": state["verdict"]}), encoding="utf-8")
+            return {"verdict": state["verdict"]}, path, state["clean"]
+
+        monkeypatch.setattr(RB, "run_cell", fake_run_cell)
+        return state
+
+    def _main(self, tmp_path, n):
+        import io
+        out = io.StringIO()
+        return RB.main(_rep_args(n, "--output-dir", str(tmp_path)), stdout=out), out.getvalue()
+
+    @pytest.mark.parametrize("n", [2, 3])
+    def test_each_approved_repetition_runs_once(self, open_gate, tmp_path, n):
+        code, text = self._main(tmp_path, n)
+        assert code == 0 and open_gate["calls"] == [f"bm-smoke-r0005-c32-rep{n}"]
+        assert (tmp_path / "ledger" / f"bm-smoke-r0005-c32-rep{n}.done").is_file()
+        assert not (tmp_path / RB.OWNER_FILE).exists()
+        code, _ = self._main(tmp_path, n)        # the same repetition again
+        assert code == 2 and open_gate["calls"] == [f"bm-smoke-r0005-c32-rep{n}"]
+
+    def test_rep2_then_rep3_sequentially(self, open_gate, tmp_path):
+        assert self._main(tmp_path, 2)[0] == 0 and self._main(tmp_path, 3)[0] == 0
+        assert open_gate["calls"] == ["bm-smoke-r0005-c32-rep2", "bm-smoke-r0005-c32-rep3"]
+
+    @pytest.mark.parametrize("n", [1, 4])
+    def test_rep1_and_rep4_refused(self, open_gate, tmp_path, n, capsys):
+        import io
+        assert RB.main(_rep_args(n, "--output-dir", str(tmp_path)), stdout=io.StringIO()) == 2
+        assert open_gate["calls"] == [] and "nothing was started" in capsys.readouterr().err
+        assert not (tmp_path / RB.OWNER_FILE).exists()
+
+    def test_crash_leaves_blocking_evidence(self, open_gate, tmp_path):
+        open_gate["raise"] = RuntimeError("process died")
+        with pytest.raises(RuntimeError):
+            self._main(tmp_path, 2)
+        assert (tmp_path / RB.OWNER_FILE).is_file()
+        assert (tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.started").is_file()
+        assert not (tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.done").exists()
+        open_gate["raise"] = None
+        assert self._main(tmp_path, 3)[0] == 2           # ownership still held
+        assert open_gate["calls"] == ["bm-smoke-r0005-c32-rep2"]
+
+    def test_unverified_cleanup_keeps_ownership_and_blocks(self, open_gate, tmp_path):
+        open_gate.update(clean=False, verdict="STOPPED")
+        code, text = self._main(tmp_path, 2)
+        assert code == 1 and "ownership is kept" in text
+        assert (tmp_path / RB.OWNER_FILE).is_file()
+        open_gate.update(clean=True, verdict="VALID")
+        assert self._main(tmp_path, 3)[0] == 2
+
+    def test_not_valid_but_clean_releases(self, open_gate, tmp_path):
+        open_gate.update(verdict="INVALID")
+        code, _ = self._main(tmp_path, 2)
+        done = json.loads((tmp_path / "ledger" / "bm-smoke-r0005-c32-rep2.done").read_text())
+        assert code == 1 and done["intended_return_status"] == 1
+        assert not (tmp_path / RB.OWNER_FILE).exists()
+
+    def test_existing_marker_blocks_before_claim(self, open_gate, tmp_path):
+        (tmp_path / RB.CLEANUP_MARKER).write_text("x", encoding="utf-8")
+        assert self._main(tmp_path, 2)[0] == 2
+        assert not (tmp_path / RB.OWNER_FILE).exists() and open_gate["calls"] == []
+
+    def test_claim_happens_before_harness_import(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", True)
+        with pytest.raises(ImportError, match="blocked"):
+            RB.main(_rep_args(2, "--output-dir", str(tmp_path)))
+        assert (tmp_path / RB.OWNER_FILE).is_file()
+        assert "run_smoke" not in sys.modules
+
+
+class TestHistoricalRep1:
+    def test_historical_result_unchanged_if_present(self):
+        if not HISTORICAL_RESULT.exists():
+            pytest.skip("historical result not on this machine")
+        import hashlib
+        digest = hashlib.sha256(HISTORICAL_RESULT.read_bytes()).hexdigest()
+        assert digest.startswith(HISTORICAL_SHA256_PREFIX)

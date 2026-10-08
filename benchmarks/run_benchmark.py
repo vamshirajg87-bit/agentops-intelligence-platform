@@ -44,8 +44,10 @@ Standard library only (plus metrics.py beside it).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import re
 import sys
 import tempfile
@@ -147,42 +149,61 @@ class Cell:
         }
 
 
-#: The only cell live execution may run (Phase 14.4B3).  Every field must
-#: match, the warm-up must be given explicitly, and --authorize must name it.
-APPROVED_LIVE_CELL: Mapping[str, Any] = {
-    "benchmark_id": "bm-smoke-r0005-c32-rep1", "level": "SMOKE", "requests": 100,
-    "rate": 5, "concurrency": 32, "repetition": 1, "warmup_requests": 25,
+#: The only cells live execution may run (Phase 14.4B3H).  rep1 has run and
+#: is not here.  Every field must match, the repetition must be selected with
+#: --repetition, the warm-up given explicitly, and --authorize must name the
+#: cell.
+_SMOKE_REPEAT: Mapping[str, Any] = {"level": "SMOKE", "requests": 100, "rate": 5,
+                                    "concurrency": 32, "warmup_requests": 25}
+APPROVED_LIVE_CELLS: Mapping[str, Mapping[str, Any]] = {
+    "bm-smoke-r0005-c32-rep2": {**_SMOKE_REPEAT, "repetition": 2},
+    "bm-smoke-r0005-c32-rep3": {**_SMOKE_REPEAT, "repetition": 3},
 }
 MAX_WARMUP_REQUESTS: int = 10000
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
+def _cell_fields(cell: Cell) -> dict[str, Any]:
+    return {"level": cell.level, "requests": cell.requests, "rate": cell.rate,
+            "concurrency": cell.concurrency, "repetition": cell.repetition,
+            "warmup_requests": cell.warmup_requests}
+
+
+def is_approved_live_cell(cell: Cell) -> bool:
+    approved = APPROVED_LIVE_CELLS.get(cell.benchmark_id)
+    return approved is not None and _cell_fields(cell) == dict(approved)
+
+
 def check_live_authorization(
     cells: Sequence[Cell], *, authorize: Optional[str], expect_head: Optional[str],
-    warmup_requests: Optional[int],
+    warmup_requests: Optional[int], repetition: Optional[int],
 ) -> Cell:
     """
     The one cell live execution may run, or BenchmarkError.  Pure: it is
-    decided before anything is imported or started.  The actual HEAD is
-    compared with expect_head by the harness's first step, before any
+    decided before anything is imported or started.  The actual HEAD and a
+    clean tree are checked by the harness's first step, before any
     infrastructure.
     """
-    approved = APPROVED_LIVE_CELL
     if authorize is None:
         raise BenchmarkError("--live needs --authorize <benchmark id>")
-    if authorize != approved["benchmark_id"]:
-        raise BenchmarkError(f"--authorize {authorize!r} is not the approved cell "
-                             f"{approved['benchmark_id']}")
+    if authorize not in APPROVED_LIVE_CELLS:
+        raise BenchmarkError(f"--authorize {authorize!r} is not an approved live cell "
+                             f"({', '.join(sorted(APPROVED_LIVE_CELLS))})")
+    approved = APPROVED_LIVE_CELLS[authorize]
     if expect_head is None or not _SHA_RE.fullmatch(expect_head):
         raise BenchmarkError("--live needs --expect-head with a full 40-character commit")
+    if repetition is None:
+        raise BenchmarkError("--live needs --repetition N (one repetition per run)")
+    if repetition != approved["repetition"]:
+        raise BenchmarkError(f"--repetition {repetition} does not match {authorize}")
     if warmup_requests != approved["warmup_requests"]:
         raise BenchmarkError(f"--live needs --warmup-requests {approved['warmup_requests']}")
     if len(cells) != 1:
         raise BenchmarkError(f"--live runs exactly one cell; {len(cells)} are planned")
     cell = cells[0]
-    found = {"benchmark_id": cell.benchmark_id, "level": cell.level, "requests": cell.requests,
-             "rate": cell.rate, "concurrency": cell.concurrency,
-             "repetition": cell.repetition, "warmup_requests": cell.warmup_requests}
+    if cell.benchmark_id != authorize:
+        raise BenchmarkError(f"the planned cell {cell.benchmark_id} is not {authorize}")
+    found = _cell_fields(cell)
     wrong = sorted(key for key, value in approved.items() if found[key] != value)
     if wrong:
         raise BenchmarkError("the planned cell differs from the approved one in "
@@ -193,11 +214,12 @@ def check_live_authorization(
 def plan_cells(
     ladder: Mapping[str, Any], level: str, *, rates: Optional[Sequence[int]] = None,
     repetitions: Optional[int] = None, concurrency: Optional[int] = None,
-    warmup_requests: Optional[int] = None,
+    warmup_requests: Optional[int] = None, repetition: Optional[int] = None,
 ) -> list[Cell]:
     """The cells of one level, in the order they would run: each rate in
     ascending order, its repetitions one after another.  warmup_requests
-    replaces the ladder's rate x warmup_seconds when given."""
+    replaces the ladder's rate x warmup_seconds when given; repetition
+    selects that one repetition only (it excludes repetitions)."""
     if warmup_requests is not None and (
             isinstance(warmup_requests, bool) or not isinstance(warmup_requests, int)
             or not 1 <= warmup_requests <= MAX_WARMUP_REQUESTS):
@@ -210,17 +232,26 @@ def plan_cells(
     unknown = [r for r in chosen if r not in spec["rates"]]
     if unknown:
         raise BenchmarkError(f"rates {unknown} are not in the ladder for {level}")
-    reps = defaults["repetitions"] if repetitions is None else repetitions
-    if not 1 <= reps <= 10:
-        raise BenchmarkError("repetitions must be 1-10")
+    if repetition is not None:
+        if repetitions is not None:
+            raise BenchmarkError("--repetition and --repetitions exclude each other")
+        if isinstance(repetition, bool) or not isinstance(repetition, int) \
+                or not 1 <= repetition <= 10:
+            raise BenchmarkError("repetition must be 1-10")
+        selected = [repetition]
+    else:
+        reps = defaults["repetitions"] if repetitions is None else repetitions
+        if not 1 <= reps <= 10:
+            raise BenchmarkError("repetitions must be 1-10")
+        selected = list(range(1, reps + 1))
     conc = defaults["concurrency"] if concurrency is None else concurrency
     if not 1 <= conc <= 64:
         raise BenchmarkError("concurrency must be 1-64")
     cells = []
     for rate in sorted(chosen):
-        for repetition in range(1, reps + 1):
+        for number in selected:
             cell = Cell(
-                level=level, rate=rate, concurrency=conc, repetition=repetition,
+                level=level, rate=rate, concurrency=conc, repetition=number,
                 requests=spec["target_requests"], seed=defaults["seed"],
                 warmup_requests=(max(1, int(rate * defaults["warmup_seconds"]))
                                  if warmup_requests is None else warmup_requests),
@@ -954,10 +985,8 @@ def run_cell(cell: Cell, ladder: Mapping[str, Any], *, expect_head: Optional[str
     only after that check.
     """
     _require_live()
-    approved = APPROVED_LIVE_CELL
-    if (cell.benchmark_id, cell.warmup_requests) != (approved["benchmark_id"],
-                                                     approved["warmup_requests"]):
-        raise BenchmarkError(f"{cell.benchmark_id} is not the approved live cell")
+    if not is_approved_live_cell(cell):
+        raise BenchmarkError(f"{cell.benchmark_id} is not an approved live cell")
     if not cell.live_allowed:
         raise BenchmarkError(f"level {cell.level} is not allowed live")
     if str(REPO / "workload-generator") not in sys.path:
@@ -1174,6 +1203,98 @@ def _clock(smoke: Any) -> list[M.ClockSample]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+LEDGER_DIR: str = "ledger"
+#: Held by the one benchmark run that owns the output directory.
+OWNER_FILE: str = "ACTIVE_RUN"
+INTENDED_STATUS_NOTE: str = ("the status this program intends to return; the operating "
+                             "system's exit code is recorded by the launcher, not here")
+
+
+def _outside_repository(output_dir: Path) -> Path:
+    output_dir = Path(output_dir).resolve()
+    if output_dir == REPO or REPO in output_dir.parents:
+        raise BenchmarkError("the ledger and results are never written inside the repository")
+    return output_dir
+
+
+def _exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Create path with payload; fails if it exists.  Written durably."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "x", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def claim_run(
+    output_dir: Path, cell: Cell, *, head: str, arguments: Mapping[str, Any],
+    now: Callable[[], float] = time.time, pid: Callable[[], int] = os.getpid,
+) -> Path:
+    """
+    Take ownership of the output directory and record that this cell has
+    started, before anything is imported or started.
+
+    Refused when another run owns the directory (or an earlier one never
+    released it), when a result for the cell exists, when the cell was
+    started before, or when a record cannot be created.  Returns the
+    ledger's .started path.  Nothing here is ever deleted automatically,
+    except an ownership taken a moment ago by this call when the cell is
+    then refused (nothing has started at that point).
+    """
+    output_dir = _outside_repository(output_dir)
+    owner = output_dir / OWNER_FILE
+    record = {"benchmark_id": cell.benchmark_id, "git_head": head, "pid": pid(),
+              "started_utc": _iso(now()), "arguments": dict(arguments)}
+    try:
+        _exclusive_json(owner, record)
+    except FileExistsError:
+        raise BenchmarkError(f"{owner} exists: another benchmark owns this output directory, "
+                             "or an earlier run did not release it; review it") from None
+    except OSError as exc:
+        raise BenchmarkError(f"cannot create {owner}: {type(exc).__name__}") from None
+    try:
+        existing = sorted(output_dir.glob(f"{cell.benchmark_id}-*.json"))
+        if existing:
+            raise BenchmarkError(f"a result for {cell.benchmark_id} already exists "
+                                 f"({existing[0].name})")
+        started = output_dir / LEDGER_DIR / f"{cell.benchmark_id}.started"
+        try:
+            _exclusive_json(started, record)
+        except FileExistsError:
+            raise BenchmarkError(f"{started} exists: {cell.benchmark_id} was started "
+                                 "before; review it") from None
+        except OSError as exc:
+            raise BenchmarkError(f"cannot create {started}: {type(exc).__name__}") from None
+    except BenchmarkError:
+        owner.unlink()  # taken by this call a moment ago; nothing has started
+        raise
+    return started
+
+
+def finish_run(
+    output_dir: Path, cell: Cell, *, result: Mapping[str, Any], result_path: Path,
+    cleanup_verified: bool, intended_status: int, now: Callable[[], float] = time.time,
+) -> bool:
+    """
+    Record the cell as done (.done: result path and SHA-256, verdict,
+    cleanup verification, intended status) and release ownership, but only
+    when cleanup was verified.  Returns whether ownership was released.  If
+    recording fails the exception propagates and ownership is kept.
+    """
+    output_dir = _outside_repository(output_dir)
+    digest = hashlib.sha256(Path(result_path).read_bytes()).hexdigest()
+    _exclusive_json(output_dir / LEDGER_DIR / f"{cell.benchmark_id}.done", {
+        "benchmark_id": cell.benchmark_id, "result_path": str(result_path),
+        "result_sha256": digest, "verdict": result["verdict"],
+        "cleanup_verified": cleanup_verified, "intended_return_status": intended_status,
+        "intended_return_status_note": INTENDED_STATUS_NOTE, "finished_utc": _iso(now()),
+    })
+    if not cleanup_verified:
+        return False
+    (output_dir / OWNER_FILE).unlink()
+    return True
+
+
 def _plan_text(cells: Sequence[Cell], output_dir: Path) -> str:
     lines = ["PLAN ONLY - nothing was started, nothing was sent.",
              f"results would be written to: {output_dir}"]
@@ -1198,7 +1319,10 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
     parser.add_argument("--level", required=True, choices=[name for name, _ in M.LEVELS])
     parser.add_argument("--rate", type=int, action="append", default=None,
                         help="one of the level's rates; repeat for several (default: all)")
-    parser.add_argument("--repetitions", type=int, default=None)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--repetitions", type=int, default=None)
+    group.add_argument("--repetition", type=int, default=None, metavar="N",
+                       help="plan only repetition N (1-10); required with --live")
     parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT), metavar="DIR")
     parser.add_argument("--warmup-requests", type=int, default=None, metavar="N",
@@ -1206,7 +1330,7 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
                              "warmup_seconds)")
     parser.add_argument("--expect-head", default=None, metavar="COMMIT")
     parser.add_argument("--authorize", default=None, metavar="BENCHMARK_ID",
-                        help="with --live: the one approved cell's id")
+                        help="with --live: the approved cell's id")
     parser.add_argument("--live", action="store_true",
                         help="run the approved cell for real (disabled in this version)")
     args = parser.parse_args(argv)
@@ -1217,7 +1341,8 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
     try:
         ladder = load_ladder(Path(args.config))
         cells = plan_cells(ladder, args.level, rates=args.rate, repetitions=args.repetitions,
-                           concurrency=args.concurrency, warmup_requests=args.warmup_requests)
+                           concurrency=args.concurrency, warmup_requests=args.warmup_requests,
+                           repetition=args.repetition)
     except BenchmarkError as exc:
         parser.error(str(exc))
 
@@ -1234,9 +1359,10 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
         sys.stderr.write(f"run_benchmark: error: {exc}\n")
         return 2
     try:
-        check_live_authorization(cells, authorize=args.authorize,
-                                 expect_head=args.expect_head,
-                                 warmup_requests=args.warmup_requests)
+        cell = check_live_authorization(cells, authorize=args.authorize,
+                                        expect_head=args.expect_head,
+                                        warmup_requests=args.warmup_requests,
+                                        repetition=args.repetition)
     except BenchmarkError as exc:
         sys.stderr.write(f"run_benchmark: error: {exc}; nothing was started\n")
         return 2
@@ -1244,18 +1370,36 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
         sys.stderr.write(f"run_benchmark: error: {output_dir / CLEANUP_MARKER} exists: an "
                          "earlier cleanup was not verified; nothing was started\n")
         return 2
-    for cell in cells:  # pragma: no cover - unreachable while LIVE_ENABLED is False
+    try:
+        claim_run(output_dir, cell, head=args.expect_head, arguments={
+            "level": args.level, "rate": args.rate, "repetition": args.repetition,
+            "concurrency": args.concurrency, "warmup_requests": args.warmup_requests,
+            "authorize": args.authorize, "expect_head": args.expect_head,
+            "output_dir": str(output_dir), "live": True})
+    except BenchmarkError as exc:
+        sys.stderr.write(f"run_benchmark: error: {exc}; nothing was started\n")
+        return 2
+    try:
         result, path, clean = run_cell(cell, ladder, expect_head=args.expect_head,
                                        output_dir=output_dir)
-        out.write(f"{cell.benchmark_id}: {result['verdict']} -> {path}\n")
-        if not clean:
-            out.write("stopping: cleanup was not verified; no further cell starts\n")
-            return 1
-        if result["verdict"] != "VALID":
-            out.write("stopping the ladder: a cell was not VALID\n")
-            return 1
-    return 0
-
+    except BaseException:
+        sys.stderr.write("run_benchmark: the cell did not complete; the ownership and ledger "
+                         "records are kept for review\n")
+        raise
+    status = 0 if clean and result["verdict"] == "VALID" else 1
+    try:
+        released = finish_run(output_dir, cell, result=result, result_path=path,
+                              cleanup_verified=clean, intended_status=status)
+    except Exception as exc:
+        sys.stderr.write(f"run_benchmark: error: could not record completion "
+                         f"({type(exc).__name__}); ownership is kept\n")
+        return 1
+    out.write(f"{cell.benchmark_id}: {result['verdict']} -> {path}\n")
+    if not clean:
+        out.write("stopping: cleanup was not verified; ownership is kept\n")
+    elif not released:  # pragma: no cover - defensive
+        out.write("ownership was not released\n")
+    return status
 
 if __name__ == "__main__":
     sys.exit(main())
