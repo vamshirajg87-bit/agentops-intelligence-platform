@@ -17,6 +17,14 @@ Two parts:
                manifest format bound to the Git HEAD, findings, and a
                recommendation that is NO-GO unless every prerequisite has
                been independently verified.
+    identity   pure helpers for a future staged execution: Git object
+               format and blob ids (SHA-1/SHA-256), canonical JSON and
+               manifest digests, relative-path validation, runtime
+               manifests, the authorization-context schema with binding
+               checks against independently obtained values, and the
+               prelaunch failure model.  A digest identifies bytes; it
+               never authenticates them, and no helper grants
+               authorization.
 
 The planner reports, and does not fix, one incompatibility of the committed
 harness: a staged copy has no .git directory, and calibrate_generator reads
@@ -520,9 +528,19 @@ def acl_intentions(layout: StagingLayout) -> list[dict[str, str]]:
     ]
 
 
-def git_blob_id(data: bytes) -> str:
-    """The Git blob id of exact file bytes (no filters applied)."""
-    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+#: Git object formats and their blob-id hash functions.
+OBJECT_FORMATS: Mapping[str, Callable[[bytes], Any]] = {
+    "sha1": hashlib.sha1, "sha256": hashlib.sha256}
+
+
+def git_blob_id(data: bytes, object_format: str = "sha1") -> str:
+    """The Git blob id of exact bytes: hash of b"blob <size>\\0" + data in
+    the repository's object format (no filters applied)."""
+    if object_format not in OBJECT_FORMATS:
+        raise PreflightError(f"unknown Git object format {object_format!r}")
+    if not isinstance(data, (bytes, bytearray)):
+        raise PreflightError("blob data must be bytes")
+    return OBJECT_FORMATS[object_format](b"blob %d\0" % len(data) + bytes(data)).hexdigest()
 
 
 def build_manifest(files: Iterable[tuple[str, bytes]], *, source_head: str,
@@ -655,6 +673,465 @@ def build_plan(inventory: Mapping[str, Any], *, expected_head: Optional[str],
         "findings": [f.as_dict() for f in findings],
         "recommendation": decision, "reasons": reasons,
     }
+
+
+# ---------------------------------------------------------------------------
+# Staged identity: pure helpers (no file system, no Git, no process)
+# ---------------------------------------------------------------------------
+
+def object_format_of(config_text: str) -> str:
+    """
+    The object format declared by a repository's .git/config text: "sha1"
+    or "sha256".  core.repositoryformatversion 0 (or absent) means SHA-1
+    and allows no objectformat extension; version 1 may declare
+    extensions.objectformat.  Unknown, repeated-conflicting or malformed
+    declarations are rejected.
+    """
+    if not isinstance(config_text, str):
+        raise PreflightError("the Git config must be text")
+    section: Optional[str] = None
+    values: dict[tuple[str, str], list[str]] = {}
+    for number, raw in enumerate(config_text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        header = re.fullmatch(r'\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]', line)
+        if header:
+            section = header.group(1).lower()
+            continue
+        if line.startswith("["):
+            raise PreflightError(f"malformed Git config section on line {number}")
+        entry = re.fullmatch(r"([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?", line)
+        if entry is None or section is None:
+            raise PreflightError(f"malformed Git config line {number}")
+        value = (entry.group(2) or "").strip()
+        value = re.split(r"\s[#;]", value, maxsplit=1)[0].strip().strip('"')
+        values.setdefault((section, entry.group(1).lower()), []).append(value)
+    versions = values.get(("core", "repositoryformatversion"), ["0"])
+    formats = values.get(("extensions", "objectformat"), [])
+    if len(set(versions)) != 1 or versions[0] not in ("0", "1"):
+        raise PreflightError(f"unsupported or conflicting repositoryformatversion {versions}")
+    if len(set(f.lower() for f in formats)) > 1:
+        raise PreflightError(f"conflicting extensions.objectformat {formats}")
+    if not formats:
+        return "sha1"
+    declared = formats[0].lower()
+    if versions[0] != "1":
+        raise PreflightError("extensions.objectformat requires repositoryformatversion 1")
+    if declared not in OBJECT_FORMATS:
+        raise PreflightError(f"unknown Git object format {formats[0]!r}")
+    return declared
+
+
+#: Canonical JSON: UTF-8, sorted keys, separators (",", ":"), no ASCII
+#: escaping, no NaN/Infinity, no floats, string keys only.
+CANONICAL_SEPARATORS: tuple[str, str] = (",", ":")
+
+
+def _check_canonical(value: Any, where: str = "$") -> None:
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        raise PreflightError(f"{where}: floats are not canonical")
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _check_canonical(item, f"{where}[{index}]")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise PreflightError(f"{where}: non-string key {key!r}")
+            _check_canonical(item, f"{where}.{key}")
+        return
+    raise PreflightError(f"{where}: {type(value).__name__} is not canonical JSON")
+
+
+def canonical_json(data: Any) -> bytes:
+    """Deterministic bytes of JSON data (see CANONICAL_SEPARATORS)."""
+    _check_canonical(data)
+    return json.dumps(data, sort_keys=True, separators=CANONICAL_SEPARATORS,
+                      ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def manifest_digest(manifest: Mapping[str, Any]) -> str:
+    """SHA-256 of the canonical manifest.  A digest only identifies bytes; it
+    authenticates nothing by itself, so a manifest may not carry one."""
+    if not isinstance(manifest, Mapping):
+        raise PreflightError("a manifest is a JSON object")
+    if any(key in manifest for key in ("digest", "sha256", "manifest_sha256")):
+        raise PreflightError("a manifest must not carry its own digest")
+    return hashlib.sha256(canonical_json(manifest)).hexdigest()
+
+
+_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)]
+    + ["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"])
+_FORBIDDEN_CHARACTERS = set('<>:"|?*\\') | {chr(c) for c in range(32)}
+
+
+def validate_relative_path(path: Any) -> str:
+    """A staged path relative to its root: '/'-separated, no traversal, no
+    absolute/drive/UNC form, no alternate data stream, no reserved device
+    name, no trailing space or dot.  Returned unchanged when valid."""
+    if not isinstance(path, str) or not path:
+        raise PreflightError("a relative path is a non-empty string")
+    if len(path) > 240:
+        raise PreflightError(f"path too long: {path[:40]!r}...")
+    if "\\" in path:
+        raise PreflightError(f"invalid separator in {path!r}; only '/' is allowed")
+    if path.startswith("/"):
+        raise PreflightError(f"absolute or UNC path {path!r}")
+    if ":" in path:
+        raise PreflightError(f"drive or alternate data stream in {path!r}")
+    for component in path.split("/"):
+        if component in ("", ".", ".."):
+            raise PreflightError(f"empty, '.' or '..' component in {path!r}")
+        if component[-1] in " .":
+            raise PreflightError(f"trailing space or dot in {path!r}")
+        if any(ch in _FORBIDDEN_CHARACTERS for ch in component):
+            raise PreflightError(f"forbidden character in {path!r}")
+        if component.split(".", 1)[0].rstrip(" ").upper() in _RESERVED_NAMES:
+            raise PreflightError(f"reserved Windows name in {path!r}")
+    return path
+
+
+def _validated_paths(paths: Iterable[Any], what: str) -> list[str]:
+    """Valid, unique paths; duplicates and case-insensitive collisions are
+    rejected (Windows file names are case-insensitive)."""
+    seen: dict[str, str] = {}
+    result = []
+    for path in paths:
+        valid = validate_relative_path(path)
+        folded = valid.casefold()
+        if folded in seen:
+            kind = "duplicate" if seen[folded] == valid else "case-insensitive collision"
+            raise PreflightError(f"{kind} in the {what}: {seen[folded]!r} / {valid!r}")
+        seen[folded] = valid
+        result.append(valid)
+    return result
+
+
+def _manifest_paths(manifest: Mapping[str, Any]) -> list[str]:
+    entries = manifest.get("entries") if isinstance(manifest, Mapping) else None
+    if not isinstance(entries, list):
+        raise PreflightError("the manifest has no entry list")
+    paths = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise PreflightError("a manifest entry is not an object")
+        paths.append(entry.get("path", entry.get("source_relative")))
+    return _validated_paths(paths, "manifest")
+
+
+def unexpected_files(listing: Iterable[Any], manifest: Mapping[str, Any]) -> dict[str, list[str]]:
+    """{"missing": [...], "unexpected": [...]} between a directory listing
+    supplied by the caller and a manifest (no file system is read)."""
+    listed = _validated_paths(listing, "listing")
+    expected = _manifest_paths(manifest)
+    by_fold = {p.casefold(): p for p in listed}
+    expected_fold = {p.casefold(): p for p in expected}
+    missing = sorted(p for f, p in expected_fold.items() if f not in by_fold)
+    unexpected = sorted(p for f, p in by_fold.items() if f not in expected_fold)
+    mismatched = sorted(p for f, p in by_fold.items()
+                        if f in expected_fold and expected_fold[f] != p)
+    return {"missing": missing, "unexpected": sorted(unexpected + mismatched)}
+
+
+RUNTIME_SCHEMA: str = "agentops-appcontainer-runtime-manifest/1"
+#: Files the staged runtime must contain, and files it must not contain.
+RUNTIME_FORBIDDEN_NAMES: frozenset[str] = frozenset(
+    {"pyvenv.cfg", "sitecustomize.py", "usercustomize.py"})
+
+
+def build_runtime_manifest(files: Iterable[tuple[str, bytes]]) -> dict[str, Any]:
+    """The runtime manifest (Python installation and site-packages) from
+    (relative path, bytes) pairs supplied by the caller.  Its digest is
+    manifest_digest(manifest)."""
+    pairs = list(files)
+    paths = _validated_paths((p for p, _ in pairs), "runtime manifest")
+    entries = []
+    for path, (_, data) in zip(paths, pairs):
+        if not isinstance(data, (bytes, bytearray)):
+            raise PreflightError(f"{path}: file data must be bytes")
+        entries.append({"path": path, "size": len(data),
+                        "sha256": hashlib.sha256(bytes(data)).hexdigest()})
+    return {"schema": RUNTIME_SCHEMA, "entries": sorted(entries, key=lambda e: e["path"])}
+
+
+def runtime_manifest_problems(manifest: Any, *, version: Sequence[int]) -> list[str]:
+    """Why a runtime manifest is not complete and clean; empty when it is."""
+    if not isinstance(manifest, Mapping) or manifest.get("schema") != RUNTIME_SCHEMA:
+        return ["not a runtime manifest"]
+    try:
+        paths = _manifest_paths(manifest)
+    except PreflightError as exc:
+        return [str(exc)]
+    problems = []
+    for entry in manifest["entries"]:
+        if not isinstance(entry.get("size"), int) or isinstance(entry.get("size"), bool) \
+                or entry["size"] < 0 or not _HEX64.fullmatch(str(entry.get("sha256"))):
+            problems.append(f"incomplete runtime entry {entry.get('path')}")
+    folded = {p.casefold() for p in paths}
+    for required in _python_runtime_files(version):
+        if required.casefold() not in folded:
+            problems.append(f"missing runtime file {required}")
+    for path in paths:
+        if path.rsplit("/", 1)[-1].casefold() in RUNTIME_FORBIDDEN_NAMES:
+            problems.append(f"forbidden runtime file {path}")
+    return problems
+
+
+CONTEXT_SCHEMA: str = "agentops-staged-authorization-context/1"
+#: The longest an authorization context may be valid.
+CONTEXT_MAX_LIFETIME_SECONDS: int = 2 * 60 * 60
+CONTEXT_FIELDS: tuple[str, ...] = (
+    "schema", "head", "object_format", "repository_manifest_sha256",
+    "runtime_manifest_sha256", "staging_root", "interpreter_path", "interpreter_sha256",
+    "run_id", "app_container_sid", "preflight_sha256", "parent", "ownership_token",
+    "created_utc", "expires_utc",
+)
+_RUN_ID_RE = re.compile(r"probe-0[1-5]|cal-a-(0[1-9]|1[0-9]|20)")
+_SID_RE = re.compile(r"S-1-15-2(-\d{1,10}){7}")
+_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z")
+_DRIVE_PATH_RE = re.compile(r"[A-Za-z]:\\[^:]*")
+
+
+def _parse_utc(text: Any) -> Optional[Any]:
+    from datetime import datetime
+    if not isinstance(text, str) or not _UTC_RE.fullmatch(text):
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _windows_absolute(path: Any) -> Optional[PureWindowsPath]:
+    if not isinstance(path, str) or not _DRIVE_PATH_RE.fullmatch(path) or path.endswith("\\"):
+        return None
+    parts = path[3:].split("\\")
+    try:
+        _validated_paths(["/".join(parts)], "path")
+    except PreflightError:
+        return None
+    return PureWindowsPath(path)
+
+
+def context_problems(context: Any, *, now: Any) -> list[str]:
+    """Why an authorization context is not well-formed or not current; empty
+    when it is.  A valid context authorizes nothing by itself."""
+    if not isinstance(context, Mapping):
+        return ["the context is not a JSON object"]
+    problems = []
+    missing = [f for f in CONTEXT_FIELDS if f not in context]
+    extra = sorted(set(context) - set(CONTEXT_FIELDS))
+    if missing:
+        problems.append("missing fields: " + ", ".join(missing))
+    if extra:
+        problems.append("unexpected fields: " + ", ".join(extra))
+    if missing:
+        return problems
+    try:
+        canonical_json(context)
+    except PreflightError as exc:
+        problems.append(f"not canonical: {exc}")
+    if context["schema"] != CONTEXT_SCHEMA:
+        problems.append("wrong schema")
+    object_format = context["object_format"]
+    if object_format not in OBJECT_FORMATS:
+        problems.append("unknown object format")
+    else:
+        length = {"sha1": 40, "sha256": 64}[object_format]
+        if not isinstance(context["head"], str) or not re.fullmatch(
+                rf"[0-9a-f]{{{length}}}", context["head"]):
+            problems.append(f"head is not a {object_format} commit id")
+    for field_name in ("repository_manifest_sha256", "runtime_manifest_sha256",
+                       "interpreter_sha256", "preflight_sha256"):
+        if not isinstance(context[field_name], str) or not _HEX64.fullmatch(context[field_name]):
+            problems.append(f"{field_name} is not a SHA-256")
+    root = _windows_absolute(context["staging_root"])
+    interpreter = _windows_absolute(context["interpreter_path"])
+    if root is None:
+        problems.append("staging_root is not a valid absolute path")
+    if interpreter is None:
+        problems.append("interpreter_path is not a valid absolute path")
+    elif root is not None:
+        inside = str(interpreter).casefold().startswith(str(root).casefold() + "\\")
+        if not inside or interpreter.name.casefold() != "python.exe":
+            problems.append("interpreter_path is not a python.exe inside staging_root")
+    if not isinstance(context["run_id"], str) or not _RUN_ID_RE.fullmatch(context["run_id"]):
+        problems.append("run_id is not an approved form")
+    if not isinstance(context["app_container_sid"], str) or not _SID_RE.fullmatch(
+            context["app_container_sid"]):
+        problems.append("app_container_sid is not an AppContainer SID")
+    parent = context["parent"]
+    if not isinstance(parent, Mapping) or set(parent) != {"pid", "creation_time"} \
+            or isinstance(parent.get("pid"), bool) or not isinstance(parent.get("pid"), int) \
+            or parent["pid"] <= 0 or _parse_utc(parent.get("creation_time")) is None:
+        problems.append("parent identity is malformed")
+    if not isinstance(context["ownership_token"], str) or not _TOKEN_RE.fullmatch(
+            context["ownership_token"]):
+        problems.append("ownership_token is malformed")
+    created, expires = _parse_utc(context["created_utc"]), _parse_utc(context["expires_utc"])
+    if created is None or expires is None:
+        problems.append("created_utc/expires_utc are malformed")
+    else:
+        lifetime = (expires - created).total_seconds()
+        if lifetime <= 0:
+            problems.append("expires_utc is not after created_utc")
+        elif lifetime > CONTEXT_MAX_LIFETIME_SECONDS:
+            problems.append("the context lifetime exceeds the maximum")
+        if now < created:
+            problems.append("the context is not yet valid (created in the future)")
+        if now >= expires:
+            problems.append("the context has expired")
+    return problems
+
+
+def context_digest(context: Mapping[str, Any]) -> str:
+    """SHA-256 of the canonical context.  It identifies the bytes only; a
+    context must not carry its own digest."""
+    if not isinstance(context, Mapping):
+        raise PreflightError("a context is a JSON object")
+    if any(key in context for key in ("digest", "context_sha256")):
+        raise PreflightError("a context must not carry its own digest")
+    return hashlib.sha256(canonical_json(context)).hexdigest()
+
+
+def verify_context_binding(context: Any, *, expected_digest: Any,
+                           expected: Mapping[str, Any], now: Any) -> list[str]:
+    """
+    Whether a context is exactly the one bound by values obtained
+    independently: the digest received over a trusted channel (not from
+    the context) and every expected field (from the authorization, the
+    manifests, the profile, the process).  Every expected field is
+    required; a missing expectation is itself a problem.  Returns problems
+    only - it never grants authorization.
+    """
+    problems = context_problems(context, now=now)
+    if problems:
+        return problems
+    if not isinstance(expected_digest, str) or not _HEX64.fullmatch(expected_digest):
+        return ["no independently supplied context digest"]
+    if context_digest(context) != expected_digest:
+        problems.append("the context does not match the independently supplied digest")
+    for field_name in CONTEXT_FIELDS:
+        if field_name in ("schema", "created_utc", "expires_utc"):
+            continue
+        if field_name not in expected:
+            problems.append(f"no independent expectation for {field_name}")
+            continue
+        actual, wanted = context[field_name], expected[field_name]
+        if field_name in ("staging_root", "interpreter_path"):
+            same = isinstance(wanted, str) and actual.casefold() == wanted.casefold()
+        else:
+            same = actual == wanted
+        if not same:
+            problems.append(f"{field_name} differs from the independent expectation")
+    return problems
+
+
+#: Prelaunch failure categories.
+FAILURE_CATEGORIES: tuple[str, ...] = (
+    "manifest_invalid", "head_mismatch", "executable_mismatch", "staging_incomplete",
+    "lock_failed", "dacl_invalid", "context_invalid", "preflight_stale", "sid_mismatch",
+    "id_mismatch", "job_failed", "evidence_write_failed",
+)
+#: Every prelaunch check and the category its failure belongs to.
+CHECK_CATEGORIES: Mapping[str, str] = {
+    "manifest_schema": "manifest_invalid", "manifest_digest": "manifest_invalid",
+    "relative_paths": "manifest_invalid", "file_hashes": "manifest_invalid",
+    "runtime_digest": "manifest_invalid",
+    "head": "head_mismatch",
+    "executable_identity": "executable_mismatch",
+    "inventory_complete": "staging_incomplete", "reparse_points": "staging_incomplete",
+    "link_counts": "staging_incomplete",
+    "locks_acquired": "lock_failed",
+    "dacl_readback": "dacl_invalid",
+    "context_binding": "context_invalid",
+    "preflight_hash": "preflight_stale", "preflight_fresh": "preflight_stale",
+    "services": "preflight_stale", "profile": "preflight_stale",
+    "sid": "sid_mismatch",
+    "run_id": "id_mismatch",
+    "job_created": "job_failed",
+    "evidence_durable": "evidence_write_failed",
+}
+#: Checks a prelaunch record must contain (evidence durability is decided
+#: after the record is written, by launch_permitted()).
+REQUIRED_PRELAUNCH_CHECKS: tuple[str, ...] = tuple(
+    name for name in CHECK_CATEGORIES if name != "evidence_durable")
+PRELAUNCH_SCHEMA: str = "agentops-staged-prelaunch/1"
+
+
+@dataclass(frozen=True)
+class PrelaunchCheck:
+    name: str
+    ok: bool
+    detail: str = ""
+
+    @property
+    def category(self) -> Optional[str]:
+        return None if self.ok else CHECK_CATEGORIES.get(self.name)
+
+
+def build_prelaunch_record(run_id: str, checks: Sequence[PrelaunchCheck], *, utc: str,
+                           context_sha256: Optional[str] = None) -> dict[str, Any]:
+    """The prelaunch evidence record (pure; nothing is written).  "passed"
+    only when every required check is present exactly once and passed; a
+    missing check counts as failed ("not performed")."""
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+        raise PreflightError("run_id is not an approved form")
+    if _parse_utc(utc) is None:
+        raise PreflightError("utc is malformed")
+    rows: list[dict[str, Any]] = []
+    names: list[str] = []
+    for check in checks:
+        if not isinstance(check, PrelaunchCheck) or check.name not in CHECK_CATEGORIES:
+            raise PreflightError(f"unknown prelaunch check {getattr(check, 'name', check)!r}")
+        if check.name == "evidence_durable":
+            raise PreflightError("evidence durability is decided by launch_permitted()")
+        if check.name in names:
+            raise PreflightError(f"duplicate prelaunch check {check.name}")
+        names.append(check.name)
+        rows.append({"name": check.name, "ok": bool(check.ok), "category": check.category,
+                     "detail": str(check.detail)[:300]})
+    for name in REQUIRED_PRELAUNCH_CHECKS:
+        if name not in names:
+            rows.append({"name": name, "ok": False, "category": CHECK_CATEGORIES[name],
+                         "detail": "not performed"})
+    failed = [row for row in rows if not row["ok"]]
+    return {"schema": PRELAUNCH_SCHEMA, "run_id": run_id, "utc": utc,
+            "checks": rows, "result": "refused" if failed else "passed",
+            "failure_category": failed[0]["category"] if failed else None,
+            "failure_categories": sorted({row["category"] for row in failed}),
+            "context_sha256": context_sha256}
+
+
+def build_evidence_failure_record(run_id: str, *, utc: str, path: str,
+                                  error: str) -> dict[str, Any]:
+    """The report of a failed evidence write (for stderr/operator summary;
+    the launch is refused)."""
+    return {"schema": PRELAUNCH_SCHEMA, "run_id": run_id, "utc": utc, "result": "refused",
+            "failure_category": "evidence_write_failed",
+            "failure_categories": ["evidence_write_failed"],
+            "detail": {"path": path, "error": str(error)[:300]}}
+
+
+def launch_permitted(record: Any, *, evidence_durable: bool) -> tuple[bool, str]:
+    """Launch only with a passed record that was durably written."""
+    if not isinstance(record, Mapping) or record.get("schema") != PRELAUNCH_SCHEMA:
+        return False, "manifest_invalid: no prelaunch record"
+    if record.get("result") != "passed" or record.get("failure_category") is not None:
+        return False, f"{record.get('failure_category')}: prelaunch checks failed"
+    names = [row.get("name") for row in record.get("checks") or []]
+    if sorted(names) != sorted(REQUIRED_PRELAUNCH_CHECKS) or not all(
+            row.get("ok") is True for row in record.get("checks") or []):
+        return False, "context_invalid: the prelaunch record is not complete"
+    if evidence_durable is not True:
+        return False, "evidence_write_failed: the prelaunch record is not durable"
+    return True, "passed"
 
 
 # ---------------------------------------------------------------------------

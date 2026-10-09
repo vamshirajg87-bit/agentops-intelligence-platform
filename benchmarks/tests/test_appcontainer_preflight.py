@@ -17,6 +17,7 @@ import re
 import socket
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -452,3 +453,430 @@ class TestPlan:
         decision, reasons = P.recommend([], {**verified, "host_prep_tool_reviewed": False})
         assert decision == "NO-GO" and has(reasons, "host_prep_tool_reviewed")
         assert P.recommend([P._blocker("a", "b")], verified) == ("NO-GO", ["a: b"])
+
+
+# ---------------------------------------------------------------------------
+# Staged identity: pure helpers
+# ---------------------------------------------------------------------------
+
+#: Independent published vectors: Git's EMPTY_BLOB constants (SHA-1 and
+#: SHA-256), `echo hello | git hash-object --stdin`, and the Pro Git book's
+#: "what is up, doc?" example.
+EMPTY_SHA1 = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+EMPTY_SHA256 = "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"
+HELLO_SHA1 = "ce013625030ba8dba906f756967f9e9ca394464a"
+DOC_SHA1 = "bd9dbf5aae1a3862dd1526723246b20206e5fc37"
+
+
+class TestGitIdentity:
+    def test_published_vectors(self):
+        assert P.git_blob_id(b"", "sha1") == EMPTY_SHA1
+        assert P.git_blob_id(b"", "sha256") == EMPTY_SHA256
+        assert P.git_blob_id(b"hello\n", "sha1") == HELLO_SHA1
+        assert P.git_blob_id(b"what is up, doc?", "sha1") == DOC_SHA1
+
+    def test_formats_differ_and_inputs_are_checked(self):
+        sha256 = P.git_blob_id(b"hello\n", "sha256")
+        assert len(sha256) == 64 and sha256 != P.git_blob_id(b"hello\r\n", "sha256")
+        with pytest.raises(P.PreflightError, match="unknown Git object format"):
+            P.git_blob_id(b"x", "sha512")
+        with pytest.raises(P.PreflightError, match="must be bytes"):
+            P.git_blob_id("text", "sha1")
+
+    @pytest.mark.parametrize("config, expected", [
+        ("", "sha1"),
+        ("[core]\n\trepositoryformatversion = 0\n\tautocrlf = true\n", "sha1"),
+        ('[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = x\n', "sha1"),
+        ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n",
+         "sha256"),
+        ("[core]\nrepositoryFormatVersion=1\n[Extensions]\nobjectFormat = SHA256 ; comment\n",
+         "sha256"),
+        ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha1\n", "sha1"),
+    ])
+    def test_object_format_of(self, config, expected):
+        assert P.object_format_of(config) == expected
+
+    @pytest.mark.parametrize("config, message", [
+        ("[core]\n\trepositoryformatversion = 0\n[extensions]\n\tobjectformat = sha256\n",
+         "requires repositoryformatversion 1"),
+        ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha512\n",
+         "unknown Git object format"),
+        ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha1\n"
+         "\tobjectformat = sha256\n", "conflicting extensions.objectformat"),
+        ("[core]\n\trepositoryformatversion = 0\n\trepositoryformatversion = 1\n",
+         "conflicting repositoryformatversion"),
+        ("[core]\n\trepositoryformatversion = 2\n", "unsupported"),
+        ("[core\n\tbare = false\n", "malformed Git config section"),
+        ("objectformat = sha1\n", "malformed Git config line"),
+        ("[core]\n= x\n", "malformed Git config line"),
+        (None, "must be text"),
+    ])
+    def test_object_format_rejections(self, config, message):
+        with pytest.raises(P.PreflightError, match=message):
+            P.object_format_of(config)
+
+
+class TestCanonical:
+    def test_canonical_bytes(self):
+        assert P.canonical_json({"b": 1, "a": [True, None, "\u00e9"]}) == \
+            '{"a":[true,null,"\u00e9"],"b":1}'.encode("utf-8")
+        assert P.CANONICAL_SEPARATORS == (",", ":")
+
+    def test_digest_stability(self):
+        one = {"schema": "s", "entries": [{"path": "a.py", "size": 1}], "z": {"y": 2, "x": 1}}
+        two = json.loads(json.dumps({"z": {"x": 1, "y": 2}, "entries": one["entries"],
+                                     "schema": "s"}, indent=4))
+        assert P.manifest_digest(one) == P.manifest_digest(two)
+        assert P.manifest_digest(one) == hashlib.sha256(P.canonical_json(one)).hexdigest()
+        changed = copy.deepcopy(one)
+        changed["entries"][0]["size"] = 2
+        assert P.manifest_digest(changed) != P.manifest_digest(one)
+
+    @pytest.mark.parametrize("value, message", [
+        ({"a": 1.5}, "floats"), ({"a": float("nan")}, "floats"), ({1: "x"}, "non-string key"),
+        ({"a": {1, 2}}, "not canonical JSON"), ({"a": object()}, "not canonical JSON"),
+    ])
+    def test_non_canonical_values(self, value, message):
+        with pytest.raises(P.PreflightError, match=message):
+            P.canonical_json(value)
+
+    @pytest.mark.parametrize("key", ["digest", "sha256", "manifest_sha256"])
+    def test_a_manifest_cannot_carry_its_own_digest(self, key):
+        with pytest.raises(P.PreflightError, match="own digest"):
+            P.manifest_digest({"schema": "s", "entries": [], key: "0" * 64})
+
+
+class TestRelativePaths:
+    @pytest.mark.parametrize("path", [
+        "benchmarks/metrics.py", "demo-app/agents/retrieval.py", "a/.hidden", "con_x.py",
+        "COM10.py", "Lib/site-packages/pydantic_core/_pydantic_core.cp313-win_amd64.pyd",
+    ])
+    def test_valid(self, path):
+        assert P.validate_relative_path(path) == path
+
+    @pytest.mark.parametrize("path", [
+        "", "/abs/x", "//server/share/x", "\\\\server\\share\\x", "C:/x", "C:x", "a\\b",
+        "a/../b", "../a", "./a", "a//b", "a/", "a/b.", "a/b ", "a/file.py:stream",
+        "a/file.py::$DATA", "con", "a/NUL.txt", "Com1.py", "LPT9", "conin$", "aux .py",
+        "a/b?c", "a/b*c", "a\x00b", "a/<x>", 'a/"q"', "a/b|c", "x" * 241, 123, None,
+    ])
+    def test_attacks_rejected(self, path):
+        with pytest.raises(P.PreflightError):
+            P.validate_relative_path(path)
+
+    def test_duplicates_and_case_collisions(self):
+        manifest = {"entries": [{"path": "a.py"}, {"path": "b.py"}]}
+        with pytest.raises(P.PreflightError, match="duplicate in the listing"):
+            P.unexpected_files(["a.py", "a.py"], manifest)
+        with pytest.raises(P.PreflightError, match="case-insensitive collision"):
+            P.unexpected_files(["a/B.py", "a/b.py"], manifest)
+        with pytest.raises(P.PreflightError, match="case-insensitive collision in the manifest"):
+            P.unexpected_files([], {"entries": [{"path": "A.py"}, {"path": "a.py"}]})
+
+    def test_missing_and_unexpected(self):
+        manifest = {"entries": [{"path": "a.py"}, {"path": "b/c.py"},
+                                {"source_relative": "d.py"}]}
+        assert P.unexpected_files(["a.py", "b/c.py", "d.py"], manifest) == {
+            "missing": [], "unexpected": []}
+        assert P.unexpected_files(["a.py", "e.py", "sitecustomize.py"], manifest) == {
+            "missing": ["b/c.py", "d.py"], "unexpected": ["e.py", "sitecustomize.py"]}
+        assert P.unexpected_files(["A.py", "b/c.py", "d.py"], manifest) == {
+            "missing": [], "unexpected": ["A.py"]}
+        with pytest.raises(P.PreflightError, match="no entry list"):
+            P.unexpected_files([], {"entries": None})
+        with pytest.raises(P.PreflightError):
+            P.unexpected_files(["../x"], manifest)
+
+
+def _runtime_files(version=(3, 13)):
+    files = [(path, f"{path}\n".encode()) for path in P._python_runtime_files(version)]
+    return files + [("Lib/site-packages/pydantic/__init__.py", b"")]
+
+
+class TestRuntimeManifest:
+    def test_complete_and_deterministic(self):
+        files = _runtime_files()
+        manifest = P.build_runtime_manifest(files)
+        assert manifest["schema"] == P.RUNTIME_SCHEMA
+        assert [e["path"] for e in manifest["entries"]] == sorted(p for p, _ in files)
+        entry = next(e for e in manifest["entries"] if e["path"] == "python.exe")
+        assert entry == {"path": "python.exe", "size": len(b"python.exe\n"),
+                         "sha256": hashlib.sha256(b"python.exe\n").hexdigest()}
+        assert P.runtime_manifest_problems(manifest, version=(3, 13)) == []
+        assert P.manifest_digest(manifest) == P.manifest_digest(
+            P.build_runtime_manifest(list(reversed(files))))
+
+    @pytest.mark.parametrize("drop", ["python313.dll", "DLLs/_socket.pyd", "Lib/site.py"])
+    def test_missing_runtime_file(self, drop):
+        manifest = P.build_runtime_manifest([f for f in _runtime_files() if f[0] != drop])
+        assert f"missing runtime file {drop}" in P.runtime_manifest_problems(manifest,
+                                                                            version=(3, 13))
+
+    @pytest.mark.parametrize("extra", ["pyvenv.cfg", "Lib/sitecustomize.py",
+                                       "Lib/site-packages/usercustomize.py"])
+    def test_forbidden_runtime_file(self, extra):
+        manifest = P.build_runtime_manifest(_runtime_files() + [(extra, b"")])
+        assert f"forbidden runtime file {extra}" in P.runtime_manifest_problems(
+            manifest, version=(3, 13))
+
+    def test_malformed_input_and_manifest(self):
+        with pytest.raises(P.PreflightError, match="case-insensitive collision"):
+            P.build_runtime_manifest([("Lib/os.py", b""), ("lib/OS.py", b"")])
+        with pytest.raises(P.PreflightError, match="must be bytes"):
+            P.build_runtime_manifest([("a.py", "text")])
+        with pytest.raises(P.PreflightError):
+            P.build_runtime_manifest([("../a.py", b"")])
+        manifest = P.build_runtime_manifest(_runtime_files())
+        assert P.runtime_manifest_problems({"schema": "x"}, version=(3, 13)) == [
+            "not a runtime manifest"]
+        broken = copy.deepcopy(manifest)
+        broken["entries"][0]["size"] = True
+        broken["entries"][1]["sha256"] = "short"
+        problems = P.runtime_manifest_problems(broken, version=(3, 13))
+        assert sum("incomplete runtime entry" in p for p in problems) == 2
+
+
+NOW = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
+SID7 = "S-1-15-2-1-2-3-4-5-6-7"
+ROOT = r"C:\Users\u\AppData\Local\agentops-probe"
+
+
+def good_context(**changes):
+    context = {
+        "schema": P.CONTEXT_SCHEMA, "head": HEAD, "object_format": "sha1",
+        "repository_manifest_sha256": "1" * 64, "runtime_manifest_sha256": "2" * 64,
+        "staging_root": ROOT, "interpreter_path": ROOT + r"\python\python.exe",
+        "interpreter_sha256": "3" * 64, "run_id": "probe-01", "app_container_sid": SID7,
+        "preflight_sha256": "4" * 64,
+        "parent": {"pid": 1234, "creation_time": "2026-10-09T11:59:00.000Z"},
+        "ownership_token": "0123456789abcdef0123456789abcdef",
+        "created_utc": "2026-10-09T11:55:00Z", "expires_utc": "2026-10-09T12:25:00Z",
+    }
+    context.update(changes)
+    return context
+
+
+def expectations(context):
+    return {k: copy.deepcopy(v) for k, v in context.items()
+            if k not in ("schema", "created_utc", "expires_utc")}
+
+
+class TestAuthorizationContext:
+    def test_valid_and_bound(self):
+        context = good_context()
+        assert P.context_problems(context, now=NOW) == []
+        assert P.verify_context_binding(context, expected_digest=P.context_digest(context),
+                                        expected=expectations(context), now=NOW) == []
+        assert P.verify_context_binding(
+            context, expected_digest=P.context_digest(context),
+            expected={**expectations(context), "staging_root": ROOT.upper(),
+                      "interpreter_path": context["interpreter_path"].lower()}, now=NOW) == []
+
+    def test_missing_and_extra_fields(self):
+        context = good_context()
+        del context["run_id"]
+        assert P.context_problems(context, now=NOW) == ["missing fields: run_id"]
+        assert P.context_problems(good_context(note="x"), now=NOW) == [
+            "unexpected fields: note"]
+        assert P.context_problems([], now=NOW) == ["the context is not a JSON object"]
+
+    @pytest.mark.parametrize("changes, message", [
+        ({"schema": "other/1"}, "wrong schema"),
+        ({"object_format": "sha512"}, "unknown object format"),
+        ({"object_format": "sha256"}, "not a sha256 commit id"),
+        ({"head": "A" * 40}, "not a sha1 commit id"),
+        ({"repository_manifest_sha256": "x"}, "repository_manifest_sha256 is not a SHA-256"),
+        ({"interpreter_sha256": None}, "interpreter_sha256 is not a SHA-256"),
+        ({"staging_root": "relative\\path"}, "staging_root is not a valid absolute path"),
+        ({"staging_root": r"\\server\share\x"}, "staging_root is not a valid absolute path"),
+        ({"staging_root": ROOT + r"\..\other"}, "staging_root is not a valid absolute path"),
+        ({"staging_root": ROOT + "\\"}, "staging_root is not a valid absolute path"),
+        ({"interpreter_path": r"C:\Python313\python.exe"}, "inside staging_root"),
+        ({"interpreter_path": ROOT + r"\python\pythonw.exe"}, "inside staging_root"),
+        ({"interpreter_path": ROOT + r"\python\python.exe:ads"}, "interpreter_path is not"),
+        ({"run_id": "bm-smoke-r0005-c32-rep2"}, "run_id is not an approved form"),
+        ({"run_id": "probe-06"}, "run_id is not an approved form"),
+        ({"app_container_sid": "S-1-5-21-1-2-3-1001"}, "not an AppContainer SID"),
+        ({"parent": {"pid": 0, "creation_time": "2026-10-09T11:59:00Z"}}, "parent identity"),
+        ({"parent": {"pid": True, "creation_time": "2026-10-09T11:59:00Z"}}, "parent identity"),
+        ({"parent": {"pid": 5}}, "parent identity"),
+        ({"ownership_token": "ABCDEF" * 5 + "AB"}, "ownership_token is malformed"),
+        ({"created_utc": "yesterday"}, "malformed"),
+        ({"expires_utc": "2026-10-09T11:00:00Z"}, "not after created_utc"),
+        ({"expires_utc": "2026-10-09T14:00:01Z"}, "lifetime exceeds"),
+        ({"preflight_sha256": 4.0}, "not canonical"),
+    ])
+    def test_malformed_fields(self, changes, message):
+        problems = P.context_problems(good_context(**changes), now=NOW)
+        assert any(message in p for p in problems), problems
+
+    def test_clock_boundaries(self):
+        context = good_context()
+        created = datetime(2026, 10, 9, 11, 55, tzinfo=timezone.utc)
+        expires = datetime(2026, 10, 9, 12, 25, tzinfo=timezone.utc)
+        assert P.context_problems(context, now=created) == []
+        assert P.context_problems(context, now=expires - timedelta(microseconds=1)) == []
+        assert P.context_problems(context, now=expires) == ["the context has expired"]
+        assert P.context_problems(context, now=created - timedelta(seconds=1)) == [
+            "the context is not yet valid (created in the future)"]
+
+    @pytest.mark.parametrize("field_name, value", [
+        ("head", "b" * 40), ("object_format", "sha256"),
+        ("repository_manifest_sha256", "9" * 64), ("runtime_manifest_sha256", "9" * 64),
+        ("staging_root", r"C:\Users\u\AppData\Local\other"),
+        ("interpreter_path", ROOT + r"\other\python.exe"), ("interpreter_sha256", "9" * 64),
+        ("run_id", "probe-02"), ("app_container_sid", "S-1-15-2-9-9-9-9-9-9-9"),
+        ("preflight_sha256", "9" * 64),
+        ("parent", {"pid": 99, "creation_time": "2026-10-09T11:59:00Z"}),
+        ("ownership_token", "f" * 32),
+    ])
+    def test_substitution_is_rejected_even_with_a_matching_digest(self, field_name, value):
+        original = good_context()
+        substituted = copy.deepcopy(original)
+        substituted[field_name] = value
+        if field_name == "object_format":
+            substituted["head"] = "a" * 64
+        if field_name == "staging_root":
+            substituted["interpreter_path"] = value + r"\python\python.exe"
+        problems = P.verify_context_binding(
+            substituted, expected_digest=P.context_digest(substituted),   # attacker's digest
+            expected=expectations(original), now=NOW)
+        assert any(f"{field_name} differs" in p for p in problems), problems
+        problems = P.verify_context_binding(
+            substituted, expected_digest=P.context_digest(original),
+            expected=expectations(original), now=NOW)
+        assert "the context does not match the independently supplied digest" in problems
+
+    def test_digest_is_never_self_authenticating(self):
+        context = good_context()
+        assert P.verify_context_binding(context, expected_digest=None,
+                                        expected=expectations(context), now=NOW) == [
+            "no independently supplied context digest"]
+        with pytest.raises(P.PreflightError, match="own digest"):
+            P.context_digest({**context, "context_sha256": P.context_digest(context)})
+        assert "unexpected fields: context_sha256" in P.context_problems(
+            {**context, "context_sha256": "0" * 64}, now=NOW)
+
+    def test_every_field_needs_an_independent_expectation(self):
+        context = good_context()
+        expected = expectations(context)
+        del expected["app_container_sid"]
+        assert P.verify_context_binding(context, expected_digest=P.context_digest(context),
+                                        expected=expected, now=NOW) == [
+            "no independent expectation for app_container_sid"]
+
+    def test_an_expired_context_is_never_bound(self):
+        context = good_context()
+        assert P.verify_context_binding(
+            context, expected_digest=P.context_digest(context), expected=expectations(context),
+            now=datetime(2026, 10, 9, 13, 0, tzinfo=timezone.utc)) == ["the context has expired"]
+
+
+def _all_checks(**failures):
+    return [P.PrelaunchCheck(name, name not in failures, failures.get(name, ""))
+            for name in P.REQUIRED_PRELAUNCH_CHECKS]
+
+
+UTC = "2026-10-09T12:00:00Z"
+
+
+class TestPrelaunchModel:
+    def test_categories_cover_the_failure_model(self):
+        assert set(P.CHECK_CATEGORIES.values()) == set(P.FAILURE_CATEGORIES)
+        assert len(P.FAILURE_CATEGORIES) == 12
+        assert "evidence_durable" not in P.REQUIRED_PRELAUNCH_CHECKS
+
+    def test_passed_record_and_launch(self):
+        record = P.build_prelaunch_record("probe-01", _all_checks(), utc=UTC,
+                                          context_sha256="5" * 64)
+        assert record["result"] == "passed" and record["failure_category"] is None
+        assert record["failure_categories"] == [] and record["context_sha256"] == "5" * 64
+        assert P.launch_permitted(record, evidence_durable=True) == (True, "passed")
+        allowed, reason = P.launch_permitted(record, evidence_durable=False)
+        assert not allowed and reason.startswith("evidence_write_failed")
+
+    @pytest.mark.parametrize("name", P.REQUIRED_PRELAUNCH_CHECKS)
+    def test_every_failing_check(self, name):
+        record = P.build_prelaunch_record("cal-a-01", _all_checks(**{name: "bad"}), utc=UTC)
+        assert record["result"] == "refused"
+        assert record["failure_category"] == P.CHECK_CATEGORIES[name]
+        allowed, reason = P.launch_permitted(record, evidence_durable=True)
+        assert not allowed and reason.startswith(P.CHECK_CATEGORIES[name])
+
+    @pytest.mark.parametrize("category", [c for c in P.FAILURE_CATEGORIES
+                                          if c != "evidence_write_failed"])
+    def test_every_category_is_reachable(self, category):
+        name = next(n for n, c in P.CHECK_CATEGORIES.items()
+                    if c == category and n != "evidence_durable")
+        record = P.build_prelaunch_record("probe-01", _all_checks(**{name: "x"}), utc=UTC)
+        assert category in record["failure_categories"]
+
+    def test_evidence_write_failure(self):
+        record = P.build_evidence_failure_record("probe-01", utc=UTC,
+                                                 path=r"C:\x\evidence\prelaunch-probe-01.json",
+                                                 error="OSError: disk full")
+        assert record["failure_category"] == "evidence_write_failed"
+        assert record["result"] == "refused" and record["detail"]["error"].endswith("disk full")
+        assert P.launch_permitted(record, evidence_durable=True)[0] is False
+
+    def test_missing_check_counts_as_failed(self):
+        checks = [c for c in _all_checks() if c.name != "locks_acquired"]
+        record = P.build_prelaunch_record("probe-01", checks, utc=UTC)
+        row = next(r for r in record["checks"] if r["name"] == "locks_acquired")
+        assert row == {"name": "locks_acquired", "ok": False, "category": "lock_failed",
+                       "detail": "not performed"}
+        assert record["failure_category"] == "lock_failed"
+
+    @pytest.mark.parametrize("checks, message", [
+        (_all_checks() + [P.PrelaunchCheck("head", True)], "duplicate prelaunch check"),
+        ([P.PrelaunchCheck("bogus", True)], "unknown prelaunch check"),
+        ([P.PrelaunchCheck("evidence_durable", True)], "launch_permitted"),
+        (["head"], "unknown prelaunch check"),
+    ])
+    def test_malformed_checks(self, checks, message):
+        with pytest.raises(P.PreflightError, match=message):
+            P.build_prelaunch_record("probe-01", checks, utc=UTC)
+
+    @pytest.mark.parametrize("run_id, utc", [("bm-x", UTC), ("probe-01", "now"),
+                                             ("probe-01", "2026-10-09T12:00:00+02:00")])
+    def test_malformed_record_arguments(self, run_id, utc):
+        with pytest.raises(P.PreflightError):
+            P.build_prelaunch_record(run_id, _all_checks(), utc=utc)
+
+    def test_tampered_records_are_not_launchable(self):
+        record = P.build_prelaunch_record("probe-01", _all_checks(), utc=UTC)
+        tampered = copy.deepcopy(record)
+        tampered["checks"][0]["ok"] = False
+        assert P.launch_permitted(tampered, evidence_durable=True)[0] is False
+        shortened = copy.deepcopy(record)
+        shortened["checks"].pop()
+        assert P.launch_permitted(shortened, evidence_durable=True)[0] is False
+        assert P.launch_permitted({"result": "passed"}, evidence_durable=True)[0] is False
+        assert P.launch_permitted(None, evidence_durable=True)[0] is False
+
+
+class TestNoImplicitAuthorization:
+    def test_helpers_grant_nothing_and_gates_stay_closed(self):
+        context = good_context()
+        result = P.verify_context_binding(context, expected_digest=P.context_digest(context),
+                                          expected=expectations(context), now=NOW)
+        assert result == [] and isinstance(result, list)
+        record = P.build_prelaunch_record("probe-01", _all_checks(), utc=UTC)
+        assert P.launch_permitted(record, evidence_durable=True) == (True, "passed")
+        assert (C.EXECUTION_ENABLED, C.APPROVED_CALIBRATIONS, C.PROBE_ENABLED,
+                C.APPROVED_PROBES, C.AUTHORIZED_APPCONTAINER_SID,
+                C.AUTHORIZED_PROFILE_PREFLIGHT_SHA256) == (False, frozenset(), False,
+                                                          frozenset(), None, None)
+        assert P.HOST_INVENTORY_ENABLED is False
+
+    def test_the_planner_source_never_authorizes(self):
+        code = SOURCE.split('"""', 2)[2]
+        assert set(re.findall(r"harness\.(\w+)", code)) == {"_read_git_head"}
+        assert not re.search(r"\bauthorize(_probe)?\(\w", code)          # no call with args
+        assert not re.search(r"harness\.\w+\s*=", code)
+        assert "Authorization(" not in code and "_SEAL" not in code
+
+    def test_default_verdict_is_still_no_go(self):
+        plan = P.build_plan({}, expected_head=None, verified={p: True for p in P.PREREQUISITES})
+        assert plan["recommendation"] == "NO-GO"
+        assert any(r.startswith("harness: ") for r in plan["reasons"])
