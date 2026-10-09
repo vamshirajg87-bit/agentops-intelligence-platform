@@ -192,10 +192,24 @@ def make_controller(monkeypatch, **overrides):
     return W.JobController(api.auth, api), kernel32
 
 
+STDOUT_HANDLE, STDERR_HANDLE = 0x204, 0x208
+
+
+def creation_for(monkeypatch, job=JOB, pid=PID, created=CREATED):
+    """An explicit, mocked assignment-at-creation assertion: the integration
+    gate is opened in memory only for minting, then closed again."""
+    monkeypatch.setattr(W, "JOB_LIST_CREATION_INTEGRATED", True)
+    plan = W.job_list_attribute_plan(job, STDOUT_HANDLE, STDERR_HANDLE)
+    assertion = W._assert_created_with_job_list(plan, job, pid, created)
+    monkeypatch.setattr(W, "JOB_LIST_CREATION_INTEGRATED", False)
+    return assertion
+
+
 def verified(monkeypatch, **overrides):
     controller, kernel32 = make_controller(monkeypatch, **overrides)
     controller.configure()
-    membership = controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+    membership = controller.verify_membership(PROCESS, PID, CREATED, CREATED,
+                                              creation_for(monkeypatch))
     return controller, kernel32, membership
 
 
@@ -427,7 +441,8 @@ class TestMembership:
         controller, kernel32 = make_controller(monkeypatch, **overrides)
         controller.configure()
         with pytest.raises(W.JobFailure, match=message) as raised:
-            controller.verify_membership(*(args or (PROCESS, PID, CREATED, CREATED)))
+            controller.verify_membership(*(args or (PROCESS, PID, CREATED, CREATED)),
+                                         creation_for(monkeypatch))
         assert raised.value.key == "not_in_job"
         assert controller.ownership == "retained_unverified" and controller.membership is None
         assert kernel32.closed == []                              # never silently closed
@@ -437,19 +452,19 @@ class TestMembership:
         controller.configure()
         kernel32.fail = {"QueryInformationJobObject"}
         with pytest.raises(W.JobFailure, match="Win32Error"):
-            controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+            controller.verify_membership(PROCESS, PID, CREATED, CREATED, creation_for(monkeypatch))
         assert controller.ownership == "retained_unverified" and kernel32.closed == []
 
     def test_membership_requires_a_configured_job(self, monkeypatch):
         controller, _ = make_controller(monkeypatch)
         with pytest.raises(W.JobFailure, match="membership in state none"):
-            controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+            controller.verify_membership(PROCESS, PID, CREATED, CREATED, creation_for(monkeypatch))
 
     def test_membership_reads_identity_accounting_and_limits(self, monkeypatch):
         controller, kernel32 = make_controller(monkeypatch)
         controller.configure()
         start = len(kernel32.log)
-        controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+        controller.verify_membership(PROCESS, PID, CREATED, CREATED, creation_for(monkeypatch))
         assert kernel32.log[start:] == ["IsProcessInJob", "QueryInformationJobObject",
                                         "QueryInformationJobObject",
                                         "QueryInformationJobObject", "GetHandleInformation"]
@@ -466,7 +481,7 @@ class TestMembership:
         controller.configure()
         kernel32.__dict__.update(change)
         with pytest.raises(W.JobFailure, match=message) as raised:
-            controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+            controller.verify_membership(PROCESS, PID, CREATED, CREATED, creation_for(monkeypatch))
         assert raised.value.key == "job_readback_mismatch"
         assert controller.ownership == "retained_unverified" and kernel32.closed == []
 
@@ -749,7 +764,7 @@ class TestNoFallback:
         start = len(kernel32.log)
         kernel32.__dict__.update(overrides)
         with pytest.raises(W.JobFailure):
-            controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+            controller.verify_membership(PROCESS, PID, CREATED, CREATED, creation_for(monkeypatch))
         assert set(kernel32.log[start:]) <= {"IsProcessInJob", "QueryInformationJobObject",
                                              "GetHandleInformation"}
         assert kernel32.terminated == [] and kernel32.closed == []
@@ -770,6 +785,262 @@ class TestNoFallback:
         W.parent_job_decision(False)
         W.configuration_problems({"limit_flags": 0x2408, "active_process_limit": 1}, False)
         assert kernel32.loads == [] and kernel32.log == []
+
+
+# ---------------------------------------------------------------------------
+# Configuration delegated to the planner (J-36)
+# ---------------------------------------------------------------------------
+
+GOOD_LIMITS = {"limit_flags": 0x2408, "active_process_limit": 1}
+
+
+class TestConfigurationDelegation:
+    def test_delegates_with_the_measured_inheritance(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(P, "job_configuration_problems",
+                            lambda readback: seen.append(readback) or ["planner verdict"])
+        assert W.configuration_problems(GOOD_LIMITS, False) == ["planner verdict"]
+        assert W.configuration_problems({**GOOD_LIMITS, "job_handle_inheritable": False},
+                                        True) == ["planner verdict"]
+        assert seen == [{**GOOD_LIMITS, "job_handle_inheritable": False},
+                        {**GOOD_LIMITS, "job_handle_inheritable": True}]   # measured wins
+
+    def test_configure_and_membership_use_the_planner(self, monkeypatch):
+        controller, kernel32 = make_controller(monkeypatch)
+        monkeypatch.setattr(P, "job_configuration_problems", lambda readback: ["planner no"])
+        with pytest.raises(W.JobFailure, match="planner no") as raised:
+            controller.configure()
+        assert raised.value.key == "job_readback_mismatch" and kernel32.closed == [JOB]
+
+    def test_no_second_rule_implementation(self):
+        code = SOURCE.split('"""', 2)[2]
+        for phrase in ("required limit flags missing", "breakaway flags present",
+                       "unexpected limit flags", "active process limit is",
+                       "prohibited_flags", "limit_flags missing or malformed"):
+            assert phrase not in code, phrase
+        assert "P.job_configuration_problems(" in code
+
+    @pytest.mark.parametrize("readback, inheritable, expected", [
+        (GOOD_LIMITS, False, []),
+        ({"limit_flags": 0x0408, "active_process_limit": 1}, False,
+         ["required limit flags missing: 0x2000"]),
+        ({"limit_flags": 0x2008, "active_process_limit": 1}, False,
+         ["required limit flags missing: 0x400"]),
+        ({"limit_flags": 0x2408 | 0x800, "active_process_limit": 1}, False,
+         ["breakaway flags present: 0x800"]),
+        ({"limit_flags": 0x2408 | 0x1000, "active_process_limit": 1}, False,
+         ["breakaway flags present: 0x1000"]),
+        ({"limit_flags": 0x2408, "active_process_limit": 2}, False,
+         ["active process limit is 2, not 1"]),
+        ({"limit_flags": 0x2408, "active_process_limit": 0}, False,
+         ["active process limit is 0, not 1"]),
+        (GOOD_LIMITS, True, ["the job handle is (or may be) inheritable"]),
+        (GOOD_LIMITS, None, ["the job handle is (or may be) inheritable"]),
+        (None, False, ["no job read-back"]),
+        ({}, False, ["limit_flags missing or malformed"]),
+        ({"limit_flags": "x", "active_process_limit": 1}, False,
+         ["limit_flags missing or malformed"]),
+        ({"limit_flags": 0x2408}, False, ["active process limit is None, not 1"]),
+    ])
+    def test_acceptance_and_refusal_preserved(self, readback, inheritable, expected):
+        assert W.configuration_problems(readback, inheritable) == expected
+
+    @pytest.mark.parametrize("readback", [(0x0408, 1), (0x2408 | 0x800, 1), (0x2408, 2),
+                                          (0x2408 | 0x1000, 1)])
+    def test_configure_refuses_bad_readback(self, monkeypatch, readback):
+        controller, kernel32 = make_controller(monkeypatch, readback=readback)
+        with pytest.raises(W.JobFailure) as raised:
+            controller.configure()
+        assert raised.value.key == "job_readback_mismatch"
+        assert controller.ownership == "closed" and kernel32.closed == [JOB]
+
+
+# ---------------------------------------------------------------------------
+# Membership evidence and assignment-at-creation provenance (J-36)
+# ---------------------------------------------------------------------------
+
+def configured(monkeypatch, **overrides):
+    controller, kernel32 = make_controller(monkeypatch, **overrides)
+    controller.configure()
+    return controller, kernel32
+
+
+class TestMembershipEvidence:
+    def test_exact_fields_and_values(self, monkeypatch):
+        _, _, membership = verified(monkeypatch)
+        assert tuple(membership.evidence) == P.JOB_MEMBERSHIP_FIELDS
+        assert dict(membership.evidence) == {
+            "job_assignment": "assigned_at_creation", "in_job": True, "pid": PID,
+            "creation_time": CREATED, "active_processes": 1, "total_processes": 1,
+            "member_pids": (PID,)}
+        assert P.job_membership_problems(membership.evidence, expected_pid=PID,
+                                         expected_creation_time=CREATED) == []
+
+    def test_evidence_is_immutable(self, monkeypatch):
+        _, _, membership = verified(monkeypatch)
+        with pytest.raises(TypeError):
+            membership.evidence["total_processes"] = 2
+        assert isinstance(membership.evidence["member_pids"], tuple)
+        with pytest.raises(AttributeError):
+            membership.evidence = {}
+
+    def test_evidence_drives_the_lifecycle(self, monkeypatch):
+        _, _, membership = verified(monkeypatch)
+        state = P.lifecycle_transition(P.LifecycleState(), "created", {
+            "pid": PID, "creation_time": CREATED, "job_assignment": "assigned_at_creation",
+            "job_limits_verified": True})
+        state = P.lifecycle_transition(state, "job_assigned", dict(membership.evidence))
+        assert state.phase == "job_assigned" and state.execution_history == P.NEVER_EXECUTED
+
+    def _refused(self, controller, kernel32, creation, key, message, *, start=None,
+                 args=(PROCESS, PID, CREATED, CREATED)):
+        start = len(kernel32.log) if start is None else start
+        with pytest.raises(W.JobFailure, match=message) as raised:
+            controller.verify_membership(*args, creation)
+        assert raised.value.key == key
+        assert controller.ownership == "retained_unverified" and controller.membership is None
+        assert kernel32.closed == [] and kernel32.terminated == []    # handles retained
+        return kernel32.log[start:]
+
+    def test_missing_assertion_refuses_before_any_native_call(self, monkeypatch):
+        controller, kernel32 = configured(monkeypatch)
+        calls = self._refused(controller, kernel32, None, "assignment_failed",
+                              "observed membership alone does not prove")
+        assert calls == []
+
+    def test_observed_membership_cannot_prove_assignment(self, monkeypatch):
+        controller, kernel32 = configured(monkeypatch)       # the fake reports a perfect member
+        assert kernel32.in_job == 1 and kernel32.pids == [PID]
+        self._refused(controller, kernel32, None, "assignment_failed", "alone does not prove")
+        with pytest.raises(W.ProvenanceRefused):
+            W._membership_evidence(None, in_job=True, member_pids=[PID], active=1, total=1)
+
+    def test_assertion_cannot_be_minted_by_default(self):
+        assert W.JOB_LIST_CREATION_INTEGRATED is False
+        plan = W.job_list_attribute_plan(JOB, STDOUT_HANDLE, STDERR_HANDLE)
+        with pytest.raises(W.ProvenanceRefused, match="no JOB_LIST integration"):
+            W._assert_created_with_job_list(plan, JOB, PID, CREATED)
+        harness = (_BENCH / "calibrate_generator.py").read_text(encoding="utf-8")
+        assert "_assert_created_with_job_list" not in harness and "CreationAssertion" not in harness
+        code = SOURCE.split('"""', 2)[2]
+        assert "JOB_LIST_CREATION_INTEGRATED: bool = False" in code
+
+    @pytest.mark.parametrize("seal", [None, object(), "seal"])
+    def test_forged_assertions_refuse(self, monkeypatch, seal):
+        controller, kernel32 = configured(monkeypatch)
+        forged = W.CreationAssertion(JOB, PID, CREATED, seal)
+        self._refused(controller, kernel32, forged, "assignment_failed", "not authentic")
+        controller, kernel32 = configured(monkeypatch)
+        self._refused(controller, kernel32, {"job": JOB, "pid": PID}, "assignment_failed",
+                      "not authentic")
+
+    def test_after_creation_assignment_refuses(self, monkeypatch):
+        monkeypatch.setattr(W, "JOB_LIST_CREATION_INTEGRATED", True)
+        other_job_plan = W.job_list_attribute_plan(0x900, STDOUT_HANDLE, STDERR_HANDLE)
+        with pytest.raises(W.ProvenanceRefused, match="does not name exactly this job"):
+            W._assert_created_with_job_list(other_job_plan, JOB, PID, CREATED)
+        with pytest.raises(W.ProvenanceRefused, match="no attribute plan"):
+            W._assert_created_with_job_list(None, JOB, PID, CREATED)
+        no_job_list = W.AttributePlan(other_job_plan.entries[:2])
+        with pytest.raises(W.ProvenanceRefused, match="does not name exactly this job"):
+            W._assert_created_with_job_list(no_job_list, JOB, PID, CREATED)
+        for pid, created in ((0, CREATED), (True, CREATED), (PID, ""), (PID, None)):
+            with pytest.raises(W.ProvenanceRefused):
+                W._assert_created_with_job_list(
+                    W.job_list_attribute_plan(JOB, STDOUT_HANDLE, STDERR_HANDLE), JOB, pid,
+                    created)
+        monkeypatch.setattr(W, "JOB_LIST_CREATION_INTEGRATED", False)
+        assert not hasattr(W.JobController, "assign") and "AssignProcessToJobObject" not in SOURCE
+
+    def test_assertion_for_another_job_refuses(self, monkeypatch):
+        controller, kernel32 = configured(monkeypatch)
+        self._refused(controller, kernel32, creation_for(monkeypatch, job=0x900),
+                      "assignment_failed", "another job or child")
+
+    def test_pid_mismatch_refuses(self, monkeypatch):
+        controller, kernel32 = configured(monkeypatch)
+        self._refused(controller, kernel32, creation_for(monkeypatch, pid=999),
+                      "assignment_failed", "another job or child")
+        controller, kernel32 = configured(monkeypatch, pids=[999])
+        self._refused(controller, kernel32, creation_for(monkeypatch), "not_in_job",
+                      "not \\[4242\\]")
+
+    def test_creation_time_mismatch_refuses(self, monkeypatch):
+        controller, kernel32 = configured(monkeypatch)
+        self._refused(controller, kernel32,
+                      creation_for(monkeypatch, created="2026-10-09T12:00:01.000Z"),
+                      "assignment_failed", "another job or child")
+        controller, kernel32 = configured(monkeypatch)
+        self._refused(controller, kernel32, creation_for(monkeypatch), "not_in_job",
+                      "creation time differs",
+                      args=(PROCESS, PID, CREATED, "2026-10-09T12:00:01.000Z"))
+
+    @pytest.mark.parametrize("accounting, message", [
+        ({"active": 0, "total": 1, "terminated": 1}, "0 active processes"),
+        ({"active": 2, "total": 2, "terminated": 0}, "2 active processes"),
+        ({"active": 1, "total": 0, "terminated": 0}, "0 processes have been in the job"),
+        ({"active": 1, "total": 2, "terminated": 1}, "2 processes have been in the job"),
+    ])
+    def test_process_counts_refuse(self, monkeypatch, accounting, message):
+        controller, kernel32 = configured(monkeypatch, accounting=accounting)
+        self._refused(controller, kernel32, creation_for(monkeypatch), "not_in_job", message)
+
+    @pytest.mark.parametrize("pids", [[PID, 7], [], [7], [PID, PID]])
+    def test_member_list_refuses(self, monkeypatch, pids):
+        controller, kernel32 = configured(monkeypatch, pids=pids)
+        self._refused(controller, kernel32, creation_for(monkeypatch), "not_in_job",
+                      "job members are")
+
+    def test_planner_validator_is_applied(self, monkeypatch):
+        calls = []
+
+        def planner(evidence, *, expected_pid, expected_creation_time):
+            calls.append((dict(evidence), expected_pid, expected_creation_time))
+            return ["planner rejects"]
+
+        controller, kernel32 = configured(monkeypatch)
+        monkeypatch.setattr(P, "job_membership_problems", planner)
+        self._refused(controller, kernel32, creation_for(monkeypatch), "not_in_job",
+                      "membership evidence refused: planner rejects")
+        assert calls == [({"job_assignment": "assigned_at_creation", "in_job": True,
+                           "pid": PID, "creation_time": CREATED, "active_processes": 1,
+                           "total_processes": 1, "member_pids": (PID,)}, PID, CREATED)]
+
+    @pytest.mark.parametrize("observed, message", [
+        ({"member_pids": [PID, 7]}, "job members are"),
+        ({"total": 2}, "2 processes have been in the job"),
+        ({"active": 0}, "0 active processes"),
+        ({"in_job": False}, "not in the job"),
+    ])
+    def test_planner_rejects_invalid_evidence(self, monkeypatch, observed, message):
+        values = {"in_job": True, "member_pids": [PID], "active": 1, "total": 1} | observed
+        evidence = W._membership_evidence(creation_for(monkeypatch), **values)
+        problems = P.job_membership_problems(evidence, expected_pid=PID,
+                                             expected_creation_time=CREATED)
+        assert any(message in problem for problem in problems)
+
+    def test_failed_verification_retains_and_never_closes(self, monkeypatch):
+        controller, kernel32 = configured(monkeypatch, accounting={"active": 1, "total": 2,
+                                                                   "terminated": 1})
+        self._refused(controller, kernel32, creation_for(monkeypatch), "not_in_job",
+                      "2 processes")
+        with pytest.raises(W.JobFailure, match="unsafe_close_refused"):
+            controller.close()
+        assert kernel32.closed == [] and "TerminateJobObject" not in kernel32.log
+        assert "CloseHandle" not in kernel32.log
+
+    def test_termination_reverification_reuses_the_assertion(self, monkeypatch):
+        controller, kernel32, membership = verified(monkeypatch)
+        accept_policy(monkeypatch)
+        outcome = controller.terminate("job_terminated_timeout", PROCESS, membership, CREATED,
+                                       wait=_wait(True), exit_code=_code(P.TIMEOUT_EXIT_CODE))
+        assert outcome.verified and controller.ownership == "child_exited"
+
+    def test_only_the_fake_dll_is_loaded(self, monkeypatch):
+        _, kernel32, _ = verified(monkeypatch)
+        assert kernel32.loads == ["kernel32"]
+        with pytest.raises(LiveAccessAttempt):
+            ctypes.WinDLL("kernel32")
 
 
 # ---------------------------------------------------------------------------
@@ -848,7 +1119,7 @@ class TestTerminationInterface:
 
     def test_stale_membership_never_terminates(self, monkeypatch):
         controller, kernel32, old = verified(monkeypatch)
-        controller.verify_membership(PROCESS, PID, CREATED, CREATED)       # newer snapshot
+        controller.verify_membership(PROCESS, PID, CREATED, CREATED, creation_for(monkeypatch))       # newer snapshot
         accept_policy(monkeypatch)
         with pytest.raises(W.TerminationRefused, match="stale or foreign"):
             controller.terminate("job_terminated_timeout", PROCESS, old, CREATED,

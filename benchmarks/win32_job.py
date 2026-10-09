@@ -30,6 +30,12 @@ termination behaviour changes.
                    the current-process pseudo-handle with a NULL job is the
                    only presence test; a launch may proceed only on a
                    definite FALSE.
+    provenance     membership evidence (exactly P.JOB_MEMBERSHIP_FIELDS)
+                   exists only with a sealed assignment-at-creation
+                   assertion, which cannot be minted while
+                   JOB_LIST_CREATION_INTEGRATED is False (the launcher has
+                   no JOB_LIST integration); observed membership alone
+                   never proves assignment at creation.
 
 There is no automatic retry and no cleanup through object destruction.
 
@@ -420,37 +426,96 @@ def parent_job_inventory(api: Any) -> ParentJobInventory:
 
 
 def configuration_problems(readback: Any, inheritable: Any) -> list[str]:
-    """The job's configuration against JOB_LIMIT_POLICY: limit flags, the
-    active process limit and handle inheritance.  Membership is not
-    configuration; it is verified on the child, separately."""
+    """The job's configuration, judged only by the planner's
+    P.job_configuration_problems.  The measured handle inheritance is passed
+    in (it overrides anything in the read-back); nothing is defaulted."""
     if not isinstance(readback, Mapping):
-        return ["no job read-back"]
-    policy = P.JOB_LIMIT_POLICY
-    flags = readback.get("limit_flags")
-    if isinstance(flags, bool) or not isinstance(flags, int) or flags < 0:
-        return ["limit_flags missing or malformed"]
-    problems = []
-    required, prohibited = policy["required_flags"], policy["prohibited_flags"]
-    if flags & required != required:
-        problems.append(f"required limit flags missing: {required & ~flags:#x}")
-    if flags & prohibited:
-        problems.append(f"breakaway flags present: {flags & prohibited:#x}")
-    if flags & ~(required | prohibited):
-        problems.append(f"unexpected limit flags: {flags & ~(required | prohibited):#x}")
-    limit = readback.get("active_process_limit")
-    if limit != policy["active_process_limit"] or isinstance(limit, bool):
-        problems.append(f"active process limit is {limit!r}, not 1")
-    if inheritable is not policy["job_handle_inheritable"]:
-        problems.append("the job handle is (or may be) inheritable")
-    return problems
+        return P.job_configuration_problems(readback)
+    return P.job_configuration_problems({**readback, "job_handle_inheritable": inheritable})
+
+
+# ---------------------------------------------------------------------------
+# Assignment-at-creation provenance and membership evidence
+# ---------------------------------------------------------------------------
+
+#: The launcher does not create children with PROC_THREAD_ATTRIBUTE_JOB_LIST
+#: yet.  Until a reviewed integration changes this, assignment at creation
+#: can never be asserted, so no membership evidence can be produced.
+JOB_LIST_CREATION_INTEGRATED: bool = False
+_CREATION_SEAL = object()
+
+
+class ProvenanceRefused(C.CalibrationError):
+    """Assignment at creation cannot be asserted."""
+
+
+@dataclass(frozen=True)
+class CreationAssertion:
+    """The creation path's statement that this child was created with a
+    JOB_LIST naming this job.  Only one minted here (sealed) is accepted;
+    observed membership alone never produces it."""
+    job: int
+    pid: int
+    creation_time: str
+    seal: Any = field(repr=False, compare=False)
+
+
+def _assert_created_with_job_list(plan: Any, job: Any, pid: Any,
+                                  creation_time: Any) -> CreationAssertion:
+    """For the future creation path only, after CreateProcessW succeeded
+    with this plan; refused while the launcher has no JOB_LIST integration."""
+    if JOB_LIST_CREATION_INTEGRATED is not True:
+        raise ProvenanceRefused("the launcher has no JOB_LIST integration; assignment at "
+                                "creation cannot be asserted")
+    if not isinstance(plan, AttributePlan):
+        raise ProvenanceRefused("no attribute plan")
+    if not C._valid_handle(job):
+        raise ProvenanceRefused("the job handle is invalid")
+    job_lists = [e for e in plan.entries if e.attribute == PROC_THREAD_ATTRIBUTE_JOB_LIST]
+    if len(job_lists) != 1 or job_lists[0].handles != (job,):
+        raise ProvenanceRefused("the plan's JOB_LIST does not name exactly this job")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ProvenanceRefused("the created PID is invalid")
+    if not isinstance(creation_time, str) or not creation_time:
+        raise ProvenanceRefused("the creation time is invalid")
+    return CreationAssertion(job, pid, creation_time, _CREATION_SEAL)
+
+
+def _assertion_problem(creation: Any, job: Any, pid: Any, creation_time: Any) -> Optional[str]:
+    """Why the assertion does not authenticate assignment at creation of
+    this child into this job; None when it does."""
+    if creation is None:
+        return ("no assignment-at-creation assertion (observed membership alone does not "
+                "prove assignment at creation)")
+    if not isinstance(creation, CreationAssertion) or creation.seal is not _CREATION_SEAL:
+        return "the assignment-at-creation assertion is not authentic"
+    if creation.job != job or creation.pid != pid or creation.creation_time != creation_time:
+        return "the assignment-at-creation assertion is about another job or child"
+    return None
+
+
+def _membership_evidence(creation: CreationAssertion, *, in_job: Any, member_pids: Any,
+                         active: Any, total: Any) -> Mapping[str, Any]:
+    """Exactly P.JOB_MEMBERSHIP_FIELDS: identity from the authenticated
+    creation context, everything else as observed; immutable."""
+    if not isinstance(creation, CreationAssertion) or creation.seal is not _CREATION_SEAL:
+        raise ProvenanceRefused("no authentic assignment-at-creation assertion")
+    values = {"job_assignment": P.ACCEPTED_JOB_ASSIGNMENT, "in_job": in_job,
+              "pid": creation.pid, "creation_time": creation.creation_time,
+              "active_processes": active, "total_processes": total,
+              "member_pids": (tuple(member_pids) if isinstance(member_pids, (list, tuple))
+                              else member_pids)}
+    return MappingProxyType({key: values[key] for key in P.JOB_MEMBERSHIP_FIELDS})
 
 
 @dataclass(frozen=True)
 class Membership:
-    """One membership snapshot: exactly this child, at this moment."""
+    """One membership snapshot: exactly this child, at this moment, with
+    its complete membership evidence."""
     pid: int
     creation_time: str
     epoch: int
+    evidence: Optional[Mapping[str, Any]] = field(default=None, compare=False)
 
 
 @dataclass
@@ -484,6 +549,7 @@ class JobController:
         self.ownership = "none"
         self.job: Optional[int] = None
         self.membership: Optional[Membership] = None
+        self._creation: Optional[CreationAssertion] = None
         self._epoch = 0
         self.errors: list[str] = []
 
@@ -541,10 +607,12 @@ class JobController:
         return self.job
 
     def _snapshot(self, process: int, pid: int, creation_time: str,
-                  handle_creation_time: str) -> Membership:
-        """Exactly one verified child, now: its PID and creation identity,
-        the only process the job has ever held, and the job's limits
-        unchanged."""
+                  handle_creation_time: str, creation: Any) -> Membership:
+        """Exactly one verified child, now: assigned at creation (an
+        authenticated assertion, checked before any native call), its PID
+        and creation identity, the only process the job has ever held, the
+        job's limits unchanged, and the complete evidence accepted by
+        P.job_membership_problems."""
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise self._fail("not_in_job", "the expected PID is invalid")
         if not isinstance(creation_time, str) or creation_time != handle_creation_time:
@@ -552,7 +620,11 @@ class JobController:
                                            "the created child's")
         if not C._valid_handle(process):
             raise self._fail("not_in_job", "no valid process handle")
-        if not self.api.is_process_in_job(process, self.job):
+        why = _assertion_problem(creation, self.job, pid, creation_time)
+        if why:
+            raise self._fail("assignment_failed", why)
+        in_job = self.api.is_process_in_job(process, self.job)
+        if not in_job:
             raise self._fail("not_in_job", "IsProcessInJob reports the child outside the job")
         pids = self.api.query_pid_list(self.job)
         if pids != [pid]:
@@ -567,26 +639,38 @@ class JobController:
                                           self.api.handle_inheritable(self.job))
         if problems:
             raise self._fail("job_readback_mismatch", "; ".join(problems))
+        evidence = _membership_evidence(creation, in_job=in_job, member_pids=pids,
+                                        active=accounting["active"], total=accounting["total"])
+        refused = P.job_membership_problems(evidence, expected_pid=pid,
+                                            expected_creation_time=handle_creation_time)
+        if refused:
+            raise self._fail("not_in_job", "membership evidence refused: " + "; ".join(refused))
         self._epoch += 1
-        return Membership(pid, creation_time, self._epoch)
+        return Membership(pid, creation_time, self._epoch, evidence)
 
     def verify_membership(self, process: int, pid: int, creation_time: str,
-                          handle_creation_time: str) -> Membership:
-        """A membership snapshot of exactly one child.  Not a permanent
-        guarantee: termination re-verifies."""
+                          handle_creation_time: str,
+                          creation: Optional[CreationAssertion] = None) -> Membership:
+        """A membership snapshot of exactly one child, with its complete,
+        immutable membership evidence.  `creation` must be the creation
+        path's authenticated assertion of assignment at creation; without
+        it nothing is verified.  Not a permanent guarantee: termination
+        re-verifies."""
         self._gate()
         if self.ownership not in ("owned_empty", "owned_with_child"):
             raise self._fail("not_in_job", f"membership in state {self.ownership}")
         try:
-            self.membership = self._snapshot(process, pid, creation_time, handle_creation_time)
+            self.membership = self._snapshot(process, pid, creation_time, handle_creation_time,
+                                             creation)
         except JobFailure:
             # A child may be in the job: never close it here (that would
             # terminate it); the caller discards through its own handle.
-            self.ownership, self.membership = "retained_unverified", None
+            self.ownership, self.membership, self._creation = "retained_unverified", None, None
             raise
         except Exception as exc:
-            self.ownership, self.membership = "retained_unverified", None
+            self.ownership, self.membership, self._creation = "retained_unverified", None, None
             raise self._fail("not_in_job", f"{type(exc).__name__}: {exc}") from None
+        self._creation = creation
         self.ownership = "owned_with_child"
         return self.membership
 
@@ -617,7 +701,7 @@ class JobController:
                              TerminationRefused)
         try:
             fresh = self._snapshot(process, membership.pid, membership.creation_time,
-                                   handle_creation_time)
+                                   handle_creation_time, self._creation)
         except Exception as exc:
             self.ownership, self.membership = "retained_unverified", None
             raise self._fail("termination_refused", f"membership no longer verified: {exc}",
