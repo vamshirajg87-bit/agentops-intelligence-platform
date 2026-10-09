@@ -888,6 +888,9 @@ class TestNoImplicitAuthorization:
 
 PID, CREATED_AT = 4242, "2026-10-09T12:00:00.000Z"
 SAME = {"pid": PID, "creation_time": CREATED_AT}
+#: Complete job-verification evidence for the expected child.
+MEMBER = SAME | {"in_job": True, "job_assignment": "assigned_at_creation",
+                 "active_processes": 1, "total_processes": 1, "member_pids": [PID]}
 
 
 def _lc(state, event, **evidence):
@@ -899,9 +902,12 @@ def created(assignment="assigned_at_creation"):
                job_assignment=assignment, job_limits_verified=True)
 
 
+def assigned():
+    return _lc(created(), "job_assigned", **MEMBER)
+
+
 def validated():
-    state = _lc(created(), "job_assigned", **SAME, in_job=True)
-    return _lc(state, "validated", **SAME, token_ok=True, image_ok=True)
+    return _lc(assigned(), "validated", **SAME, token_ok=True, image_ok=True)
 
 
 def resumed():
@@ -951,14 +957,13 @@ class TestLifecycleTransitions:
             "exited", P.CONFIRMED_EXITED, "natural_exit", 0, "wait+exit_code", False)
         assert state.execution_history == P.MAY_HAVE_EXECUTED
 
-    def test_assignment_after_creation(self):
-        state = _lc(created("unknown"), "job_assigned", **SAME, in_job=True)
-        assert state.job_assignment == "assigned_before_resume"
-        state = _lc(created(), "job_assigned", **SAME, in_job=True)
-        assert state.job_assignment == "assigned_at_creation"
+    def test_assignment_at_creation_is_the_only_success(self):
+        state = assigned()
+        assert (state.phase, state.job_assignment) == ("job_assigned", "assigned_at_creation")
+        assert state.execution_history == P.NEVER_EXECUTED      # unchanged by membership
 
     def test_assignment_failure_then_verified_discard(self):
-        state = _lc(created("unknown"), "assignment_failed", **SAME, reason="access denied")
+        state = _lc(created(), "assignment_failed", **SAME, reason="access denied")
         assert state.job_assignment == "assignment_failed" and state.phase == "assignment_failed"
         state = _lc(state, "terminate_result", **SAME, cause="discarded_before_resume",
                     api_ok=True, signaled=True, exit_code=P.DISCARD_EXIT_CODE)
@@ -966,8 +971,7 @@ class TestLifecycleTransitions:
             P.CONFIRMED_EXITED, "discarded_before_resume", P.NEVER_EXECUTED)
 
     def test_rejected_validation_is_discarded(self):
-        state = _lc(created(), "job_assigned", **SAME, in_job=True)
-        state = _lc(state, "validated", **SAME, token_ok=False, image_ok=True)
+        state = _lc(assigned(), "validated", **SAME, token_ok=False, image_ok=True)
         assert state.phase == "rejected"
         with pytest.raises(P.LifecycleError, match="not allowed in phase rejected"):
             _lc(state, "resume_result", **SAME, previous=1, intent_durable=True)
@@ -1052,22 +1056,20 @@ class TestLifecycleTransitions:
         assert state.execution_history == P.NEVER_EXECUTED and state.liveness == P.STATE_UNKNOWN
 
     @pytest.mark.parametrize("event, evidence", [
-        ("job_assigned", {"pid": 999, "creation_time": CREATED_AT, "in_job": True}),
-        ("job_assigned", {"pid": PID, "creation_time": "2026-10-09T12:00:01.000Z",
-                          "in_job": True}),
+        ("job_assigned", MEMBER | {"pid": 999}),
+        ("job_assigned", MEMBER | {"creation_time": "2026-10-09T12:00:01.000Z"}),
         ("validated", {"pid": 999, "creation_time": CREATED_AT, "token_ok": True,
                        "image_ok": True}),
     ])
     def test_pid_and_creation_time_mismatches(self, event, evidence):
-        state = created() if event == "job_assigned" else _lc(created(), "job_assigned",
-                                                              **SAME, in_job=True)
+        state = created() if event == "job_assigned" else assigned()
         with pytest.raises(P.LifecycleError, match="another process"):
             P.lifecycle_transition(state, event, evidence)
         with pytest.raises(P.LifecycleError, match="another PID"):
             _lc(_lc(resumed(), "parent_lost"), "recovery_inspection", pid=1, found=False)
 
     @pytest.mark.parametrize("state_factory, event, evidence, message", [
-        (P.LifecycleState, "job_assigned", SAME | {"in_job": True}, "not allowed"),
+        (P.LifecycleState, "job_assigned", MEMBER, "not allowed"),
         (P.LifecycleState, "resume_result", SAME | {"previous": 1, "intent_durable": True},
          "not allowed"),
         (created, "created", {"pid": PID, "creation_time": CREATED_AT,
@@ -1214,6 +1216,290 @@ class TestJobLimits:
     def test_malformed_readback(self):
         assert P.job_limits_problems(None) == ["no job read-back"]
         assert P.job_limits_problems({"limit_flags": "x"}) == ["limit_flags missing or malformed"]
+
+
+# ---------------------------------------------------------------------------
+# Assignment policy, configuration and membership validation (J-34)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_native(monkeypatch):
+    """Any native library load fails the test."""
+    import ctypes
+
+    def refuse(*args, **kwargs):
+        raise LiveAccessAttempt("a native library load attempted")
+
+    monkeypatch.setattr(ctypes, "WinDLL", refuse)
+    monkeypatch.setattr(ctypes, "CDLL", refuse)
+
+
+GOOD_CONFIG = {"limit_flags": P.JOB_LIMIT_POLICY["required_flags"], "active_process_limit": 1,
+               "job_handle_inheritable": False}
+
+
+def membership(**changes):
+    evidence = {key: value for key, value in (MEMBER | changes).items()
+                if value is not _ABSENT}
+    return P.job_membership_problems(evidence, expected_pid=PID,
+                                     expected_creation_time=CREATED_AT)
+
+
+_ABSENT = object()
+
+
+@pytest.mark.usefixtures("no_native")
+class TestAssignmentPolicy:
+    def test_accepted_assignment_reaches_resume(self):
+        assert P.ACCEPTED_JOB_ASSIGNMENT == "assigned_at_creation"
+        assert "assigned_before_resume" in P.JOB_ASSIGNMENTS        # recordable, never accepted
+        state = resumed()
+        assert (state.phase, state.job_assignment, state.execution_history) == (
+            "resumed", "assigned_at_creation", P.MAY_HAVE_EXECUTED)
+
+    def test_assigned_before_resume_refused_everywhere(self):
+        with pytest.raises(P.LifecycleError, match="after creation is refused"):
+            created("assigned_before_resume")
+        with pytest.raises(P.LifecycleError, match="assigned_before_resume\\) is refused"):
+            _lc(created(), "job_assigned", **(MEMBER | {"job_assignment":
+                                                         "assigned_before_resume"}))
+        forged = P.LifecycleState(phase="created_suspended", process_created=True, pid=PID,
+                                  creation_time=CREATED_AT,
+                                  job_assignment="assigned_before_resume",
+                                  job_limits_verified=True,
+                                  execution_history=P.NEVER_EXECUTED,
+                                  liveness=P.ALIVE_AT_LAST_CHECK, handles_retained=True)
+        with pytest.raises(P.LifecycleError, match="assignment after creation is refused"):
+            _lc(forged, "job_assigned", **MEMBER)
+
+    @pytest.mark.parametrize("value", ["unknown", "not_created", "assignment_failed",
+                                       "assigned_before_resume"])
+    def test_unknown_or_unsuccessful_assignment_refused_at_creation(self, value):
+        with pytest.raises(P.LifecycleError, match="job_assignment assigned_at_creation"):
+            created(value)
+
+    def test_missing_assignment_refused(self):
+        with pytest.raises(P.LifecycleError, match="job_assignment"):
+            _lc(P.LifecycleState(), "created", pid=PID, creation_time=CREATED_AT,
+                job_limits_verified=True)
+        evidence = {k: v for k, v in MEMBER.items() if k != "job_assignment"}
+        with pytest.raises(P.LifecycleError, match="missing: job_assignment"):
+            _lc(created(), "job_assigned", **evidence)
+
+    @pytest.mark.parametrize("value", [None, 1, True, ["assigned_at_creation"],
+                                       "ASSIGNED_AT_CREATION", "assigned_at_creation ",
+                                       b"assigned_at_creation"])
+    def test_malformed_assignment_refused(self, value):
+        with pytest.raises(P.LifecycleError, match="job_assignment"):
+            created(value)
+        with pytest.raises(P.LifecycleError, match="job_assignment"):
+            _lc(created(), "job_assigned", **(MEMBER | {"job_assignment": value}))
+
+    @pytest.mark.parametrize("assignment, verified", [
+        ("assigned_before_resume", True), ("unknown", True), ("assignment_failed", True),
+        ("not_created", True), ("assigned_at_creation", False)])
+    def test_no_advancement_without_assignment_at_creation(self, assignment, verified):
+        base = dict(process_created=True, pid=PID, creation_time=CREATED_AT,
+                    job_assignment=assignment, job_limits_verified=verified,
+                    execution_history=P.NEVER_EXECUTED, liveness=P.ALIVE_AT_LAST_CHECK,
+                    handles_retained=True)
+        with pytest.raises(P.LifecycleError, match="assigned to a verified job at creation"):
+            _lc(P.LifecycleState(phase="job_assigned", **base), "validated", **SAME,
+                token_ok=True, image_ok=True)
+        with pytest.raises(P.LifecycleError, match="assigned to a verified job at creation"):
+            _lc(P.LifecycleState(phase="validated", **base), "resume_result", **SAME,
+                previous=1, intent_durable=True)
+
+    def test_refused_membership_keeps_history_and_allows_discard(self):
+        state = created()
+        with pytest.raises(P.LifecycleError, match="membership is not verified"):
+            _lc(state, "job_assigned", **(MEMBER | {"total_processes": 2}))
+        assert (state.phase, state.execution_history) == ("created_suspended",
+                                                          P.NEVER_EXECUTED)
+        state = _lc(state, "assignment_failed", **SAME, reason="membership refused")
+        state = _lc(state, "terminate_result", **SAME, cause="discarded_before_resume",
+                    api_ok=True, signaled=True, exit_code=P.DISCARD_EXIT_CODE)
+        assert (state.liveness, state.execution_history, state.termination_cause) == (
+            P.CONFIRMED_EXITED, P.NEVER_EXECUTED, "discarded_before_resume")
+
+    def test_failure_and_recovery_rules_unchanged(self):
+        expected = {
+            "assignment_failed": ("discard_before_resume", "discard", P.NEVER_EXECUTED),
+            "not_in_job": ("discard_before_resume", "discard", P.NEVER_EXECUTED),
+            "nested_job_incompatible": ("prelaunch_refusal", "none", None),
+            "job_readback_mismatch": ("prelaunch_refusal", "none", None),
+            "parent_crash": ("unknown_liveness", "recovery_inspection", "unchanged"),
+            "resume_api_failed": ("possible_execution", "bounded_termination",
+                                  P.STATE_UNKNOWN),
+        }
+        for key, (action, containment, history) in expected.items():
+            entry = P.FAILURE_ACTIONS[key]
+            assert (entry["action_class"], entry["containment"],
+                    entry["execution_history"]) == (action, containment, history), key
+        assert len(P.FAILURE_ACTIONS) == 19
+        state = _lc(assigned(), "parent_lost")
+        assert state.execution_history == P.NEVER_EXECUTED and state.liveness == P.STATE_UNKNOWN
+
+    def test_lifecycle_state_shape_unchanged(self):
+        assert list(P.LifecycleState().as_dict()) == [
+            "phase", "process_created", "pid", "creation_time", "job_assignment",
+            "job_limits_verified", "execution_history", "liveness", "termination_cause",
+            "exit_code", "exit_evidence", "handles_retained", "cleanup_errors"]
+
+
+@pytest.mark.usefixtures("no_native")
+class TestConfigurationValidation:
+    def test_good_configuration(self):
+        assert P.job_configuration_problems(GOOD_CONFIG) == []
+
+    @pytest.mark.parametrize("flags, message", [
+        (0x8 | 0x400, "required limit flags missing: 0x2000"),
+        (0x2000 | 0x400, "required limit flags missing: 0x8"),
+        (0x2000 | 0x8, "required limit flags missing: 0x400"),
+        (P.JOB_LIMIT_POLICY["required_flags"] | 0x800, "breakaway flags present: 0x800"),
+        (P.JOB_LIMIT_POLICY["required_flags"] | 0x1000, "breakaway flags present: 0x1000"),
+        (P.JOB_LIMIT_POLICY["required_flags"] | 0x2, "unexpected limit flags: 0x2"),
+    ])
+    def test_required_and_prohibited_flags(self, flags, message):
+        problems = P.job_configuration_problems(GOOD_CONFIG | {"limit_flags": flags})
+        assert problems == [message]
+
+    @pytest.mark.parametrize("change, message", [
+        ({"active_process_limit": 0}, "active process limit is 0, not 1"),
+        ({"active_process_limit": 2}, "active process limit is 2, not 1"),
+        ({"active_process_limit": True}, "active process limit is True, not 1"),
+        ({"active_process_limit": None}, "active process limit is None, not 1"),
+        ({"job_handle_inheritable": True}, "the job handle is (or may be) inheritable"),
+        ({"job_handle_inheritable": None}, "the job handle is (or may be) inheritable"),
+        ({"job_handle_inheritable": 0}, "the job handle is (or may be) inheritable"),
+    ])
+    def test_limit_and_inheritance_failures(self, change, message):
+        assert P.job_configuration_problems(GOOD_CONFIG | change) == [message]
+
+    def test_malformed_configuration(self):
+        assert P.job_configuration_problems(None) == ["no job read-back"]
+        for flags in ("x", None, -1, True, 1.0):
+            assert P.job_configuration_problems(GOOD_CONFIG | {"limit_flags": flags}) == [
+                "limit_flags missing or malformed"]
+
+    def test_configuration_ignores_membership(self):
+        for extra in ({}, {"in_job_before_resume": False}, {"in_job_before_resume": True}):
+            assert P.job_configuration_problems(GOOD_CONFIG | extra) == []
+
+    @pytest.mark.parametrize("change", [
+        {}, {"limit_flags": 0x408}, {"limit_flags": 0x2408 | 0x1800},
+        {"active_process_limit": 3}, {"job_handle_inheritable": True},
+        {"in_job_before_resume": False}, {"in_job_before_resume": None},
+        {"limit_flags": "x", "in_job_before_resume": False},
+    ])
+    def test_original_interface_is_compatible(self, change):
+        readback = GOOD_READBACK | change
+        legacy = [] if readback.get("in_job_before_resume") is True else [
+            "job membership was not verified before resume"]
+        config = P.job_configuration_problems(readback)
+        expected = config if config == ["limit_flags missing or malformed"] else config + legacy
+        assert P.job_limits_problems(readback) == expected
+
+    @pytest.mark.parametrize("readback", [
+        {"limit_flags": 0x2408, "active_process_limit": 1},
+        {"limit_flags": 0x0408, "active_process_limit": 1},
+        {"limit_flags": 0x2408 | 0x800, "active_process_limit": 1},
+        {"limit_flags": 0x2408 | 0x2, "active_process_limit": 1},
+        {"limit_flags": 0x2408, "active_process_limit": 2},
+        {"limit_flags": 0x2408, "active_process_limit": True},
+        {"limit_flags": None, "active_process_limit": 1},
+        {"limit_flags": -1, "active_process_limit": None},
+        {},
+    ])
+    @pytest.mark.parametrize("inheritable", [False, True, None])
+    def test_equivalent_to_the_backend_rules(self, readback, inheritable):
+        import win32_job as W                                      # backend: unchanged here
+        planner = P.job_configuration_problems({**readback, "job_handle_inheritable":
+                                                inheritable})
+        assert W.configuration_problems(readback, inheritable) == planner
+
+
+@pytest.mark.usefixtures("no_native")
+class TestMembershipValidation:
+    def test_complete_evidence(self):
+        assert membership() == []
+        assert membership(member_pids=(PID,)) == []
+
+    @pytest.mark.parametrize("total, ok", [(0, False), (1, True), (2, False)])
+    def test_total_processes(self, total, ok):
+        problems = membership(total_processes=total)
+        assert (problems == []) is ok
+        if not ok:
+            assert problems == [f"{total} processes have been in the job, not 1"]
+
+    @pytest.mark.parametrize("active", [0, 2])
+    def test_active_processes(self, active):
+        assert membership(active_processes=active) == [f"{active} active processes, not 1"]
+
+    @pytest.mark.parametrize("field", P.JOB_MEMBERSHIP_FIELDS)
+    def test_each_missing_field_refuses(self, field):
+        assert membership(**{field: _ABSENT}) == [f"membership evidence missing: {field}"]
+
+    def test_non_mapping_and_empty(self):
+        assert P.job_membership_problems(None, expected_pid=PID,
+                                         expected_creation_time=CREATED_AT) == [
+            "no membership evidence"]
+        assert P.job_membership_problems({}, expected_pid=PID,
+                                         expected_creation_time=CREATED_AT) == [
+            "membership evidence missing: " + ", ".join(P.JOB_MEMBERSHIP_FIELDS)]
+
+    @pytest.mark.parametrize("changes, message", [
+        ({"active_processes": True}, "active_processes is malformed"),
+        ({"active_processes": "1"}, "active_processes is malformed"),
+        ({"total_processes": None}, "total_processes is malformed"),
+        ({"total_processes": 1.0}, "total_processes is malformed"),
+        ({"in_job": "yes"}, "in_job is malformed"),
+        ({"in_job": None}, "in_job is malformed"),
+        ({"in_job": False}, "the child is not in the job"),
+        ({"member_pids": None}, "member_pids is malformed"),
+        ({"member_pids": str(PID)}, "member_pids is malformed"),
+        ({"member_pids": [True]}, "member_pids is malformed"),
+        ({"member_pids": []}, "the job members are [], not [4242]"),
+        ({"member_pids": [PID, 7]}, "the job members are [4242, 7], not [4242]"),
+        ({"member_pids": [7]}, "the job members are [7], not [4242]"),
+        ({"job_assignment": "unknown"}, "job_assignment is unknown, not assigned_at_creation"),
+        ({"job_assignment": "bogus"}, "job_assignment is malformed"),
+    ])
+    def test_malformed_or_contradictory_evidence(self, changes, message):
+        assert any(message in problem for problem in membership(**changes))
+
+    @pytest.mark.parametrize("changes, message", [
+        ({"pid": 999}, "the PID 999 is not the expected child's"),
+        ({"pid": True}, "the PID True is not the expected child's"),
+        ({"pid": str(PID)}, "is not the expected child's"),
+        ({"creation_time": "2026-10-09T12:00:01.000Z"}, "creation time is not the expected"),
+        ({"creation_time": None}, "creation time is not the expected"),
+    ])
+    def test_identity_mismatch(self, changes, message):
+        assert any(message in problem for problem in membership(**changes))
+
+    @pytest.mark.parametrize("expected_pid, expected_time", [
+        (None, CREATED_AT), (0, CREATED_AT), (True, CREATED_AT), (PID, "noon"), (PID, None)])
+    def test_invalid_expected_identity_refuses(self, expected_pid, expected_time):
+        problems = P.job_membership_problems(MEMBER, expected_pid=expected_pid,
+                                             expected_creation_time=expected_time)
+        assert "no valid expected child identity" in problems
+
+    @pytest.mark.parametrize("changes", [
+        {"total_processes": 0}, {"total_processes": 2}, {"active_processes": 2},
+        {"member_pids": [PID, 7]}, {"in_job": "true"}, {"total_processes": _ABSENT},
+    ])
+    def test_lifecycle_refuses_bad_membership(self, changes):
+        evidence = {k: v for k, v in (MEMBER | changes).items() if v is not _ABSENT}
+        with pytest.raises(P.LifecycleError):
+            P.lifecycle_transition(created(), "job_assigned", evidence)
+
+    def test_validators_are_pure(self):
+        start = SOURCE.index("def job_configuration_problems")
+        section = SOURCE[start:SOURCE.index("#: Durable evidence stages")]
+        for word in ("ctypes", "WinDLL", "subprocess", "socket", "open(", "Path(", "os.",
+                     "time.", "harness.", "import "):
+            assert word not in section, word
 
 
 STAGES = list(P.LIFECYCLE_STAGES)

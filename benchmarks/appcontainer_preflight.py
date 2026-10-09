@@ -1155,6 +1155,10 @@ EXECUTION_HISTORIES: tuple[str, ...] = (NEVER_EXECUTED, MAY_HAVE_EXECUTED, STATE
 LIVENESS_STATES: tuple[str, ...] = (CONFIRMED_EXITED, ALIVE_AT_LAST_CHECK, STATE_UNKNOWN)
 JOB_ASSIGNMENTS: tuple[str, ...] = ("not_created", "assigned_at_creation",
                                     "assigned_before_resume", "assignment_failed", "unknown")
+#: The only successful job assignment: the child joined the job AT creation
+#: (PROC_THREAD_ATTRIBUTE_JOB_LIST).  The other JOB_ASSIGNMENTS values stay
+#: recordable vocabulary; "assigned_before_resume" is always refused.
+ACCEPTED_JOB_ASSIGNMENT: str = "assigned_at_creation"
 TERMINATION_CAUSES: tuple[str, ...] = (
     "natural_exit", "discarded_before_resume", "job_terminated_timeout",
     "job_terminated_operator", "job_closed_parent_exit", "unknown")
@@ -1261,6 +1265,15 @@ def _add_error(state: LifecycleState, message: str) -> tuple[str, ...]:
     return state.cleanup_errors + (message,)
 
 
+def _require_assigned_at_creation(state: LifecycleState, event: str) -> None:
+    """Membership, validation and resume all need a child that joined a
+    verified job at creation; nothing else is ever upgraded to that."""
+    if state.job_assignment != ACCEPTED_JOB_ASSIGNMENT or state.job_limits_verified is not True:
+        raise LifecycleError(f"{event} needs a child assigned to a verified job at creation "
+                             f"(job_assignment {state.job_assignment!r}); assignment after "
+                             "creation is refused")
+
+
 #: Phases in which the child was not (validly) resumed yet.
 _BEFORE_RESUME = ("created_suspended", "job_assigned", "assignment_failed", "validated",
                   "rejected", "resume_rejected")
@@ -1291,9 +1304,10 @@ def lifecycle_transition(state: LifecycleState, event: str,
             raise LifecycleError("a child may only be created after the job limits are "
                                  "verified")
         assignment = evidence.get("job_assignment")
-        if assignment not in ("assigned_at_creation", "unknown"):
-            raise LifecycleError("created needs job_assignment assigned_at_creation or "
-                                 "unknown (assignment pending)")
+        if not isinstance(assignment, str) or assignment != ACCEPTED_JOB_ASSIGNMENT:
+            raise LifecycleError(f"created needs job_assignment {ACCEPTED_JOB_ASSIGNMENT} (the "
+                                 "child joins the job at creation); assignment pending or "
+                                 "after creation is refused")
         return replace(state, phase="created_suspended", process_created=True, pid=pid,
                        creation_time=creation, job_assignment=assignment,
                        job_limits_verified=True, execution_history=NEVER_EXECUTED,
@@ -1304,9 +1318,12 @@ def lifecycle_transition(state: LifecycleState, event: str,
         _same_process(state, evidence)
         if _evidence_bool(evidence, "in_job") is not True:
             raise LifecycleError("job_assigned needs in_job true; use assignment_failed")
-        assignment = ("assigned_before_resume" if state.job_assignment == "unknown"
-                      else state.job_assignment)
-        return replace(state, phase="job_assigned", job_assignment=assignment)
+        _require_assigned_at_creation(state, event)
+        problems = job_membership_problems(evidence, expected_pid=state.pid,
+                                           expected_creation_time=state.creation_time)
+        if problems:
+            raise LifecycleError("job membership is not verified: " + "; ".join(problems))
+        return replace(state, phase="job_assigned")
 
     if event == "assignment_failed":
         _require_phase(state, event, ("created_suspended",))
@@ -1318,12 +1335,14 @@ def lifecycle_transition(state: LifecycleState, event: str,
     if event == "validated":
         _require_phase(state, event, ("job_assigned",))
         _same_process(state, evidence)
+        _require_assigned_at_creation(state, event)
         ok = _evidence_bool(evidence, "token_ok") and _evidence_bool(evidence, "image_ok")
         return replace(state, phase="validated" if ok else "rejected")
 
     if event == "resume_result":
         _require_phase(state, event, ("validated",))
         _same_process(state, evidence)
+        _require_assigned_at_creation(state, event)
         if _evidence_bool(evidence, "intent_durable") is not True:
             raise LifecycleError("no resume without durable resume-intent evidence")
         has_error = evidence.get("error") is not None
@@ -1505,15 +1524,19 @@ JOB_LIMIT_POLICY: Mapping[str, Any] = {
 }
 
 
-def job_limits_problems(readback: Any) -> list[str]:
-    """Why a job's read-back limits (as a future backend would report them)
-    do not match JOB_LIMIT_POLICY; empty when they do."""
+_MALFORMED_FLAGS = "limit_flags missing or malformed"
+
+
+def job_configuration_problems(readback: Any) -> list[str]:
+    """Why a job's configuration (limit_flags, active_process_limit,
+    job_handle_inheritable) does not match JOB_LIMIT_POLICY; empty when it
+    does.  Membership is not configuration (job_membership_problems)."""
     if not isinstance(readback, Mapping):
         return ["no job read-back"]
-    problems = []
     flags = readback.get("limit_flags")
     if isinstance(flags, bool) or not isinstance(flags, int) or flags < 0:
-        return ["limit_flags missing or malformed"]
+        return [_MALFORMED_FLAGS]
+    problems = []
     required, prohibited = JOB_LIMIT_POLICY["required_flags"], JOB_LIMIT_POLICY["prohibited_flags"]
     if flags & required != required:
         problems.append(f"required limit flags missing: {required & ~flags:#x}")
@@ -1524,8 +1547,83 @@ def job_limits_problems(readback: Any) -> list[str]:
     limit = readback.get("active_process_limit")
     if limit != JOB_LIMIT_POLICY["active_process_limit"] or isinstance(limit, bool):
         problems.append(f"active process limit is {limit!r}, not 1")
-    if readback.get("job_handle_inheritable") is not False:
+    if readback.get("job_handle_inheritable") is not JOB_LIMIT_POLICY["job_handle_inheritable"]:
         problems.append("the job handle is (or may be) inheritable")
+    return problems
+
+
+#: Every field the membership evidence must carry; nothing is defaulted.
+JOB_MEMBERSHIP_FIELDS: tuple[str, ...] = (
+    "job_assignment", "in_job", "pid", "creation_time", "active_processes",
+    "total_processes", "member_pids")
+
+
+def _exact_count(evidence: Mapping[str, Any], key: str, what: str) -> Optional[str]:
+    value = evidence[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"{key} is malformed ({value!r})"
+    if value != 1:
+        return f"{value} {what}, not 1"
+    return None
+
+
+def job_membership_problems(evidence: Any, *, expected_pid: Any,
+                            expected_creation_time: Any) -> list[str]:
+    """Why the job-verification evidence does not prove that exactly the
+    expected child - and never any other process - is in the job it joined
+    at creation; empty when it does.  Missing fields are reported, never
+    defaulted."""
+    if not isinstance(evidence, Mapping):
+        return ["no membership evidence"]
+    missing = [key for key in JOB_MEMBERSHIP_FIELDS if key not in evidence]
+    if missing:
+        return ["membership evidence missing: " + ", ".join(missing)]
+    problems = []
+    if isinstance(expected_pid, bool) or not isinstance(expected_pid, int) or expected_pid <= 0 \
+            or _parse_utc(expected_creation_time) is None:
+        problems.append("no valid expected child identity")
+    assignment = evidence["job_assignment"]
+    if not isinstance(assignment, str) or assignment not in JOB_ASSIGNMENTS:
+        problems.append(f"job_assignment is malformed ({assignment!r})")
+    elif assignment == "assigned_before_resume":
+        problems.append("assignment after creation (assigned_before_resume) is refused")
+    elif assignment != ACCEPTED_JOB_ASSIGNMENT:
+        problems.append(f"job_assignment is {assignment}, not {ACCEPTED_JOB_ASSIGNMENT}")
+    in_job = evidence["in_job"]
+    if not isinstance(in_job, bool):
+        problems.append(f"in_job is malformed ({in_job!r})")
+    elif not in_job:
+        problems.append("the child is not in the job")
+    pid = evidence["pid"]
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid != expected_pid:
+        problems.append(f"the PID {pid!r} is not the expected child's")
+    if not isinstance(evidence["creation_time"], str) \
+            or evidence["creation_time"] != expected_creation_time:
+        problems.append("the creation time is not the expected child's")
+    for key, what in (("active_processes", "active processes"),
+                      ("total_processes", "processes have been in the job")):
+        problem = _exact_count(evidence, key, what)
+        if problem:
+            problems.append(problem)
+    members = evidence["member_pids"]
+    if not isinstance(members, (list, tuple)) or any(
+            isinstance(m, bool) or not isinstance(m, int) for m in members):
+        problems.append(f"member_pids is malformed ({members!r})")
+    elif list(members) != [expected_pid]:
+        problems.append(f"the job members are {list(members)}, not [{expected_pid!r}]")
+    return problems
+
+
+def job_limits_problems(readback: Any) -> list[str]:
+    """Backward-compatible check: the configuration plus the legacy
+    in_job_before_resume flag.  New code checks configuration
+    (job_configuration_problems) and membership (job_membership_problems)
+    separately."""
+    if not isinstance(readback, Mapping):
+        return ["no job read-back"]
+    problems = job_configuration_problems(readback)
+    if problems == [_MALFORMED_FLAGS]:
+        return problems
     if readback.get("in_job_before_resume") is not True:
         problems.append("job membership was not verified before resume")
     return problems
