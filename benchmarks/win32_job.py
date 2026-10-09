@@ -20,6 +20,16 @@ termination behaviour changes.
                    the lifecycle TERMINATION_POLICY is design-only, and a
                    close that never closes a job that may hold a live child
                    (closing it would terminate the child).
+    planning       pure helpers for the future creation path: the
+                   immutable PROC_THREAD_ATTRIBUTE plan (SECURITY_CAPABILITIES,
+                   HANDLE_LIST, JOB_LIST) and the attribute-list sizing
+                   contract.  A child joins the job only AT creation
+                   (JOB_LIST); there is no after-creation assignment API
+                   here, so there is nothing to fall back to.
+    parent job     inventory through the injected API: IsProcessInJob on
+                   the current-process pseudo-handle with a NULL job is the
+                   only presence test; a launch may proceed only on a
+                   definite FALSE.
 
 There is no automatic retry and no cleanup through object destruction.
 
@@ -31,7 +41,8 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Optional
 
 HERE: Path = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -44,9 +55,20 @@ import calibrate_generator as C  # noqa: E402
 JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
 JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-#: For the future creation path (UpdateProcThreadAttribute); unused here.
+#: PROC_THREAD_ATTRIBUTE values (documented) of the future creation path.
+PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
+PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
 HANDLE_FLAG_INHERIT = 0x00000001
+#: The sizing call of InitializeProcThreadAttributeList must fail with this.
+ERROR_INSUFFICIENT_BUFFER = 122
+#: Upper bound for an attribute list's size (fail closed beyond it).
+ATTRIBUTE_LIST_SIZE_LIMIT = 4096
+#: GetCurrentProcess() pseudo-handle; valid only as "this process", never
+#: as an owned handle (the handle-validity check rejects it on purpose).
+CURRENT_PROCESS = -1
+#: The FAILURE_ACTIONS key of every parent-job refusal.
+PARENT_JOB_REFUSAL = "nested_job_incompatible"
 #: How many member PIDs a membership query can return; more is an error.
 PID_LIST_CAPACITY = 8
 #: The only lifecycle policy under which termination may be requested.
@@ -141,7 +163,6 @@ def _job_signatures(t: Any) -> dict[str, tuple[Any, list[Any]]]:
         "SetInformationJobObject": (w.BOOL, [w.HANDLE, c.c_int, c.c_void_p, w.DWORD]),
         "QueryInformationJobObject": (w.BOOL, [w.HANDLE, c.c_int, c.c_void_p, w.DWORD,
                                                c.POINTER(w.DWORD)]),
-        "AssignProcessToJobObject": (w.BOOL, [w.HANDLE, w.HANDLE]),
         "IsProcessInJob": (w.BOOL, [w.HANDLE, w.HANDLE, c.POINTER(w.BOOL)]),
         "TerminateJobObject": (w.BOOL, [w.HANDLE, w.UINT]),
         "GetHandleInformation": (w.BOOL, [w.HANDLE, c.POINTER(w.DWORD)]),
@@ -205,7 +226,7 @@ class CtypesJobApi:
                 t.ctypes.sizeof(info)):
             raise self._error("SetInformationJobObject")
 
-    def _query(self, job: int, information_class: int, buffer: Any) -> int:
+    def _query(self, job: Optional[int], information_class: int, buffer: Any) -> int:
         t = _job_types()
         returned = t.w.DWORD(0)
         if not self._api("QueryInformationJobObject")(
@@ -217,7 +238,7 @@ class CtypesJobApi:
                                f"returned length {returned.value} exceeds the buffer")
         return int(returned.value)
 
-    def query_limits(self, job: int) -> dict[str, int]:
+    def query_limits(self, job: Optional[int]) -> dict[str, int]:
         t = _job_types()
         info = t.EXTENDED()
         length = self._query(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, info)
@@ -257,11 +278,7 @@ class CtypesJobApi:
         ids = (c.c_size_t * listed).from_buffer(buffer, offset) if listed else []
         return [int(pid) for pid in ids]
 
-    def assign(self, job: int, process: int) -> None:
-        if not self._api("AssignProcessToJobObject")(job, process):
-            raise self._error("AssignProcessToJobObject")
-
-    def is_process_in_job(self, process: int, job: int) -> bool:
+    def _in_job(self, process: int, job: Optional[int]) -> bool:
         t = _job_types()
         result = t.w.BOOL(0)
         if not self._api("IsProcessInJob")(process, job, t.ctypes.byref(result)):
@@ -270,6 +287,20 @@ class CtypesJobApi:
             raise C.Win32Error("IsProcessInJob", f"malformed result {result.value}")
         return result.value == 1
 
+    def is_process_in_job(self, process: int, job: int) -> bool:
+        return self._in_job(process, job)
+
+    def parent_in_any_job(self) -> bool:
+        """IsProcessInJob(GetCurrentProcess(), NULL): documented to report
+        whether this process runs under ANY job - the presence test."""
+        return self._in_job(CURRENT_PROCESS, None)
+
+    def current_job_limits(self) -> dict[str, int]:
+        """Diagnostics only: QueryInformationJobObject with a NULL job reads
+        the calling process's immediate job, and is meaningful only when
+        there is one.  It is never a presence test."""
+        return self.query_limits(None)
+
     def terminate_job(self, job: int, exit_code: int) -> None:
         if not self._api("TerminateJobObject")(job, exit_code):
             raise self._error("TerminateJobObject")
@@ -277,6 +308,141 @@ class CtypesJobApi:
     def close(self, handle: int) -> None:
         if not self._api("CloseHandle")(handle):
             raise self._error("CloseHandle")
+
+
+# ---------------------------------------------------------------------------
+# Creation planning (pure) and parent-job inventory
+# ---------------------------------------------------------------------------
+
+class PlanRefused(C.CalibrationError):
+    """A creation plan that must not be used; nothing native was called."""
+
+
+@dataclass(frozen=True)
+class AttributeEntry:
+    attribute: int
+    name: str
+    handles: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class AttributePlan:
+    """The PROC_THREAD_ATTRIBUTE entries of one creation, in update order.
+    The attribute-list count is derived from it, never written down."""
+    entries: tuple[AttributeEntry, ...]
+
+    @property
+    def count(self) -> int:
+        return len(self.entries)
+
+
+def job_list_attribute_plan(job: Any, stdout: Any, stderr: Any) -> AttributePlan:
+    """SECURITY_CAPABILITIES, HANDLE_LIST (stdout, stderr) and JOB_LIST
+    (job).  Every handle must be valid and distinct, and the job handle is
+    never in the inherited handle list."""
+    for label, handle in (("job", job), ("stdout", stdout), ("stderr", stderr)):
+        if not C._valid_handle(handle):
+            raise PlanRefused(f"the {label} handle is invalid")
+    if job in (stdout, stderr):
+        raise PlanRefused("the job handle must never be in the inherited handle list")
+    if stdout == stderr:
+        raise PlanRefused("stdout and stderr must be distinct handles")
+    return AttributePlan((
+        AttributeEntry(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, "security_capabilities", ()),
+        AttributeEntry(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, "handle_list", (stdout, stderr)),
+        AttributeEntry(PROC_THREAD_ATTRIBUTE_JOB_LIST, "job_list", (job,)),
+    ))
+
+
+def validate_attribute_list_size(first_result: Any, last_error: Any, size: Any) -> int:
+    """The sizing call InitializeProcThreadAttributeList(NULL, count, 0,
+    &size) must return FALSE with ERROR_INSUFFICIENT_BUFFER and a size in
+    (0, ATTRIBUTE_LIST_SIZE_LIMIT]; anything else refuses."""
+    if isinstance(first_result, bool):
+        failed = first_result is False
+    else:
+        failed = isinstance(first_result, int) and first_result == 0
+    if not failed:
+        raise PlanRefused(f"the sizing call returned {first_result!r}, not FALSE")
+    if isinstance(last_error, bool) or last_error != ERROR_INSUFFICIENT_BUFFER \
+            or not isinstance(last_error, int):
+        raise PlanRefused(f"the sizing call failed with {last_error!r}, not "
+                          f"ERROR_INSUFFICIENT_BUFFER ({ERROR_INSUFFICIENT_BUFFER})")
+    if isinstance(size, bool) or not isinstance(size, int) \
+            or not 0 < size <= ATTRIBUTE_LIST_SIZE_LIMIT:
+        raise PlanRefused(f"implausible attribute-list size {size!r}")
+    return size
+
+
+@dataclass(frozen=True)
+class ParentJobInventory:
+    in_job: Optional[bool]                     # None: unknown
+    decision: str                              # "proceed" or "refuse"
+    key: Optional[str]                         # FAILURE_ACTIONS key when refused
+    reason: str
+    diagnostics: Optional[Mapping[str, Any]]   # immediate-job limits; informational
+
+
+def parent_job_decision(in_job: Any, diagnostics: Any = None,
+                        error: Optional[str] = None) -> ParentJobInventory:
+    """Pure.  Proceed only on a definite False; True, an error or a
+    malformed value refuses.  Diagnostics never change the decision."""
+    frozen = MappingProxyType(dict(diagnostics)) if isinstance(diagnostics, Mapping) else None
+    if in_job is False and error is None:
+        return ParentJobInventory(False, "proceed", None, "the parent runs in no job", frozen)
+    if in_job is True and error is None:
+        return ParentJobInventory(True, "refuse", PARENT_JOB_REFUSAL,
+                                  "the parent already runs in a job; nested jobs are not "
+                                  "accepted", frozen)
+    why = error if error is not None else f"malformed result {in_job!r}"
+    return ParentJobInventory(None, "refuse", PARENT_JOB_REFUSAL,
+                              f"the parent's job state is unknown ({why})", frozen)
+
+
+def parent_job_inventory(api: Any) -> ParentJobInventory:
+    """Through the injected API.  The immediate job's limits are read only
+    after the presence test reported True, and only as diagnostics."""
+    try:
+        in_job = api.parent_in_any_job()
+    except C.ExecutionDisabled:
+        raise
+    except Exception as exc:
+        return parent_job_decision(None, error=f"{type(exc).__name__}: {exc}")
+    if in_job is not True:
+        return parent_job_decision(in_job)
+    try:
+        diagnostics = dict(api.current_job_limits())
+    except C.ExecutionDisabled:
+        raise
+    except Exception as exc:
+        diagnostics = {"error": f"{type(exc).__name__}: {exc}"}
+    return parent_job_decision(True, diagnostics)
+
+
+def configuration_problems(readback: Any, inheritable: Any) -> list[str]:
+    """The job's configuration against JOB_LIMIT_POLICY: limit flags, the
+    active process limit and handle inheritance.  Membership is not
+    configuration; it is verified on the child, separately."""
+    if not isinstance(readback, Mapping):
+        return ["no job read-back"]
+    policy = P.JOB_LIMIT_POLICY
+    flags = readback.get("limit_flags")
+    if isinstance(flags, bool) or not isinstance(flags, int) or flags < 0:
+        return ["limit_flags missing or malformed"]
+    problems = []
+    required, prohibited = policy["required_flags"], policy["prohibited_flags"]
+    if flags & required != required:
+        problems.append(f"required limit flags missing: {required & ~flags:#x}")
+    if flags & prohibited:
+        problems.append(f"breakaway flags present: {flags & prohibited:#x}")
+    if flags & ~(required | prohibited):
+        problems.append(f"unexpected limit flags: {flags & ~(required | prohibited):#x}")
+    limit = readback.get("active_process_limit")
+    if limit != policy["active_process_limit"] or isinstance(limit, bool):
+        problems.append(f"active process limit is {limit!r}, not 1")
+    if inheritable is not policy["job_handle_inheritable"]:
+        problems.append("the job handle is (or may be) inheritable")
+    return problems
 
 
 @dataclass(frozen=True)
@@ -350,7 +516,8 @@ class JobController:
             raise self._fail("create_job_failed", str(exc)) from None
         self.ownership = "owned_empty"
         try:
-            if self.api.handle_inheritable(self.job):
+            inheritable = self.api.handle_inheritable(self.job)
+            if inheritable:
                 raise self._fail("inheritable_job_handle", "the job handle is inheritable")
             policy = P.JOB_LIMIT_POLICY
             try:
@@ -359,8 +526,7 @@ class JobController:
             except Exception as exc:
                 raise self._fail("set_job_information_failed", str(exc)) from None
             readback = self.api.query_limits(self.job)
-            problems = [p for p in P.job_limits_problems(
-                {**readback, "job_handle_inheritable": False, "in_job_before_resume": True})]
+            problems = configuration_problems(readback, inheritable)
             if problems:
                 raise self._fail("job_readback_mismatch", "; ".join(problems))
         except JobFailure as failure:
@@ -376,7 +542,9 @@ class JobController:
 
     def _snapshot(self, process: int, pid: int, creation_time: str,
                   handle_creation_time: str) -> Membership:
-        """Exactly one verified child, now."""
+        """Exactly one verified child, now: its PID and creation identity,
+        the only process the job has ever held, and the job's limits
+        unchanged."""
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise self._fail("not_in_job", "the expected PID is invalid")
         if not isinstance(creation_time, str) or creation_time != handle_creation_time:
@@ -392,6 +560,13 @@ class JobController:
         accounting = self.api.query_accounting(self.job)
         if accounting["active"] != 1:
             raise self._fail("not_in_job", f"{accounting['active']} active processes, not 1")
+        if accounting["total"] != 1:
+            raise self._fail("not_in_job", f"{accounting['total']} processes have been in the "
+                                           "job, not 1")
+        problems = configuration_problems(self.api.query_limits(self.job),
+                                          self.api.handle_inheritable(self.job))
+        if problems:
+            raise self._fail("job_readback_mismatch", "; ".join(problems))
         self._epoch += 1
         return Membership(pid, creation_time, self._epoch)
 

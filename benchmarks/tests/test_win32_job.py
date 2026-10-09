@@ -89,6 +89,8 @@ class FakeKernel32:
         self.pids, self.assigned, self.pid_length = [PID], None, None
         self.terminated, self.closed, self.created_with = [], [], None
         self.empty_on_terminate, self.last_error = True, 5
+        self.parent_in_job, self.parent_limits = 0, (0x2000, 0)
+        self.in_job_calls, self.query_jobs = [], []
         self.__dict__.update(overrides)
 
     def loader(self, name):
@@ -117,9 +119,21 @@ class FakeKernel32:
         return 1
 
     def QueryInformationJobObject(self, job, information_class, address, length, returned):
+        self.query_jobs.append(job)
         if "QueryInformationJobObject" in self.fail:
             return 0
         t = W._job_types()
+        if job is None:                          # the caller's own job, if any
+            assert information_class == W.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION
+            if not self.parent_in_job:
+                return 0
+            info = t.EXTENDED()
+            info.BasicLimitInformation.LimitFlags, \
+                info.BasicLimitInformation.ActiveProcessLimit = self.parent_limits
+            data = bytes(info)
+            ctypes.memmove(address, data, len(data))
+            returned._obj.value = len(data)
+            return 1
         if information_class == W.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION:
             info = t.EXTENDED()
             flags, limit = self.readback or self.stored
@@ -147,13 +161,11 @@ class FakeKernel32:
         return 1
 
     def IsProcessInJob(self, process, job, out):
+        self.in_job_calls.append((process, job))
         if "IsProcessInJob" in self.fail:
             return 0
-        out._obj.value = self.in_job
+        out._obj.value = self.parent_in_job if job is None else self.in_job
         return 1
-
-    def AssignProcessToJobObject(self, job, process):
-        return 0 if "AssignProcessToJobObject" in self.fail else 1
 
     def TerminateJobObject(self, job, code):
         self.terminated.append((job, code))
@@ -211,8 +223,7 @@ class TestLayoutAndSignatures:
         signatures = W._job_signatures(t)
         assert set(signatures) == {
             "CreateJobObjectW", "SetInformationJobObject", "QueryInformationJobObject",
-            "AssignProcessToJobObject", "IsProcessInJob", "TerminateJobObject",
-            "GetHandleInformation", "CloseHandle"}
+            "IsProcessInJob", "TerminateJobObject", "GetHandleInformation", "CloseHandle"}
         assert signatures["CreateJobObjectW"][0] is t.w.HANDLE
         assert len(signatures["QueryInformationJobObject"][1]) == 5
         assert signatures["TerminateJobObject"][1] == [t.w.HANDLE, t.w.UINT]
@@ -280,7 +291,7 @@ class TestCtypesJobApi:
         ("SetInformationJobObject", lambda api: api.set_limits(JOB, 0x2408, 1)),
         ("QueryInformationJobObject", lambda api: api.query_accounting(JOB)),
         ("IsProcessInJob", lambda api: api.is_process_in_job(PROCESS, JOB)),
-        ("AssignProcessToJobObject", lambda api: api.assign(JOB, PROCESS)),
+        ("IsProcessInJob", lambda api: api.parent_in_any_job()),
         ("TerminateJobObject", lambda api: api.terminate_job(JOB, 0x0BAE)),
         ("CloseHandle", lambda api: api.close(JOB)),
     ])
@@ -403,6 +414,10 @@ class TestMembership:
         ({"pids": []}, None, "not \\[4242\\]"),
         ({"pids": [999]}, None, "not \\[4242\\]"),
         ({"accounting": {"active": 2, "total": 2, "terminated": 0}}, None, "2 active"),
+        ({"accounting": {"active": 1, "total": 2, "terminated": 1}}, None,
+         "2 processes have been in the job, not 1"),
+        ({"accounting": {"active": 1, "total": 0, "terminated": 0}}, None,
+         "0 processes have been in the job"),
         ({}, (PROCESS, PID, CREATED, "2026-10-09T12:00:01.000Z"), "creation time differs"),
         ({}, (0, PID, CREATED, CREATED), "no valid process handle"),
         ({}, (PROCESS, 0, CREATED, CREATED), "PID is invalid"),
@@ -429,6 +444,332 @@ class TestMembership:
         controller, _ = make_controller(monkeypatch)
         with pytest.raises(W.JobFailure, match="membership in state none"):
             controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+
+    def test_membership_reads_identity_accounting_and_limits(self, monkeypatch):
+        controller, kernel32 = make_controller(monkeypatch)
+        controller.configure()
+        start = len(kernel32.log)
+        controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+        assert kernel32.log[start:] == ["IsProcessInJob", "QueryInformationJobObject",
+                                        "QueryInformationJobObject",
+                                        "QueryInformationJobObject", "GetHandleInformation"]
+        assert kernel32.in_job_calls == [(PROCESS, JOB)]
+
+    @pytest.mark.parametrize("change, message", [
+        ({"readback": (0x2408 | 0x800, 1)}, "breakaway flags present"),
+        ({"readback": (0x0408, 1)}, "required limit flags missing"),
+        ({"readback": (0x2408, 2)}, "active process limit is 2"),
+        ({"inherit_flags": 1}, "inheritable"),
+    ])
+    def test_limits_changed_before_membership(self, monkeypatch, change, message):
+        controller, kernel32 = make_controller(monkeypatch)
+        controller.configure()
+        kernel32.__dict__.update(change)
+        with pytest.raises(W.JobFailure, match=message) as raised:
+            controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+        assert raised.value.key == "job_readback_mismatch"
+        assert controller.ownership == "retained_unverified" and kernel32.closed == []
+
+
+# ---------------------------------------------------------------------------
+# Configuration policy (no membership placeholder)
+# ---------------------------------------------------------------------------
+
+READBACKS = [
+    {"limit_flags": 0x2408, "active_process_limit": 1},
+    {"limit_flags": 0x0408, "active_process_limit": 1},
+    {"limit_flags": 0x2408 | 0x1000, "active_process_limit": 1},
+    {"limit_flags": 0x2408 | 0x2, "active_process_limit": 1},
+    {"limit_flags": 0x2408, "active_process_limit": 0},
+    {"limit_flags": 0x2408, "active_process_limit": True},
+    {"limit_flags": -1, "active_process_limit": 1},
+    {"limit_flags": None, "active_process_limit": 1},
+    {},
+]
+
+
+class TestConfigurationProblems:
+    @pytest.mark.parametrize("readback", READBACKS)
+    @pytest.mark.parametrize("inheritable", [False, True, None])
+    def test_matches_the_planner_policy(self, readback, inheritable):
+        planner = P.job_limits_problems({**readback, "job_handle_inheritable": inheritable,
+                                         "in_job_before_resume": True})
+        assert W.configuration_problems(readback, inheritable) == planner
+
+    def test_membership_is_not_configuration(self):
+        assert W.configuration_problems({"limit_flags": 0x2408, "active_process_limit": 1},
+                                        False) == []
+        assert W.configuration_problems(None, False) == ["no job read-back"]
+        code = SOURCE.split('"""', 2)[2]
+        assert "in_job_before_resume" not in code and "job_limits_problems" not in code
+
+    def test_configure_uses_the_real_inheritance(self, monkeypatch):
+        controller, kernel32 = make_controller(monkeypatch)
+        seen = []
+        real = W.configuration_problems
+        monkeypatch.setattr(W, "configuration_problems",
+                            lambda readback, inheritable: seen.append(inheritable)
+                            or real(readback, inheritable))
+        controller.configure()
+        assert seen == [False]
+
+
+# ---------------------------------------------------------------------------
+# Creation planning (pure)
+# ---------------------------------------------------------------------------
+
+OUT, ERR = 0x204, 0x208
+
+
+class TestAttributePlan:
+    def test_constants(self):
+        assert (W.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, W.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                W.PROC_THREAD_ATTRIBUTE_JOB_LIST) == (0x00020009, 0x00020002, 0x0002000D)
+        assert W.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES == \
+            C.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
+        assert W.PROC_THREAD_ATTRIBUTE_HANDLE_LIST == C.PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+        assert C.CREATION_FLAGS & 0x01000000 == 0                 # no CREATE_BREAKAWAY_FROM_JOB
+
+    def test_exact_immutable_plan(self):
+        plan = W.job_list_attribute_plan(JOB, OUT, ERR)
+        assert plan.entries == (
+            W.AttributeEntry(0x00020009, "security_capabilities", ()),
+            W.AttributeEntry(0x00020002, "handle_list", (OUT, ERR)),
+            W.AttributeEntry(0x0002000D, "job_list", (JOB,)))
+        assert isinstance(plan.entries, tuple)
+        assert all(isinstance(entry.handles, tuple) for entry in plan.entries)
+        with pytest.raises(AttributeError):
+            plan.entries = ()
+        with pytest.raises(AttributeError):
+            plan.entries[2].handles = (OUT,)
+        assert len({entry.attribute for entry in plan.entries}) == 3   # each updated once
+
+    def test_count_is_derived(self):
+        plan = W.job_list_attribute_plan(JOB, OUT, ERR)
+        assert plan.count == len(plan.entries) == 3
+        assert W.AttributePlan(plan.entries[:2]).count == 2
+        assert isinstance(type(plan).count, property)
+
+    def test_job_absent_from_the_handle_list(self):
+        plan = W.job_list_attribute_plan(JOB, OUT, ERR)
+        handle_list = [e for e in plan.entries if e.name == "handle_list"][0]
+        job_list = [e for e in plan.entries if e.name == "job_list"][0]
+        assert JOB not in handle_list.handles and job_list.handles == (JOB,)
+
+    @pytest.mark.parametrize("bad", [0, -1, None, True, False, "0x500", 1.5,
+                                     (1 << 32) - 1, (1 << 64) - 1])
+    @pytest.mark.parametrize("position", [0, 1, 2])
+    def test_invalid_handles(self, bad, position):
+        handles = [JOB, OUT, ERR]
+        handles[position] = bad
+        label = ("job", "stdout", "stderr")[position]
+        with pytest.raises(W.PlanRefused, match=f"the {label} handle is invalid"):
+            W.job_list_attribute_plan(*handles)
+
+    @pytest.mark.parametrize("handles, message", [
+        ((JOB, JOB, ERR), "never be in the inherited handle list"),
+        ((JOB, OUT, JOB), "never be in the inherited handle list"),
+        ((JOB, JOB, JOB), "never be in the inherited handle list"),
+        ((JOB, OUT, OUT), "distinct"),
+    ])
+    def test_duplicate_handles(self, handles, message):
+        with pytest.raises(W.PlanRefused, match=message):
+            W.job_list_attribute_plan(*handles)
+
+    def test_plan_refusal_is_a_calibration_error(self):
+        assert issubclass(W.PlanRefused, C.CalibrationError)
+
+
+class TestAttributeListSizing:
+    @pytest.mark.parametrize("first, error, size", [(False, 122, 64), (0, 122, 4096),
+                                                    (False, 122, 1)])
+    def test_valid(self, first, error, size):
+        assert W.validate_attribute_list_size(first, error, size) == size
+
+    @pytest.mark.parametrize("first, error, size, message", [
+        (True, 122, 64, "not FALSE"),
+        (1, 122, 64, "not FALSE"),
+        (None, 122, 64, "not FALSE"),
+        ("0", 122, 64, "not FALSE"),
+        (False, 0, 64, "not ERROR_INSUFFICIENT_BUFFER"),
+        (False, 87, 64, "not ERROR_INSUFFICIENT_BUFFER"),
+        (False, 122.0, 64, "not ERROR_INSUFFICIENT_BUFFER"),
+        (False, None, 64, "not ERROR_INSUFFICIENT_BUFFER"),
+        (False, 122, 0, "implausible"),
+        (False, 122, -8, "implausible"),
+        (False, 122, 4097, "implausible"),
+        (False, 122, True, "implausible"),
+        (False, 122, 64.0, "implausible"),
+        (False, 122, None, "implausible"),
+    ])
+    def test_refusals(self, first, error, size, message):
+        with pytest.raises(W.PlanRefused, match=message):
+            W.validate_attribute_list_size(first, error, size)
+
+    def test_bound(self):
+        assert (W.ERROR_INSUFFICIENT_BUFFER, W.ATTRIBUTE_LIST_SIZE_LIMIT) == (122, 4096)
+
+
+# ---------------------------------------------------------------------------
+# Parent-job inventory (mocked)
+# ---------------------------------------------------------------------------
+
+class InjectedApi:
+    """A scripted parent-job API (no native layer at all)."""
+
+    def __init__(self, in_job=False, limits=None, error=None):
+        self.in_job, self.limits, self.error, self.calls = in_job, limits, error, []
+
+    def parent_in_any_job(self):
+        self.calls.append("presence")
+        if self.error is not None:
+            raise self.error
+        return self.in_job
+
+    def current_job_limits(self):
+        self.calls.append("limits")
+        return self.limits or {"limit_flags": 0, "active_process_limit": 0}
+
+
+class TestParentJobInventory:
+    def test_not_in_a_job_proceeds(self, monkeypatch):
+        api, kernel32 = make_api(monkeypatch)
+        inventory = W.parent_job_inventory(api)
+        assert (inventory.in_job, inventory.decision, inventory.key) == (False, "proceed", None)
+        assert kernel32.log == ["IsProcessInJob"] and kernel32.query_jobs == []
+
+    def test_pseudo_handle_and_null_job(self, monkeypatch):
+        api, kernel32 = make_api(monkeypatch)
+        W.parent_job_inventory(api)
+        assert kernel32.in_job_calls == [(-1, None)] and W.CURRENT_PROCESS == -1
+        assert not C._valid_handle(W.CURRENT_PROCESS)       # never treated as owned
+
+    def test_in_a_job_refuses_with_diagnostics(self, monkeypatch):
+        api, kernel32 = make_api(monkeypatch, parent_in_job=1, parent_limits=(0x2000, 0))
+        inventory = W.parent_job_inventory(api)
+        assert (inventory.in_job, inventory.decision, inventory.key) == (
+            True, "refuse", "nested_job_incompatible")
+        assert dict(inventory.diagnostics) == {"limit_flags": 0x2000, "active_process_limit": 0}
+        assert kernel32.log == ["IsProcessInJob", "QueryInformationJobObject"]
+        assert kernel32.query_jobs == [None]
+        with pytest.raises(TypeError):
+            inventory.diagnostics["limit_flags"] = 0            # read-only
+
+    @pytest.mark.parametrize("limits", [(0, 0), (0x2000, 0), (0x2408, 1), (0x800, 0),
+                                        (0xFFFFFFFF, 99)])
+    def test_diagnostics_never_change_the_refusal(self, monkeypatch, limits):
+        api, _ = make_api(monkeypatch, parent_in_job=1, parent_limits=limits)
+        assert W.parent_job_inventory(api).decision == "refuse"
+
+    def test_unreadable_diagnostics_still_refuse(self, monkeypatch):
+        api, kernel32 = make_api(monkeypatch, parent_in_job=1,
+                                 fail={"QueryInformationJobObject"})
+        inventory = W.parent_job_inventory(api)
+        assert inventory.decision == "refuse" and inventory.in_job is True
+        assert "QueryInformationJobObject failed" in inventory.diagnostics["error"]
+
+    def test_api_error_refuses(self, monkeypatch):
+        api, kernel32 = make_api(monkeypatch, fail={"IsProcessInJob"}, last_error=5)
+        inventory = W.parent_job_inventory(api)
+        assert (inventory.in_job, inventory.decision, inventory.key) == (
+            None, "refuse", "nested_job_incompatible")
+        assert "IsProcessInJob failed (Windows error 5)" in inventory.reason
+        assert kernel32.query_jobs == [] and inventory.diagnostics is None
+
+    @pytest.mark.parametrize("value", [2, -1, 0xFFFFFFFF])
+    def test_malformed_native_result_refuses(self, monkeypatch, value):
+        api, kernel32 = make_api(monkeypatch, parent_in_job=value)
+        inventory = W.parent_job_inventory(api)
+        assert inventory.decision == "refuse" and inventory.in_job is None
+        assert "malformed result" in inventory.reason and kernel32.query_jobs == []
+
+    @pytest.mark.parametrize("value", [None, 0, 1, "false", "False", [], object()])
+    def test_malformed_injected_result_refuses(self, value):
+        api = InjectedApi(in_job=value)
+        inventory = W.parent_job_inventory(api)
+        assert inventory.decision == "refuse" and inventory.key == "nested_job_incompatible"
+        assert api.calls == ["presence"]                    # limits never consulted
+
+    def test_query_is_never_the_presence_test(self):
+        api = InjectedApi(error=C.Win32Error("IsProcessInJob", 6))
+        assert W.parent_job_inventory(api).decision == "refuse"
+        assert api.calls == ["presence"]
+        api = InjectedApi(in_job=False)
+        assert W.parent_job_inventory(api).decision == "proceed"
+        assert api.calls == ["presence"]
+        api = InjectedApi(in_job=True)
+        W.parent_job_inventory(api)
+        assert api.calls == ["presence", "limits"]
+
+    def test_pure_decision(self):
+        assert W.parent_job_decision(False).decision == "proceed"
+        for value in (True, None, 0, 1, "no", 0.0):
+            decision = W.parent_job_decision(value)
+            assert decision.decision == "refuse" and decision.key == "nested_job_incompatible"
+        assert W.parent_job_decision(False, error="boom").decision == "refuse"
+        assert W.parent_job_decision(True, {"x": 1}).diagnostics == {"x": 1}
+        with pytest.raises(AttributeError):
+            W.parent_job_decision(False).decision = "proceed"
+
+    def test_refusal_key_is_a_prelaunch_refusal(self):
+        action = P.FAILURE_ACTIONS[W.PARENT_JOB_REFUSAL]
+        assert action["action_class"] == "prelaunch_refusal"
+        assert action["containment"] == "none"
+
+    def test_gate_closed_propagates_before_any_call(self, monkeypatch):
+        api, kernel32 = make_api(monkeypatch)
+        monkeypatch.setattr(C, "APPROVED_PROBES", frozenset())
+        with pytest.raises(C.ExecutionDisabled):
+            W.parent_job_inventory(api)
+        assert kernel32.log == [] and kernel32.loads == []
+
+
+# ---------------------------------------------------------------------------
+# No after-creation assignment, no implicit termination
+# ---------------------------------------------------------------------------
+
+class TestNoFallback:
+    def test_no_assignment_api(self, monkeypatch):
+        assert "AssignProcessToJobObject" not in SOURCE
+        api, kernel32 = make_api(monkeypatch)
+        assert not hasattr(api, "assign") and not hasattr(W.JobController, "assign")
+        with pytest.raises(KeyError):
+            api._api("AssignProcessToJobObject")
+        with pytest.raises(LiveAccessAttempt, match="unexpected Windows API"):
+            FakeDll(kernel32).AssignProcessToJobObject
+        assert kernel32.loads == []
+
+    @pytest.mark.parametrize("overrides", [
+        {"in_job": 0}, {"pids": []}, {"accounting": {"active": 1, "total": 2, "terminated": 1}},
+        {"fail": {"IsProcessInJob"}},
+    ])
+    def test_membership_failure_only_reads(self, monkeypatch, overrides):
+        controller, kernel32 = make_controller(monkeypatch)
+        controller.configure()
+        start = len(kernel32.log)
+        kernel32.__dict__.update(overrides)
+        with pytest.raises(W.JobFailure):
+            controller.verify_membership(PROCESS, PID, CREATED, CREATED)
+        assert set(kernel32.log[start:]) <= {"IsProcessInJob", "QueryInformationJobObject",
+                                             "GetHandleInformation"}
+        assert kernel32.terminated == [] and kernel32.closed == []
+
+    def test_planning_and_inventory_never_terminate(self, monkeypatch):
+        W.job_list_attribute_plan(JOB, OUT, ERR)
+        W.validate_attribute_list_size(False, 122, 64)
+        for parent in (0, 1):
+            api, kernel32 = make_api(monkeypatch, parent_in_job=parent)
+            W.parent_job_inventory(api)
+            assert "TerminateJobObject" not in kernel32.log
+            assert "CloseHandle" not in kernel32.log and kernel32.terminated == []
+
+    def test_pure_helpers_load_nothing(self, monkeypatch):
+        kernel32 = FakeKernel32()
+        W.job_list_attribute_plan(JOB, OUT, ERR)
+        W.validate_attribute_list_size(0, 122, 64)
+        W.parent_job_decision(False)
+        W.configuration_problems({"limit_flags": 0x2408, "active_process_limit": 1}, False)
+        assert kernel32.loads == [] and kernel32.log == []
 
 
 # ---------------------------------------------------------------------------
