@@ -25,6 +25,16 @@ and re-read; this proves the logical content, not power-loss durability.
 Directory entries are not flushed, a device may ignore flushes, and the
 re-read may be served from the cache.
 
+Record contracts: a record's (schema, writer_version) pair selects its
+contract.  Strict records ("agentops-evidence/2", "evidence-store/e2") carry
+the observed job configuration, the applied creation attributes and the
+complete job-membership and token evidence, all validated by the planner's
+pure validators; job assignment is accepted only AT creation.  Legacy
+records ("agentops-evidence/1", "evidence-store/e1") are verified under
+their original rules only and never satisfy a strict requirement; one chain
+never mixes contracts; any other pair is refused.  The writer writes strict
+records only.
+
 Integrity model, stated precisely: a hash chain detects a deleted,
 reordered, truncated or altered record.  It is NOT authentication - anyone
 able to rewrite every record can recompute every hash.  The verified chain
@@ -52,8 +62,30 @@ import appcontainer_preflight as P  # noqa: E402
 
 #: No real file-system adapter exists; this flag does not enable anything.
 EVIDENCE_WRITES_ENABLED: bool = False
-EVIDENCE_SCHEMA: str = "agentops-evidence/1"
-WRITER_VERSION: str = "evidence-store/e1"
+#: Record contracts, selected by the exact (schema, writer_version) pair.
+#: The legacy contract (E1) keeps its original meaning and is only ever
+#: verified; it never satisfies a strict requirement.  The writer produces
+#: strict records only.
+EVIDENCE_SCHEMA: str = "agentops-evidence/2"
+WRITER_VERSION: str = "evidence-store/e2"
+LEGACY_SCHEMA: str = "agentops-evidence/1"
+LEGACY_WRITER_VERSION: str = "evidence-store/e1"
+STRICT, LEGACY = "strict", "legacy"
+RECORD_CONTRACTS: Mapping[tuple[str, str], str] = {
+    (LEGACY_SCHEMA, LEGACY_WRITER_VERSION): LEGACY,
+    (EVIDENCE_SCHEMA, WRITER_VERSION): STRICT,
+}
+#: The PROC_THREAD_ATTRIBUTE identifiers a strict process_created record must
+#: show as applied: SECURITY_CAPABILITIES, HANDLE_LIST, JOB_LIST.
+CREATION_ATTRIBUTES: tuple[int, ...] = (0x00020009, 0x00020002, 0x0002000D)
+#: Job assignments a strict record may carry: none before a process exists,
+#: assignment at creation once it does.
+STRICT_ASSIGNMENTS: tuple[str, ...] = ("not_created", P.ACCEPTED_JOB_ASSIGNMENT)
+JOB_CONFIGURATION_FIELDS: frozenset[str] = frozenset(
+    {"limit_flags", "active_process_limit", "job_handle_inheritable"})
+PROCESS_CREATED_FIELDS: frozenset[str] = frozenset(
+    {"pid", "creation_time", "create_process_ok", "applied_attributes"})
+JOB_VERIFIED_FIELDS: frozenset[str] = frozenset({"membership", "token_ok", "image_ok"})
 MAX_SEQUENCE: int = 999
 
 RECORD_KINDS: tuple[str, ...] = (
@@ -156,8 +188,21 @@ def _identity(value: Any) -> Optional[tuple[int, str]]:
     return pid, creation
 
 
+def record_contract(record: Any) -> Optional[str]:
+    """STRICT or LEGACY for a supported (schema, writer_version) pair, else
+    None (unsupported - never guessed)."""
+    if not isinstance(record, Mapping):
+        return None
+    schema, integrity = record.get("schema"), record.get("integrity")
+    version = integrity.get("writer_version") if isinstance(integrity, Mapping) else None
+    if not isinstance(schema, str) or not isinstance(version, str):
+        return None
+    return RECORD_CONTRACTS.get((schema, version))
+
+
 def record_problems(record: Any) -> list[str]:
-    """Why one record is not well-formed (its own content only)."""
+    """Why one record is not well-formed (its own content only), under the
+    contract its (schema, writer_version) pair selects."""
     if not isinstance(record, Mapping):
         return ["the record is not an object"]
     problems = []
@@ -173,8 +218,9 @@ def record_problems(record: Any) -> list[str]:
         P.canonical_json(record)
     except P.PreflightError as exc:
         problems.append(f"not canonical: {exc}")
-    if record["schema"] != EVIDENCE_SCHEMA:
-        problems.append("wrong schema")
+    contract = record_contract(record)
+    if contract is None:
+        problems.append("unsupported schema/version combination")
     kind = record["kind"]
     if kind not in RECORD_KINDS:
         problems.append(f"unknown kind {kind!r}")
@@ -214,26 +260,106 @@ def record_problems(record: Any) -> list[str]:
     if record["process"] is not None and _identity(record["process"]) is None:
         problems.append("process identity is malformed")
     job = record["job"]
-    if not isinstance(job, Mapping) or set(job) != {"job_id", "limits_verified", "assignment"} \
-            or (job["job_id"] is not None and (not isinstance(job["job_id"], str)
-                                               or not _HEX32.fullmatch(job["job_id"]))) \
+    job_ok = isinstance(job, Mapping) and set(job) == {"job_id", "limits_verified", "assignment"}
+    if not job_ok or (job["job_id"] is not None and (not isinstance(job["job_id"], str)
+                                                     or not _HEX32.fullmatch(job["job_id"]))) \
             or not isinstance(job["limits_verified"], bool) \
+            or not isinstance(job["assignment"], str) \
             or job["assignment"] not in P.JOB_ASSIGNMENTS:
         problems.append("job identity is malformed")
+    elif contract == STRICT:
+        problems.extend(_strict_job_problems(record))
     lifecycle = record["lifecycle"]
     if not isinstance(lifecycle, Mapping) or set(lifecycle) != LIFECYCLE_KEYS \
             or lifecycle.get("execution_history") not in (None,) + P.EXECUTION_HISTORIES \
             or lifecycle.get("liveness") not in (None,) + P.LIVENESS_STATES:
         problems.append("lifecycle is malformed")
     integrity = record["integrity"]
-    if not isinstance(integrity, Mapping) or integrity.get("writer_version") != WRITER_VERSION:
+    if not isinstance(integrity, Mapping) or (
+            contract == STRICT and set(integrity) != {"writer_version"}):
         problems.append("integrity block is malformed")
     body = record["body"]
     if not isinstance(body, Mapping):
         problems.append("body is not an object")
         return problems
     problems.extend(_body_problems(kind, record, body))
+    if contract == STRICT:
+        problems.extend(_strict_body_problems(kind, record, body))
     return problems
+
+
+def _strict_job_problems(record: Mapping[str, Any]) -> list[str]:
+    """Strict job block: no assignment before a process exists, assignment
+    AT creation (into a verified job) once it does; nothing else."""
+    job = record["job"]
+    assignment = job["assignment"]
+    if assignment == "assigned_before_resume":
+        return ["assignment after creation (assigned_before_resume) is refused"]
+    if assignment not in STRICT_ASSIGNMENTS:
+        return [f"job assignment {assignment!r} is not accepted in a strict record"]
+    if record["process"] is not None:
+        if assignment != P.ACCEPTED_JOB_ASSIGNMENT:
+            return ["a record naming a process needs job assignment assigned_at_creation"]
+        if job["limits_verified"] is not True or job["job_id"] is None:
+            return ["a record naming a process needs a verified job identity"]
+    elif assignment != "not_created":
+        return ["a job assignment without a process is contradictory"]
+    return []
+
+
+def _strict_body_problems(kind: str, record: Mapping[str, Any],
+                          body: Mapping[str, Any]) -> list[str]:
+    """Strict content of the job stages: nothing is defaulted, inferred from
+    a stage name, or taken from a plan instead of an observed result."""
+    if kind == "job_configured":
+        if set(body) != JOB_CONFIGURATION_FIELDS:
+            return ["job_configured needs exactly the configuration read-back fields "
+                    "(" + ", ".join(sorted(JOB_CONFIGURATION_FIELDS)) + ")"]
+        if not isinstance(body["job_handle_inheritable"], bool):
+            return ["job_configured needs the observed handle inheritance (true or false)"]
+        job = record["job"]
+        problems = ["job_configured: " + p for p in P.job_configuration_problems(body)]
+        if job["limits_verified"] is not True or job["job_id"] is None:
+            problems.append("job_configured needs a verified job identity")
+        return problems
+    if kind == "process_created":
+        if set(body) != PROCESS_CREATED_FIELDS:
+            return ["process_created needs exactly " + ", ".join(sorted(PROCESS_CREATED_FIELDS))
+                    + " (a plan is not proof that CreateProcessW applied it)"]
+        problems = []
+        if body["create_process_ok"] is not True:
+            problems.append("process_created needs a successful CreateProcessW result")
+        applied = body["applied_attributes"]
+        if not isinstance(applied, list) or any(
+                isinstance(a, bool) or not isinstance(a, int) for a in applied):
+            problems.append("applied_attributes is malformed")
+        elif len(applied) != len(set(applied)):
+            problems.append("applied_attributes has duplicates")
+        elif set(applied) != set(CREATION_ATTRIBUTES):
+            problems.append("applied_attributes are not exactly SECURITY_CAPABILITIES, "
+                            "HANDLE_LIST and JOB_LIST: "
+                            + ", ".join(f"{a:#x}" for a in applied))
+        return problems
+    if kind == "job_verified_and_validated":
+        if set(body) != JOB_VERIFIED_FIELDS:
+            return ["job_verified_and_validated needs exactly membership, token_ok and "
+                    "image_ok"]
+        identity = _identity(record["process"]) if record["process"] is not None else None
+        if identity is None:
+            return ["job_verified_and_validated needs the recorded process identity"]
+        problems = []
+        membership = body["membership"]
+        if not isinstance(membership, Mapping) \
+                or set(membership) != set(P.JOB_MEMBERSHIP_FIELDS):
+            problems.append("membership must carry exactly "
+                            + ", ".join(P.JOB_MEMBERSHIP_FIELDS))
+        else:
+            problems.extend("membership: " + p for p in P.job_membership_problems(
+                membership, expected_pid=identity[0], expected_creation_time=identity[1]))
+        if body["token_ok"] is not True or body["image_ok"] is not True:
+            problems.append("token and image validation must both be explicitly true")
+        return problems
+    return []
 
 
 def _body_problems(kind: str, record: Mapping[str, Any], body: Mapping[str, Any]) -> list[str]:
@@ -272,13 +398,19 @@ def _body_problems(kind: str, record: Mapping[str, Any], body: Mapping[str, Any]
 
 
 def build_record(kind: str, envelope: Mapping[str, Any], body: Mapping[str, Any], *,
-                 sequence: int, previous_record_sha256: Optional[str]) -> dict[str, Any]:
-    """One validated record (pure)."""
+                 sequence: int, previous_record_sha256: Optional[str],
+                 contract: str = STRICT) -> dict[str, Any]:
+    """One validated record (pure), under the named contract; an envelope
+    whose writer_version belongs to another contract makes an unsupported
+    (schema, writer_version) pair and is refused."""
+    schemas = {c: schema for (schema, _), c in RECORD_CONTRACTS.items()}
+    if contract not in schemas:
+        raise EvidenceError(f"unknown record contract {contract!r}")
     if not isinstance(envelope, Mapping) or set(envelope) != set(ENVELOPE_FIELDS):
         missing = sorted(set(ENVELOPE_FIELDS) - set(envelope or {}))
         extra = sorted(set(envelope or {}) - set(ENVELOPE_FIELDS))
         raise EvidenceError(f"malformed envelope (missing {missing}, unexpected {extra})")
-    record = {"schema": EVIDENCE_SCHEMA, "kind": kind, "sequence": sequence,
+    record = {"schema": schemas[contract], "kind": kind, "sequence": sequence,
               "previous_record_sha256": previous_record_sha256, "body": dict(body),
               **{k: envelope[k] for k in ENVELOPE_FIELDS}}
     problems = record_problems(record)
@@ -302,6 +434,7 @@ class ChainState:
     evidence_failure: bool
     resume_result_history: Optional[str]
     termination_verified: bool
+    contract: Optional[str] = None      # of every verified record (one per chain)
 
 
 def verify_chain(records: Sequence[Any], *, expected_run_id: Optional[str] = None,
@@ -309,7 +442,10 @@ def verify_chain(records: Sequence[Any], *, expected_run_id: Optional[str] = Non
                  expected_token_sha256: Optional[str] = None) -> ChainState:
     """
     Verify an ordered list of parsed records.  Verification stops at the
-    first problem; the state describes the verified prefix only.
+    first problem; the state describes the verified prefix only.  Every
+    record must share the first record's contract (no mixing); in a strict
+    chain resume_intent must directly follow a valid
+    job_verified_and_validated record.
     """
     problems: list[str] = []
     verified: list[Mapping[str, Any]] = []
@@ -317,10 +453,17 @@ def verify_chain(records: Sequence[Any], *, expected_run_id: Optional[str] = Non
     first: Optional[Mapping[str, Any]] = None
     process: Optional[tuple[int, str]] = None
     context = job_id = None
+    contract: Optional[str] = None
     for index, record in enumerate(records):
         own = record_problems(record)
         if own:
             problems.append(f"record {index}: " + "; ".join(own))
+            break
+        if contract is None:
+            contract = record_contract(record)
+        elif record_contract(record) != contract:
+            problems.append(f"record {index}: its schema/version differs from the chain's "
+                            f"{contract} contract")
             break
         if record["sequence"] != index:
             problems.append(f"record {index}: sequence {record['sequence']} (missing, "
@@ -353,6 +496,11 @@ def verify_chain(records: Sequence[Any], *, expected_run_id: Optional[str] = Non
                          else ", ".join(changed))
                 problems.append(f"record {index}: inconsistent {label}")
                 break
+        if contract == STRICT and record["kind"] == "resume_intent" and (
+                not verified or verified[-1]["kind"] != "job_verified_and_validated"):
+            problems.append(f"record {index}: resume_intent without a validated job "
+                            "membership record")
+            break
         identity = _identity(record["process"]) if record["process"] is not None else None
         if process is None and identity is not None and record["kind"] != "process_created":
             problems.append(f"record {index}: process identity before process_created")
@@ -404,7 +552,8 @@ def verify_chain(records: Sequence[Any], *, expected_run_id: Optional[str] = Non
         complete=any(r["kind"] == "complete" for r in verified),
         evidence_failure=any(r["kind"] == "evidence_failure" for r in verified),
         resume_result_history=results[-1]["body"]["execution_history"] if results else None,
-        termination_verified=bool(terminations and terminations[-1]["body"]["verified"]))
+        termination_verified=bool(terminations and terminations[-1]["body"]["verified"]),
+        contract=contract if verified else None)
 
 
 # ---------------------------------------------------------------------------
@@ -468,8 +617,14 @@ class EvidenceWriter:
         return verify_chain(self.records).durable_stages
 
     def stage_permissions(self) -> dict[str, Any]:
-        """P.next_stage_allowed over the verified records and failure state."""
-        return P.next_stage_allowed(self._durable_stages(), self.state.evidence_failed)
+        """P.next_stage_allowed over the verified records and failure state.
+        Launch and resume are only ever permitted over a fully verified
+        strict chain."""
+        chain = verify_chain(self.records)
+        permissions = P.next_stage_allowed(chain.durable_stages, self.state.evidence_failed)
+        if not chain.ok or (self.records and chain.contract != STRICT):
+            permissions = {**permissions, "may_launch": False, "may_resume": False}
+        return permissions
 
     @property
     def may_resume(self) -> bool:
@@ -522,7 +677,8 @@ class EvidenceWriter:
                after_failure: bool = False) -> str:
         previous = self.records[-1] if self.records else None
         record = build_record(kind, envelope, body, sequence=self.next_sequence,
-                              previous_record_sha256=record_digest(previous) if previous else None)
+                              previous_record_sha256=record_digest(previous) if previous else None,
+                              contract=STRICT)
         if after_failure:
             chain = verify_chain(self.records, expected_run_id=self.expected["run_id"],
                                  expected_head=self.expected["head"],

@@ -147,16 +147,28 @@ def _lifecycle(**changes):
 
 
 JOB = {"job_id": JOB_ID, "limits_verified": True, "assignment": "assigned_at_creation"}
+#: A configured job before any process exists: no assignment yet.
+JOB_READY = {"job_id": JOB_ID, "limits_verified": True, "assignment": "not_created"}
+CONFIGURED = dict(job=JOB_READY, context_sha256="3" * 64)
 RUNNING = dict(job=JOB, context_sha256="3" * 64, process=PROCESS)
 EXITED = _lifecycle(phase="exited", process_created=True, pid=4242, creation_time=CREATED,
                     execution_history=P.MAY_HAVE_EXECUTED, liveness=P.CONFIRMED_EXITED)
+#: Strict stage bodies (observed values only).
+CONFIG_BODY = {"limit_flags": 0x2408, "active_process_limit": 1,
+               "job_handle_inheritable": False}
+CREATED_BODY = {**PROCESS, "create_process_ok": True,
+                "applied_attributes": [0x00020009, 0x00020002, 0x0002000D]}
+MEMBERSHIP = {"job_assignment": "assigned_at_creation", "in_job": True, "pid": 4242,
+              "creation_time": CREATED, "active_processes": 1, "total_processes": 1,
+              "member_pids": [4242]}
+VERIFIED_BODY = {"membership": MEMBERSHIP, "token_ok": True, "image_ok": True}
 
-#: A complete, verified run: (kind, envelope changes, body).
+#: A complete, verified strict run: (kind, envelope changes, body).
 STEPS = [
     ("prelaunch", {}, {"result": "passed"}),
-    ("job_configured", dict(job=JOB, context_sha256="3" * 64), {"limits": "verified"}),
-    ("process_created", RUNNING, dict(PROCESS)),
-    ("job_verified_and_validated", RUNNING, {"members": [4242]}),
+    ("job_configured", CONFIGURED, CONFIG_BODY),
+    ("process_created", RUNNING, CREATED_BODY),
+    ("job_verified_and_validated", RUNNING, VERIFIED_BODY),
     ("resume_intent", RUNNING, {}),
     ("resume_result", RUNNING, {"execution_history": P.MAY_HAVE_EXECUTED}),
     ("termination_intent", RUNNING, {"cause": "job_terminated_timeout"}),
@@ -261,7 +273,8 @@ class TestRecords:
         ({"process": {"pid": 1}}, "process identity"),
         ({"job": {"job_id": "x", "limits_verified": True, "assignment": "unknown"}}, "job"),
         ({"lifecycle": {"liveness": "dead"}}, "lifecycle"),
-        ({"integrity": {}}, "integrity"),
+        ({"integrity": {}}, "unsupported schema/version combination"),
+        ({"integrity": {"writer_version": E.WRITER_VERSION, "x": 1}}, "integrity"),
         ({"context_sha256": "short"}, "context_sha256"),
     ])
     def test_malformed_envelopes(self, changes, message):
@@ -341,7 +354,7 @@ class TestChain:
 
     def test_broken_previous_digest(self):
         records = copy.deepcopy(full_chain().records)
-        records[2]["body"]["note"] = "altered"
+        records[2]["utc"] = "2026-10-09T12:00:01Z"          # still a well-formed record
         chain, text = self._problem(records)
         assert "record 3: broken previous digest" in text and chain.count == 3
 
@@ -377,7 +390,7 @@ class TestChain:
         with pytest.raises(E.EvidenceError, match="inconsistent process identity"):
             w.write("resume_intent", envelope(**moved), {})
         with pytest.raises(E.EvidenceError, match="inconsistent process identity"):
-            w.write("resume_intent", envelope(job=JOB, context_sha256="3" * 64), {})
+            w.write("resume_intent", envelope(**CONFIGURED), {})
 
     def test_stage_order_is_enforced_by_the_writer(self):
         w = write_steps(writer(), 1)
@@ -392,12 +405,12 @@ class TestChain:
         assert (w.next_sequence, len(w.fs.files)) == before         # nothing consumed
         w2 = writer()
         with pytest.raises(E.EvidenceError, match="does not start with prelaunch"):
-            w2.write("job_configured", envelope(), {})
+            w2.write("job_configured", envelope(**CONFIGURED), CONFIG_BODY)
 
     def test_hash_chain_is_not_authentication(self):
         rewritten = writer()
         for kind, changes, body in STEPS:
-            rewritten.write(kind, envelope(**changes), {**body, "forged": True})
+            rewritten.write(kind, envelope(**{**changes, "monotonic_ms": 7}), body)  # forged
         complete(rewritten)
         assert E.verify_chain(rewritten.records).ok                  # recomputed hashes pass
         assert rewritten.state.last_verified_digest != full_chain().state.last_verified_digest
@@ -1162,3 +1175,375 @@ class TestWindowsFsOpsWrites:
             if disposition == E.OPEN_EXISTING:
                 assert flags & E.FILE_FLAG_OPEN_REPARSE_POINT        # never follow a reparse
         assert "GetHandleInformation" in kernel32.log
+
+
+# ---------------------------------------------------------------------------
+# Strict record contract (J-39): versioning, assignment, job content, resume
+# ---------------------------------------------------------------------------
+
+#: The original E1 run, as legacy records carried it.
+LEGACY_STEPS = [
+    ("prelaunch", {}, {"result": "passed"}),
+    ("job_configured", dict(job=JOB, context_sha256="3" * 64), {"limits": "verified"}),
+    ("process_created", RUNNING, dict(PROCESS)),
+    ("job_verified_and_validated", RUNNING, {"members": [4242]}),
+    ("resume_intent", RUNNING, {}),
+]
+
+
+def chain_of(steps, contract=None):
+    """Records built purely (no writer, no file system) and digest-chained."""
+    contract = contract or E.STRICT
+    version = E.WRITER_VERSION if contract == E.STRICT else E.LEGACY_WRITER_VERSION
+    records, previous = [], None
+    for sequence, (kind, changes, body) in enumerate(steps):
+        env = envelope(**{"integrity": {"writer_version": version}, **changes})
+        record = E.build_record(kind, env, body, sequence=sequence,
+                                previous_record_sha256=previous, contract=contract)
+        records.append(record)
+        previous = E.record_digest(record)
+    return records
+
+
+def strict_problems(kind, changes, body):
+    record = {"schema": E.EVIDENCE_SCHEMA, "kind": kind, "sequence": 1,
+              "previous_record_sha256": "0" * 64, "body": body, **envelope(**changes)}
+    return E.record_problems(record)
+
+
+def with_job(**job):
+    return {**RUNNING, "job": {**JOB, **job}}
+
+
+class TestRecordContracts:
+    def test_contract_table(self):
+        assert E.RECORD_CONTRACTS == {
+            ("agentops-evidence/1", "evidence-store/e1"): "legacy",
+            ("agentops-evidence/2", "evidence-store/e2"): "strict"}
+        assert (E.EVIDENCE_SCHEMA, E.WRITER_VERSION) == ("agentops-evidence/2",
+                                                         "evidence-store/e2")
+
+    def test_valid_strict_chain(self):
+        w = full_chain()
+        chain = E.verify_chain(w.records, expected_run_id=RUN, expected_head=HEAD,
+                               expected_token_sha256=TOKEN_SHA)
+        assert chain.ok and chain.contract == E.STRICT and chain.complete
+        assert all(E.record_contract(r) == E.STRICT for r in w.records)
+
+    def test_valid_legacy_chain_under_its_original_contract(self):
+        records = chain_of(LEGACY_STEPS, E.LEGACY)
+        chain = E.verify_chain(records)
+        assert chain.ok and chain.contract == E.LEGACY and chain.count == 5
+        assert chain.durable_stages == list(P.LIFECYCLE_STAGES[:5])
+        before_resume = [(k, {**c, "job": {**JOB, "assignment": "assigned_before_resume"}}
+                          if c else c, b) for k, c, b in LEGACY_STEPS]
+        assert E.verify_chain(chain_of(before_resume, E.LEGACY)).ok   # E1 rules, unchanged
+
+    def test_legacy_records_never_satisfy_the_strict_contract(self):
+        for record in chain_of(LEGACY_STEPS, E.LEGACY)[1:4]:
+            relabelled = {**copy.deepcopy(record), "schema": E.EVIDENCE_SCHEMA,
+                          "integrity": {"writer_version": E.WRITER_VERSION}}
+            assert E.record_problems(relabelled)                     # strict content missing
+        w = writer()
+        w.records = chain_of(LEGACY_STEPS, E.LEGACY)
+        assert not w.may_resume and not w.may_launch
+        w.next_sequence = 5
+        with pytest.raises(E.EvidenceError, match="differs from the chain's legacy contract"):
+            w.write("resume_result", envelope(**RUNNING),
+                    {"execution_history": P.MAY_HAVE_EXECUTED})
+
+    @pytest.mark.parametrize("schema, version", [
+        ("agentops-evidence/1", "evidence-store/e2"), ("agentops-evidence/2", "evidence-store/e1"),
+        ("agentops-evidence/3", "evidence-store/e2"), ("agentops-evidence/2", "evidence-store/e3"),
+        (None, "evidence-store/e2"), ("agentops-evidence/2", None), (["x"], "evidence-store/e2"),
+    ])
+    def test_unsupported_schema_version_combinations(self, schema, version):
+        record = copy.deepcopy(full_chain().records[0])
+        record["schema"], record["integrity"] = schema, {"writer_version": version}
+        assert E.record_contract(record) is None
+        assert "unsupported schema/version combination" in E.record_problems(record)
+
+    def test_build_record_contract_must_match_the_envelope(self):
+        with pytest.raises(E.EvidenceError, match="unknown record contract"):
+            E.build_record("prelaunch", envelope(), {}, sequence=0, previous_record_sha256=None,
+                           contract="lenient")
+        with pytest.raises(E.EvidenceError, match="unsupported schema/version combination"):
+            E.build_record("prelaunch", envelope(), {}, sequence=0, previous_record_sha256=None,
+                           contract=E.LEGACY)                 # strict envelope, legacy schema
+
+    def test_contracts_never_mix_in_one_chain(self):
+        legacy = chain_of(LEGACY_STEPS[:1], E.LEGACY)
+        strict = E.build_record("job_configured", envelope(**CONFIGURED), CONFIG_BODY,
+                                sequence=1, previous_record_sha256=E.record_digest(legacy[0]))
+        chain = E.verify_chain(legacy + [strict])
+        assert not chain.ok and "differs from the chain's legacy contract" in chain.problems[0]
+        assert chain.count == 1
+
+    def test_writer_writes_strict_only(self):
+        w = write_steps(writer(), 2)
+        assert {E.record_contract(r) for r in w.records} == {E.STRICT}
+        with pytest.raises(E.EvidenceError, match="unsupported schema/version"):
+            w.write("process_created",
+                    envelope(**RUNNING, integrity={"writer_version": E.LEGACY_WRITER_VERSION}),
+                    CREATED_BODY)
+
+
+class TestStrictAssignment:
+    @pytest.mark.parametrize("kind, body", [
+        ("process_created", CREATED_BODY), ("job_verified_and_validated", VERIFIED_BODY),
+        ("resume_intent", {}), ("final_inspection", {"liveness": P.STATE_UNKNOWN})])
+    def test_assigned_before_resume_refused(self, kind, body):
+        problems = strict_problems(kind, with_job(assignment="assigned_before_resume"), body)
+        assert "assignment after creation (assigned_before_resume) is refused" in problems
+
+    @pytest.mark.parametrize("assignment, message", [
+        ("unknown", "not accepted in a strict record"),
+        ("assignment_failed", "not accepted in a strict record"),
+        ("not_created", "needs job assignment assigned_at_creation"),
+        (None, "job identity is malformed"), (1, "job identity is malformed"),
+        ("ASSIGNED_AT_CREATION", "job identity is malformed"),
+        (["assigned_at_creation"], "job identity is malformed"),
+    ])
+    def test_malformed_or_unaccepted_assignment(self, assignment, message):
+        problems = strict_problems("process_created", with_job(assignment=assignment),
+                                   CREATED_BODY)
+        assert any(message in p for p in problems)
+
+    def test_missing_assignment(self):
+        job = {"job_id": JOB_ID, "limits_verified": True}
+        assert "job identity is malformed" in strict_problems(
+            "process_created", {**RUNNING, "job": job}, CREATED_BODY)
+
+    def test_contradictory_assignment(self):
+        assert "a job assignment without a process is contradictory" in strict_problems(
+            "job_configured", dict(job=JOB, context_sha256="3" * 64), CONFIG_BODY)
+        for job in ({"limits_verified": False}, {"job_id": None}):
+            assert "a record naming a process needs a verified job identity" in strict_problems(
+                "process_created", with_job(**job), CREATED_BODY)
+
+    def test_assignment_never_inferred_from_membership(self):
+        problems = strict_problems("job_verified_and_validated",
+                                   with_job(assignment="not_created"), VERIFIED_BODY)
+        assert "a record naming a process needs job assignment assigned_at_creation" in problems
+
+
+class TestStrictJobConfiguration:
+    @pytest.mark.parametrize("field", sorted(CONFIG_BODY))
+    def test_missing_field(self, field):
+        body = {k: v for k, v in CONFIG_BODY.items() if k != field}
+        assert any("exactly the configuration read-back fields" in p
+                   for p in strict_problems("job_configured", CONFIGURED, body))
+
+    def test_extra_field(self):
+        assert any("exactly the configuration read-back fields" in p for p in strict_problems(
+            "job_configured", CONFIGURED, {**CONFIG_BODY, "limits": "verified"}))
+
+    @pytest.mark.parametrize("value", [None, 0, "false"])
+    def test_inheritance_must_be_observed(self, value):
+        assert "job_configured needs the observed handle inheritance (true or false)" in \
+            strict_problems("job_configured", CONFIGURED,
+                            {**CONFIG_BODY, "job_handle_inheritable": value})
+
+    @pytest.mark.parametrize("changes, message", [
+        ({"limit_flags": 0x0408}, "required limit flags missing: 0x2000"),
+        ({"limit_flags": 0x2008}, "required limit flags missing: 0x400"),
+        ({"limit_flags": 0x2408 | 0x800}, "breakaway flags present: 0x800"),
+        ({"limit_flags": 0x2408 | 0x1000}, "breakaway flags present: 0x1000"),
+        ({"limit_flags": 0x2408 | 0x2}, "unexpected limit flags: 0x2"),
+        ({"limit_flags": "x"}, "limit_flags missing or malformed"),
+        ({"active_process_limit": 2}, "active process limit is 2, not 1"),
+        ({"active_process_limit": 0}, "active process limit is 0, not 1"),
+        ({"active_process_limit": True}, "active process limit is True, not 1"),
+        ({"job_handle_inheritable": True}, "the job handle is (or may be) inheritable"),
+    ])
+    def test_invalid_configuration(self, changes, message):
+        assert f"job_configured: {message}" in strict_problems(
+            "job_configured", CONFIGURED, {**CONFIG_BODY, **changes})
+
+    def test_needs_a_verified_job(self):
+        for job in ({"limits_verified": False}, {"job_id": None}):
+            assert "job_configured needs a verified job identity" in strict_problems(
+                "job_configured", {**CONFIGURED, "job": {**JOB_READY, **job}}, CONFIG_BODY)
+
+    def test_delegates_to_the_planner(self, monkeypatch):
+        monkeypatch.setattr(P, "job_configuration_problems", lambda body: ["planner refuses"])
+        assert "job_configured: planner refuses" in strict_problems("job_configured",
+                                                                    CONFIGURED, CONFIG_BODY)
+        code = SOURCE.split('"""', 2)[2]
+        assert "breakaway flags present" not in code and "required_flags" not in code
+
+
+class TestStrictProcessCreation:
+    def test_constants_match_the_backend(self):
+        import win32_job as W
+        assert E.CREATION_ATTRIBUTES == (W.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                                         W.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                         W.PROC_THREAD_ATTRIBUTE_JOB_LIST)
+
+    @pytest.mark.parametrize("applied", [[0x20009, 0x20002, 0x2000D], [0x2000D, 0x20009, 0x20002]])
+    def test_applied_attributes_accepted(self, applied):
+        assert strict_problems("process_created", RUNNING,
+                               {**CREATED_BODY, "applied_attributes": applied}) == []
+
+    @pytest.mark.parametrize("applied, message", [
+        ([0x20009, 0x20002], "not exactly"), ([0x20009, 0x2000D], "not exactly"),
+        ([0x20009, 0x20002, 0x2000D, 0x20000], "not exactly"),
+        ([0x20009, 0x20002, 0x20002], "duplicates"),
+        ([0x20009, 0x20002, 0x2000D, 0x2000D], "duplicates"),
+        ([0x20009, 0x20002, True], "malformed"), ([0x20009, 0x20002, "0x2000D"], "malformed"),
+        ([], "not exactly"), (None, "malformed"), ({"job_list": 0x2000D}, "malformed"),
+        ("0x20009,0x20002,0x2000D", "malformed"),
+    ])
+    def test_invalid_applied_attributes(self, applied, message):
+        problems = strict_problems("process_created", RUNNING,
+                                   {**CREATED_BODY, "applied_attributes": applied})
+        assert any(message in p for p in problems), problems
+
+    @pytest.mark.parametrize("value", [False, None, 1, "true"])
+    def test_needs_a_successful_creation_result(self, value):
+        assert "process_created needs a successful CreateProcessW result" in strict_problems(
+            "process_created", RUNNING, {**CREATED_BODY, "create_process_ok": value})
+
+    def test_a_plan_is_not_proof(self):
+        planned = {k: v for k, v in CREATED_BODY.items() if k != "applied_attributes"}
+        planned["planned_attributes"] = [0x20009, 0x20002, 0x2000D]
+        for body in (planned, {**CREATED_BODY, "planned_attributes": [0x2000D]},
+                     {k: v for k, v in CREATED_BODY.items() if k != "create_process_ok"}):
+            assert any("a plan is not proof" in p
+                       for p in strict_problems("process_created", RUNNING, body))
+
+    def test_identity_still_required(self):
+        assert any("name the process" in p for p in strict_problems(
+            "process_created", RUNNING, {**CREATED_BODY, "pid": 1}))
+
+
+class TestStrictMembership:
+    @pytest.mark.parametrize("field", P.JOB_MEMBERSHIP_FIELDS)
+    def test_missing_membership_field(self, field):
+        membership = {k: v for k, v in MEMBERSHIP.items() if k != field}
+        assert any("membership must carry exactly" in p for p in strict_problems(
+            "job_verified_and_validated", RUNNING, {**VERIFIED_BODY, "membership": membership}))
+
+    def _membership(self, **changes):
+        return strict_problems("job_verified_and_validated", RUNNING,
+                               {**VERIFIED_BODY, "membership": {**MEMBERSHIP, **changes}})
+
+    @pytest.mark.parametrize("changes, message", [
+        ({"pid": 999}, "the PID 999 is not the expected child's"),
+        ({"creation_time": "2026-10-09T12:00:01.000Z"}, "creation time is not the expected"),
+        ({"job_assignment": "assigned_before_resume"}, "assigned_before_resume) is refused"),
+        ({"in_job": False}, "the child is not in the job"),
+        ({"in_job": "true"}, "in_job is malformed"),
+    ])
+    def test_identity_assignment_and_presence(self, changes, message):
+        assert any(message in p for p in self._membership(**changes))
+
+    @pytest.mark.parametrize("field, value, ok", [
+        ("active_processes", 0, False), ("active_processes", 1, True),
+        ("active_processes", 2, False), ("total_processes", 0, False),
+        ("total_processes", 1, True), ("total_processes", 2, False),
+        ("total_processes", True, False), ("active_processes", None, False),
+    ])
+    def test_process_counts(self, field, value, ok):
+        assert (self._membership(**{field: value}) == []) is ok
+
+    @pytest.mark.parametrize("members", [[4242, 7], [], [7], [4242, 4242], None])
+    def test_member_pids(self, members):
+        assert any("member" in p for p in self._membership(member_pids=members))
+
+    @pytest.mark.parametrize("changes", [
+        {"token_ok": False}, {"image_ok": False}, {"token_ok": None}, {"image_ok": "true"},
+        {"token_ok": 1}])
+    def test_token_and_image_must_be_true(self, changes):
+        assert "token and image validation must both be explicitly true" in strict_problems(
+            "job_verified_and_validated", RUNNING, {**VERIFIED_BODY, **changes})
+
+    @pytest.mark.parametrize("field", ["token_ok", "image_ok", "membership"])
+    def test_missing_body_field(self, field):
+        body = {k: v for k, v in VERIFIED_BODY.items() if k != field}
+        assert any("needs exactly membership, token_ok and image_ok" in p
+                   for p in strict_problems("job_verified_and_validated", RUNNING, body))
+
+    def test_needs_the_recorded_identity(self):
+        assert "job_verified_and_validated needs the recorded process identity" in \
+            strict_problems("job_verified_and_validated", CONFIGURED, VERIFIED_BODY)
+
+    def test_a_stage_name_alone_proves_nothing(self):
+        assert strict_problems("job_verified_and_validated", RUNNING, {})
+        assert strict_problems("job_verified_and_validated", RUNNING, {"members": [4242]})
+
+
+class TestStrictResumePrerequisites:
+    def test_resume_requires_a_valid_membership_record(self):
+        w = write_steps(writer(), 3)                      # up to process_created
+        with pytest.raises(E.EvidenceError, match="may not follow"):
+            w.write("resume_intent", envelope(**RUNNING), {})
+        before = (w.next_sequence, dict(w.fs.files))
+        bad = {**VERIFIED_BODY, "membership": {**MEMBERSHIP, "total_processes": 2}}
+        with pytest.raises(E.EvidenceError, match="total|processes have been"):
+            w.write("job_verified_and_validated", envelope(**RUNNING), bad)
+        assert (w.next_sequence, dict(w.fs.files)) == before     # nothing consumed
+        assert not w.state.evidence_failed and w.state.ownership_retained
+        assert not w.may_resume
+
+    def test_valid_membership_then_intent_allows_resume(self):
+        w = write_steps(writer(), 4)
+        assert not w.may_resume
+        w.write("resume_intent", envelope(**RUNNING), {})
+        assert w.may_resume
+
+    def test_explicit_strict_resume_check(self, monkeypatch):
+        records = chain_of(STEPS[:3] + [("resume_intent", RUNNING, {})])
+        chain = E.verify_chain(records)
+        assert not chain.ok and "may not follow" in chain.problems[0] and chain.count == 3
+        relaxed = {**E.ALLOWED_NEXT, "process_created": E.ALLOWED_NEXT["process_created"]
+                   | {"resume_intent"}}
+        monkeypatch.setattr(E, "ALLOWED_NEXT", relaxed)          # order rule bypassed in memory
+        chain = E.verify_chain(records)
+        assert not chain.ok and chain.count == 3
+        assert "resume_intent without a validated job membership record" in chain.problems[0]
+
+    def test_tampered_records_revoke_permissions(self):
+        w = write_steps(writer(), 5)
+        assert w.may_resume
+        w.records[3] = copy.deepcopy(w.records[3])
+        w.records[3]["body"]["membership"]["total_processes"] = 2
+        assert not w.may_resume and not w.may_launch
+        assert not E.verify_chain(w.records).ok
+
+    @pytest.mark.parametrize("mutate, message", [
+        (lambda r: r.__setitem__(3, {**r[3], "process": {"pid": 4243,
+                                                         "creation_time": CREATED}}),
+         "record 3"),
+        (lambda r: r.pop(3), "sequence"),
+        (lambda r: r.insert(3, r[4]), "sequence"),
+        (lambda r: r[3]["body"]["membership"].__setitem__("pid", 4243), "record 3"),
+        (lambda r: r[2]["body"].__setitem__("applied_attributes", [0x20009, 0x20002]),
+         "record 2"),
+    ])
+    def test_corrupted_truncated_reordered_or_conflicting(self, mutate, message):
+        records = copy.deepcopy(full_chain().records)
+        mutate(records)
+        chain = E.verify_chain(records)
+        assert not chain.ok and message in chain.problems[0]
+        assert "resume_intent" not in chain.kinds or chain.count > 4
+
+    def test_truncated_chain_never_permits_resume(self):
+        records = full_chain().records[:4]
+        w = writer()
+        w.records, w.next_sequence = records, 4
+        assert E.verify_chain(records).ok and not w.may_resume
+
+    def test_failed_write_retains_ownership(self):
+        w = write_steps(writer(FakeFs(fail={"flush": OSError(5, "flush failed")})), 0)
+        with pytest.raises(E.EvidenceFailed):
+            w.write("prelaunch", envelope(), {"result": "passed"})
+        assert w.state.evidence_failed and w.state.ownership_retained
+        assert not w.may_resume and not w.may_launch
+
+    def test_strict_contract_needs_no_real_io(self):
+        assert E.EVIDENCE_WRITES_ENABLED is False
+        fs = FakeFs()
+        write_steps(writer(fs))
+        assert set(fs.calls) <= {"dir_identity", "open", "write", "flush", "close", "read",
+                                 "identity"}
