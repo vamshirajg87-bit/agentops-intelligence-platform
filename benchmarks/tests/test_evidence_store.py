@@ -9,10 +9,12 @@ write, process, socket or subprocess fails the test.
 from __future__ import annotations
 
 import copy
+import ctypes
 import errno
 import hashlib
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -56,6 +58,8 @@ def fail_closed(monkeypatch):
     for name in ("Popen", "run", "call", "check_call", "check_output"):
         monkeypatch.setattr(subprocess, name, refuse(f"subprocess.{name}"))
     monkeypatch.setattr(socket, "create_connection", refuse("a network connection"))
+    monkeypatch.setattr(ctypes, "WinDLL", refuse("a real DLL load"))
+    monkeypatch.setattr(E, "_kernel32_loader", refuse("the real kernel32 loader"))
 
 
 class FakeFs:
@@ -202,10 +206,16 @@ class TestGatesAndScope:
 
     def test_source_has_no_real_io(self):
         code = SOURCE.split('"""', 2)[2]
-        for word in ("open(", "os.", "import os", "mkdir", "write_text", "write_bytes",
-                     "shutil", "subprocess", "socket", "ctypes", "WinDLL", "fsync(",
-                     "unlink", "rename(", "replace(path", "calibrate_generator"):
+        assert not re.search(r"(?<![\w.])open\(", code)            # only self._open(...)
+        for word in ("os.", "import os", "mkdir", "write_text", "write_bytes", "shutil",
+                     "subprocess", "socket", "fsync(", "unlink", "rename(", "replace(path",
+                     "CreateDirectory", "DeleteFile", "MoveFile", "RemoveDirectory"):
             assert word not in code, word
+        start = code.index("# WindowsFsOps (slice E2)")
+        end = code.index("# Recovery classification")
+        outside = code[:start] + code[end:]
+        for word in ("ctypes", "WinDLL", "calibrate_generator", "kernel32"):
+            assert word not in outside, word                       # native code only in E2
 
     def test_nothing_imports_the_store(self):
         for name in ("calibrate_generator.py", "appcontainer_preflight.py", "win32_job.py"):
@@ -612,3 +622,543 @@ class TestRecovery:
     def test_requires_a_chain_state(self):
         with pytest.raises(E.EvidenceError):
             E.classify_recovery({"durable_stages": []}, NOT_FOUND)
+
+
+# ---------------------------------------------------------------------------
+# WindowsFsOps (E2) over a fake kernel32
+# ---------------------------------------------------------------------------
+
+class FakeFunction:
+    def __init__(self, name, implementation, log):
+        self.name, self.implementation, self.log = name, implementation, log
+
+    def __call__(self, *args):
+        self.log.append(self.name)
+        return self.implementation(*args)
+
+
+class FakeDll:
+    def __init__(self, kernel32):
+        self._k = kernel32
+
+    def __getattr__(self, name):
+        if name.startswith("_") or name not in FakeKernel32Fs.APIS:
+            raise LiveAccessAttempt(f"unexpected Windows API {name}")
+        return FakeFunction(name, getattr(self._k, name), self._k.log)
+
+
+class FakeKernel32Fs:
+    """A tiny NTFS-like file system behind the eight kernel32 functions."""
+
+    APIS = ("CreateFileW", "WriteFile", "ReadFile", "FlushFileBuffers", "CloseHandle",
+            "GetFileInformationByHandle", "GetFinalPathNameByHandleW", "GetHandleInformation")
+
+    def __init__(self, **overrides):
+        self.dirs = {RUN_DIR: {"attrs": E.FILE_ATTRIBUTE_DIRECTORY, "volume": 77}}
+        self.files, self.handles, self.closed, self.log, self.loads = {}, {}, [], [], []
+        self.fail, self.last_error, self.next_handle = {}, 0, 0x100
+        self.inherit_flags, self.write_mode, self.read_overclaim = 0, None, False
+        self.final_override = self.final_length = None
+        self.file_info, self.dir_info, self.calls_args = {}, {}, []
+        self.__dict__.update(overrides)
+
+    def loader(self, name):
+        self.loads.append(name)
+        return FakeDll(self)
+
+    def _failing(self, api):
+        code = self.fail.get(api)
+        if code is not None:
+            self.last_error = code
+            return True
+        return False
+
+    def CreateFileW(self, path, access, share, attributes, disposition, flags, template):
+        self.calls_args.append((path, access, share, attributes, disposition, flags, template))
+        assert attributes is None and template is None          # non-inheritable, no template
+        if self._failing("CreateFileW"):
+            return -1
+        if flags & E.FILE_FLAG_BACKUP_SEMANTICS:
+            assert flags & E.FILE_FLAG_OPEN_REPARSE_POINT
+            if path not in self.dirs:
+                self.last_error = 3
+                return -1
+            kind = "dir"
+        elif disposition == E.CREATE_NEW:
+            assert (access, share) == (E.GENERIC_WRITE, 0)
+            assert flags & E.FILE_FLAG_WRITE_THROUGH
+            if path in self.files:
+                self.last_error = 80
+                return -1
+            if path.rsplit("\\", 1)[0] not in self.dirs:
+                self.last_error = 3
+                return -1
+            self.files[path] = {"data": bytearray(), "attrs": E.FILE_ATTRIBUTE_NORMAL,
+                                "links": 1, "volume": 77, "index": len(self.files) + 1}
+            kind = "write"
+        else:
+            assert disposition == E.OPEN_EXISTING and flags & E.FILE_FLAG_OPEN_REPARSE_POINT
+            if path not in self.files:
+                self.last_error = 2
+                return -1
+            kind = "read" if access == E.GENERIC_READ else "identity"
+        handle, self.next_handle = self.next_handle, self.next_handle + 4
+        self.handles[handle] = {"path": path, "kind": kind, "pos": 0}
+        return handle
+
+    def GetHandleInformation(self, handle, flags):
+        if self._failing("GetHandleInformation"):
+            return 0
+        flags._obj.value = self.inherit_flags
+        return 1
+
+    def WriteFile(self, handle, address, length, written, overlapped):
+        if self._failing("WriteFile"):
+            return 0
+        data = ctypes.string_at(address, length)
+        claimed = {"zero": 0, "half": max(1, length // 2), "over": length + 1,
+                   "lie": length}.get(self.write_mode, length)
+        stored = data[:min(claimed, length)] if self.write_mode != "lie" else data[:-1]
+        self.files[self.handles[handle]["path"]]["data"] += stored
+        written._obj.value = claimed
+        return 1
+
+    def FlushFileBuffers(self, handle):
+        return 0 if self._failing("FlushFileBuffers") else 1
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        self.handles.pop(handle, None)
+        return 0 if self._failing("CloseHandle") else 1
+
+    def ReadFile(self, handle, address, length, read, overlapped):
+        if self._failing("ReadFile"):
+            return 0
+        entry = self.handles[handle]
+        data = bytes(self.files[entry["path"]]["data"])
+        chunk = data[entry["pos"]:entry["pos"] + length]
+        if self.read_overclaim and chunk:
+            read._obj.value = length + 5
+            return 1
+        ctypes.memmove(address, chunk, len(chunk))
+        entry["pos"] += len(chunk)
+        read._obj.value = len(chunk)
+        return 1
+
+    def GetFileInformationByHandle(self, handle, info_ref):
+        if self._failing("GetFileInformationByHandle"):
+            return 0
+        entry = self.handles[handle]
+        if entry["kind"] == "dir":
+            source = self.dirs[entry["path"]]
+            values = {"attrs": source["attrs"], "volume": source["volume"], "size": 0,
+                      "links": 1, "index": 1, **self.dir_info}
+        else:
+            source = self.files[entry["path"]]
+            values = {"attrs": source["attrs"], "volume": source["volume"],
+                      "size": len(source["data"]), "links": source["links"],
+                      "index": source["index"], **self.file_info}
+        info = info_ref._obj
+        info.dwFileAttributes, info.dwVolumeSerialNumber = values["attrs"], values["volume"]
+        info.nFileSizeHigh, info.nFileSizeLow = values["size"] >> 32, values["size"] & 0xFFFFFFFF
+        info.nNumberOfLinks = values["links"]
+        info.nFileIndexHigh, info.nFileIndexLow = 0, values["index"]
+        return 1
+
+    def GetFinalPathNameByHandleW(self, handle, address, capacity, flags):
+        if self._failing("GetFinalPathNameByHandleW"):
+            return 0
+        assert flags == E.FINAL_PATH_FLAGS and capacity == E.FINAL_PATH_CAPACITY
+        text = self.final_override if self.final_override is not None \
+            else "\\\\?\\" + self.handles[handle]["path"]
+        encoded = (text + "\0").encode("utf-16-le")
+        ctypes.memmove(address, encoded, len(encoded))
+        return len(text) if self.final_length is None else self.final_length
+
+
+def open_gates(monkeypatch):
+    """In memory only: the evidence-write flag and a probe authorization."""
+    monkeypatch.setattr(E, "EVIDENCE_WRITES_ENABLED", True)
+    monkeypatch.setattr(C, "PROBE_ENABLED", True)
+    monkeypatch.setattr(C, "APPROVED_PROBES", frozenset({"probe-01"}))
+    monkeypatch.setattr(C, "_git_head", lambda *require: HEAD)
+    return C.authorize_probe("probe-01", HEAD)
+
+
+def win_fs(monkeypatch, **overrides):
+    kernel32 = FakeKernel32Fs(**overrides)
+    fs = E.WindowsFsOps(open_gates(monkeypatch), loader=kernel32.loader,
+                        last_error=lambda: kernel32.last_error)
+    return fs, kernel32
+
+
+class TestWindowsFsOpsGates:
+    def test_disabled_flag_refuses_before_loading(self):
+        kernel32 = FakeKernel32Fs()
+        with pytest.raises(E.EvidenceDisabled, match="not enabled"):
+            E.WindowsFsOps(object(), loader=kernel32.loader)
+        assert kernel32.loads == [] and kernel32.log == []
+
+    def test_flag_alone_is_not_enough(self, monkeypatch):
+        monkeypatch.setattr(E, "EVIDENCE_WRITES_ENABLED", True)
+        for forged in (None, object(), C.ProbeAuthorization("probe-01", HEAD)):
+            with pytest.raises(E.EvidenceDisabled, match="no valid authorization"):
+                E.WindowsFsOps(forged, loader=FakeKernel32Fs().loader)
+
+    def test_gates_rechecked_on_every_call(self, monkeypatch):
+        fs, kernel32 = win_fs(monkeypatch)
+        monkeypatch.setattr(E, "EVIDENCE_WRITES_ENABLED", False)
+        with pytest.raises(E.EvidenceDisabled):
+            fs.dir_identity(RUN_DIR)
+        monkeypatch.setattr(E, "EVIDENCE_WRITES_ENABLED", True)
+        monkeypatch.setattr(C, "PROBE_ENABLED", False)
+        with pytest.raises(E.EvidenceDisabled):
+            fs.dir_identity(RUN_DIR)
+        assert kernel32.loads == [] and kernel32.log == []
+
+    def test_real_loader_is_never_used(self, monkeypatch):
+        fs = E.WindowsFsOps(open_gates(monkeypatch))
+        assert not fs.loaded
+        with pytest.raises(LiveAccessAttempt, match="real kernel32 loader"):
+            fs.dir_identity(RUN_DIR)
+
+
+@pytest.fixture
+def no_harness_import(monkeypatch):
+    """Any attempt to import the harness (or run_benchmark) or to probe the
+    temporary directory fails the test."""
+    import builtins
+    import importlib
+    import tempfile
+    real_import = builtins.__import__
+    attempts = []
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] in ("calibrate_generator", "run_benchmark"):
+            attempts.append(name)
+            raise LiveAccessAttempt(f"import of {name} attempted")
+        return real_import(name, *args, **kwargs)
+
+    def refuse(what):
+        def call(*args, **kwargs):
+            attempts.append(what)
+            raise LiveAccessAttempt(f"{what} attempted")
+        return call
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(importlib, "import_module", refuse("importlib.import_module"))
+    monkeypatch.setattr(tempfile, "gettempdir", refuse("tempfile.gettempdir"))
+    monkeypatch.setattr(tempfile, "_get_default_tempdir", refuse("the tempdir probe"))
+    return attempts
+
+
+def fake_harness(**attributes):
+    """A module object posing as the harness (it can never be the real one)."""
+    import importlib.machinery
+    import types as pytypes
+    module = pytypes.ModuleType(E.HARNESS_MODULE)
+    module.__spec__ = importlib.machinery.ModuleSpec(E.HARNESS_MODULE, None)
+    module.__spec__._initializing = False
+    module.__file__ = C.__file__
+    module._require_any_authorization = C._require_any_authorization
+    module.CalibrationError = C.CalibrationError
+    for name, value in attributes.items():
+        setattr(module, name, value)
+    return module
+
+
+class TestHarnessLookup:
+    def test_lookup_only_in_source(self):
+        code = SOURCE.split('"""', 2)[2]
+        section = code[code.index("# WindowsFsOps (slice E2)"):code.index(
+            "# Recovery classification")]
+        for word in ("import calibrate_generator", "import run_benchmark", "importlib",
+                     "__import__", "tempfile", "exec(", "eval("):
+            assert word not in section, word
+        assert "sys.modules.get(HARNESS_MODULE)" in section
+
+    def test_missing_module_refuses_without_import(self, monkeypatch, no_harness_import):
+        auth = open_gates(monkeypatch)
+        monkeypatch.delitem(sys.modules, E.HARNESS_MODULE)
+        kernel32 = FakeKernel32Fs()
+        with pytest.raises(E.EvidenceDisabled, match="not loaded; the evidence adapter never "
+                                                     "imports it"):
+            E.WindowsFsOps(auth, loader=kernel32.loader)
+        assert no_harness_import == [] and kernel32.loads == []
+        assert E.HARNESS_MODULE not in sys.modules                 # not preloaded or repaired
+
+    def test_removal_after_construction_blocks_every_call(self, monkeypatch, no_harness_import):
+        fs, kernel32 = win_fs(monkeypatch)
+        monkeypatch.delitem(sys.modules, E.HARNESS_MODULE)
+        for call in (lambda: fs.dir_identity(RUN_DIR), lambda: fs.open_exclusive("x"),
+                     lambda: fs.write(1, b"x"), lambda: fs.flush(1), lambda: fs.close(1),
+                     lambda: fs.read_all("x"), lambda: fs.file_identity("x")):
+            with pytest.raises(E.EvidenceDisabled, match="not loaded"):
+                call()
+        assert kernel32.log == [] and kernel32.loads == [] and no_harness_import == []
+
+    def test_partially_initialized_module_refuses(self, monkeypatch, no_harness_import):
+        auth = open_gates(monkeypatch)
+        monkeypatch.setattr(C.__spec__, "_initializing", True, raising=False)
+        with pytest.raises(E.EvidenceDisabled, match="partially initialized"):
+            E.WindowsFsOps(auth, loader=FakeKernel32Fs().loader)
+        monkeypatch.setattr(C.__spec__, "_initializing", False, raising=False)
+        monkeypatch.setitem(sys.modules, E.HARNESS_MODULE, fake_harness(__spec__=None))
+        with pytest.raises(E.EvidenceDisabled, match="partially initialized"):
+            E.WindowsFsOps(auth, loader=FakeKernel32Fs().loader)
+        assert no_harness_import == []
+
+    @pytest.mark.parametrize("attributes, message", [
+        ({"__name__": "other"}, "unexpected name"),
+        ({"__file__": r"C:\elsewhere\calibrate_generator.py"}, "replaced"),
+        ({"__file__": None}, "replaced"),
+        ({}, "not the module's own"),                         # a perfect-looking impostor
+        ({"_require_any_authorization": None}, "missing or not the module's own"),
+    ])
+    def test_replaced_or_malformed_module_refuses(self, monkeypatch, no_harness_import,
+                                                  attributes, message):
+        auth = open_gates(monkeypatch)
+        monkeypatch.setitem(sys.modules, E.HARNESS_MODULE, fake_harness(**attributes))
+        with pytest.raises(E.EvidenceDisabled, match=message):
+            E.WindowsFsOps(auth, loader=FakeKernel32Fs().loader)
+        assert no_harness_import == []
+
+    def test_tampered_real_module_refuses(self, monkeypatch, no_harness_import):
+        auth = open_gates(monkeypatch)
+        monkeypatch.setattr(C, "_require_any_authorization", lambda authorization: authorization)
+        with pytest.raises(E.EvidenceDisabled, match="not the module's own"):
+            E.WindowsFsOps(auth, loader=FakeKernel32Fs().loader)
+        monkeypatch.undo()
+        auth = open_gates(monkeypatch)
+        monkeypatch.setattr(C, "CalibrationError", "not a type")
+        with pytest.raises(E.EvidenceDisabled, match="error type"):
+            E.WindowsFsOps(auth, loader=FakeKernel32Fs().loader)
+
+    def test_presence_is_not_authorization(self, monkeypatch, no_harness_import):
+        monkeypatch.setattr(E, "EVIDENCE_WRITES_ENABLED", True)
+        assert sys.modules[E.HARNESS_MODULE] is C
+        for forged in (None, object(), C.ProbeAuthorization("probe-01", HEAD)):
+            with pytest.raises(E.EvidenceDisabled, match="no valid authorization"):
+                E.WindowsFsOps(forged, loader=FakeKernel32Fs().loader)
+        assert no_harness_import == []
+
+    def test_valid_authorization_with_the_loaded_harness(self, monkeypatch, no_harness_import):
+        fs, kernel32 = win_fs(monkeypatch)
+        w = write_steps(win_writer(fs))
+        complete(w)
+        assert E.verify_chain(w.records).ok and no_harness_import == []
+        assert kernel32.loads == ["kernel32"]
+
+    def test_revoked_authorization_refuses_every_operation(self, monkeypatch,
+                                                           no_harness_import):
+        fs, kernel32 = win_fs(monkeypatch)
+        monkeypatch.setattr(C, "APPROVED_PROBES", frozenset())         # revoke
+        for call in (lambda: fs.dir_identity(RUN_DIR), lambda: fs.open_exclusive("x"),
+                     lambda: fs.write(1, b"x"), lambda: fs.flush(1), lambda: fs.close(1),
+                     lambda: fs.read_all("x"), lambda: fs.file_identity("x")):
+            with pytest.raises(E.EvidenceDisabled, match="no valid authorization"):
+                call()
+        assert kernel32.log == [] and kernel32.loads == [] and no_harness_import == []
+
+    def test_disabled_flag_never_looks_up_or_imports(self, monkeypatch, no_harness_import):
+        monkeypatch.delitem(sys.modules, E.HARNESS_MODULE)
+        with pytest.raises(E.EvidenceDisabled, match="not enabled"):
+            E.WindowsFsOps(object(), loader=FakeKernel32Fs().loader)
+        assert no_harness_import == []
+
+
+class TestWindowsFsOpsContracts:
+    @pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="x64 layout")
+    def test_structure_layout(self):
+        t = E._fs_types()
+        assert ctypes.sizeof(t.INFO) == 52 and ctypes.sizeof(t.FILETIME) == 8
+        assert t.INFO.dwVolumeSerialNumber.offset == 28 and t.INFO.nNumberOfLinks.offset == 40
+        assert t.INFO.nFileIndexLow.offset == 48
+
+    def test_signatures(self):
+        t = E._fs_types()
+        signatures = E._fs_signatures(t)
+        assert set(signatures) == set(FakeKernel32Fs.APIS)
+        assert signatures["CreateFileW"][0] is t.w.HANDLE
+        assert len(signatures["CreateFileW"][1]) == 7
+        assert signatures["GetFinalPathNameByHandleW"][0] is t.w.DWORD
+
+    def test_flags(self):
+        assert (E.CREATE_NEW, E.OPEN_EXISTING, E.GENERIC_WRITE, E.GENERIC_READ) == (
+            1, 3, 0x40000000, 0x80000000)
+        assert (E.FILE_FLAG_WRITE_THROUGH, E.FILE_FLAG_BACKUP_SEMANTICS,
+                E.FILE_FLAG_OPEN_REPARSE_POINT, E.FILE_ATTRIBUTE_REPARSE_POINT) == (
+            0x80000000, 0x02000000, 0x00200000, 0x400)
+
+    @pytest.mark.parametrize("text, expected", [
+        ("\\\\?\\C:\\Users\\u\\x", "C:\\Users\\u\\x"),
+        ("\\\\?\\UNC\\server\\share\\x", "\\\\server\\share\\x"),
+    ])
+    def test_final_path_normalization(self, text, expected):
+        assert E.normalize_final_path(text) == expected
+
+    @pytest.mark.parametrize("text", ["C:\\x", "\\\\?\\Volume{1}\\x", "", None, "\\\\?\\C:\\a\x00"])
+    def test_malformed_final_paths(self, text):
+        with pytest.raises(OSError):
+            E.normalize_final_path(text)
+
+    def test_windows_error_mapping(self):
+        assert isinstance(E.windows_error("x", 80), FileExistsError)
+        assert isinstance(E.windows_error("x", 5), PermissionError)
+        assert isinstance(E.windows_error("x", 3), FileNotFoundError)
+        full = E.windows_error("x", 112)
+        assert full.errno == errno.ENOSPC and full.windows_code == 112
+        assert type(E.windows_error("x", 1234)) is OSError
+
+
+def win_writer(fs):
+    return E.EvidenceWriter(RUN_DIR, fs, expected_dir={"final_path": RUN_DIR,
+                                                       "volume_serial": 77},
+                            run_id=RUN, expected_head=HEAD, token_sha256=TOKEN_SHA)
+
+
+class TestWindowsFsOpsWrites:
+    def test_full_chain_matches_the_fake_path(self, monkeypatch):
+        fs, kernel32 = win_fs(monkeypatch)
+        w = write_steps(win_writer(fs))
+        complete(w)
+        chain = E.verify_chain(w.records)
+        assert chain.ok and chain.complete
+        assert chain.tip_digest == full_chain().state.last_verified_digest
+        name = RUN_DIR + "\\000-prelaunch.json"
+        assert bytes(kernel32.files[name]["data"]) == P.canonical_json(w.records[0])
+        assert kernel32.handles == {} and kernel32.loads == ["kernel32"]
+        assert kernel32.dirs == {RUN_DIR: {"attrs": E.FILE_ATTRIBUTE_DIRECTORY, "volume": 77}}
+
+    def test_partial_writes_progress(self, monkeypatch):
+        fs, _ = win_fs(monkeypatch, write_mode="half")
+        w = win_writer(fs)
+        w.write("prelaunch", envelope(), {"x": "y" * 200})
+        assert w.state.last_verified_sequence == 0
+
+    def _fails(self, monkeypatch, operation, partial=None, **overrides):
+        fs, kernel32 = win_fs(monkeypatch, **overrides)
+        w = win_writer(fs)
+        with pytest.raises(E.EvidenceFailed):
+            w.write("prelaunch", envelope(), {})
+        assert w.state.failed_operation == operation, w.state.failed_operation
+        if partial is not None:
+            assert w.state.partial_record_possible is partial
+        assert kernel32.handles == {}                              # every handle closed
+        return w, kernel32
+
+    @pytest.mark.parametrize("overrides, operation, partial", [
+        ({"write_mode": "zero"}, "write_short", True),
+        ({"write_mode": "over"}, "write_short", True),
+        ({"write_mode": "lie"}, "readback_mismatch", True),
+        ({"fail": {"WriteFile": 112}}, "write:OSError", True),
+        ({"fail": {"FlushFileBuffers": 1117}}, "flush:OSError", True),
+        ({"fail": {"ReadFile": 23}}, "readback:OSError", True),
+        ({"read_overclaim": True}, "readback:OSError", True),
+        ({"file_info": {"links": 2}}, "file_identity", True),
+        ({"file_info": {"attrs": E.FILE_ATTRIBUTE_NORMAL | E.FILE_ATTRIBUTE_REPARSE_POINT}},
+         "file_identity", True),
+        ({"file_info": {"volume": 78}}, "file_identity", True),
+        ({"file_info": {"attrs": E.FILE_ATTRIBUTE_DIRECTORY}}, "file_identity:OSError", True),
+        ({"inherit_flags": 1}, "create_unusable:OSError", True),
+        ({"fail": {"GetHandleInformation": 6}}, "create_unusable:OSError", True),
+        ({"fail": {"CreateFileW": 112}}, "directory_identity:OSError", False),
+        ({"dirs": {}}, "directory_missing", False),
+        ({"dir_info": {"attrs": E.FILE_ATTRIBUTE_DIRECTORY | E.FILE_ATTRIBUTE_REPARSE_POINT}},
+         "directory_reparse_point", False),
+        ({"dir_info": {"attrs": E.FILE_ATTRIBUTE_NORMAL}}, "directory_identity:OSError", False),
+        ({"dir_info": {"volume": 78}}, "directory_volume_mismatch", False),
+        ({"final_override": "\\\\?\\C:\\elsewhere"}, "directory_path_mismatch", False),
+        ({"final_override": "C:\\no-prefix"}, "directory_identity:OSError", False),
+        ({"final_length": 0}, "directory_identity:OSError", False),
+        ({"final_length": 3}, "directory_identity:OSError", False),
+        ({"fail": {"GetFileInformationByHandle": 6}}, "directory_identity:OSError", False),
+    ])
+    def test_failures(self, monkeypatch, overrides, operation, partial):
+        self._fails(monkeypatch, operation, partial, **overrides)
+
+    def test_duplicate_create(self, monkeypatch):
+        fs, kernel32 = win_fs(monkeypatch)
+        name = RUN_DIR + "\\000-prelaunch.json"
+        kernel32.files[name] = {"data": bytearray(b"existing"), "attrs": 0x80, "links": 1,
+                                "volume": 77, "index": 1}
+        w = win_writer(fs)
+        with pytest.raises(E.EvidenceFailed, match="create_duplicate"):
+            w.write("prelaunch", envelope(), {})
+        assert bytes(kernel32.files[name]["data"]) == b"existing"
+        assert not w.state.partial_record_possible
+
+    @pytest.mark.parametrize("code, operation", [(112, "create:OSError"),
+                                                 (5, "create:PermissionError"),
+                                                 (3, "create:FileNotFoundError")])
+    def test_create_errors(self, monkeypatch, code, operation):
+        fs, kernel32 = win_fs(monkeypatch)
+        real_create = kernel32.CreateFileW
+
+        def create(path, access, share, attributes, disposition, flags, template):
+            if disposition == E.CREATE_NEW:
+                kernel32.last_error = code
+                return -1
+            return real_create(path, access, share, attributes, disposition, flags, template)
+
+        kernel32.CreateFileW = create
+        w = win_writer(fs)
+        with pytest.raises(E.EvidenceFailed, match=operation):
+            w.write("prelaunch", envelope(), {})
+        assert kernel32.files == {} and not w.state.partial_record_possible
+
+    def test_close_failure(self, monkeypatch):
+        fs, kernel32 = win_fs(monkeypatch)
+        real_close = kernel32.CloseHandle
+
+        def close(handle):
+            kind = kernel32.handles.get(handle, {}).get("kind")
+            real_close(handle)
+            return 0 if kind == "write" else 1
+
+        kernel32.CloseHandle = close
+        w = win_writer(fs)
+        with pytest.raises(E.EvidenceFailed, match="close:OSError"):
+            w.write("prelaunch", envelope(), {})
+        assert w.state.partial_record_possible
+
+    def test_short_read_and_growth(self, monkeypatch):
+        fs, kernel32 = win_fs(monkeypatch)
+        name = RUN_DIR + "\\x.json"
+        kernel32.files[name] = {"data": bytearray(b"abc"), "attrs": 0x80, "links": 1,
+                                "volume": 77, "index": 5}
+        assert fs.read_all(name) == b"abc"
+        kernel32.file_info = {"size": 5}
+        with pytest.raises(OSError, match="short read"):
+            fs.read_all(name)
+        kernel32.file_info = {"size": 2}
+        with pytest.raises(OSError, match="grew"):
+            fs.read_all(name)
+        kernel32.file_info = {"size": E.MAX_RECORD_BYTES + 1}
+        with pytest.raises(OSError, match="too large"):
+            fs.read_all(name)
+        assert kernel32.handles == {}
+
+    def test_file_identity_values(self, monkeypatch):
+        fs, kernel32 = win_fs(monkeypatch)
+        name = RUN_DIR + "\\x.json"
+        kernel32.files[name] = {"data": bytearray(b"abcd"), "attrs": 0x80, "links": 1,
+                                "volume": 77, "index": 9}
+        assert fs.file_identity(name) == {"links": 1, "reparse": False, "volume_serial": 77,
+                                          "file_index": 9, "size": 4}
+        assert fs.dir_identity(RUN_DIR) == {"exists": True, "reparse": False,
+                                            "final_path": RUN_DIR, "volume_serial": 77}
+        assert kernel32.handles == {}
+
+    def test_open_flags(self, monkeypatch):
+        fs, kernel32 = win_fs(monkeypatch)
+        win_writer(fs).write("prelaunch", envelope(), {})
+        creates = [args for args in kernel32.calls_args if args[4] == E.CREATE_NEW]
+        assert len(creates) == 1
+        _, access, share, attributes, _, flags, template = creates[0]
+        assert (access, share, attributes, template) == (E.GENERIC_WRITE, 0, None, None)
+        assert flags == E.FILE_ATTRIBUTE_NORMAL | E.FILE_FLAG_WRITE_THROUGH
+        for path, access, share, attributes, disposition, flags, template in kernel32.calls_args:
+            if disposition == E.OPEN_EXISTING:
+                assert flags & E.FILE_FLAG_OPEN_REPARSE_POINT        # never follow a reparse
+        assert "GetHandleInformation" in kernel32.log
