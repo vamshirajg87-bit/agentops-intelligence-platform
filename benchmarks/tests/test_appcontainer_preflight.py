@@ -880,3 +880,422 @@ class TestNoImplicitAuthorization:
         plan = P.build_plan({}, expected_head=None, verified={p: True for p in P.PREREQUISITES})
         assert plan["recommendation"] == "NO-GO"
         assert any(r.startswith("harness: ") for r in plan["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# Job Object lifecycle policy (pure; fake evidence only)
+# ---------------------------------------------------------------------------
+
+PID, CREATED_AT = 4242, "2026-10-09T12:00:00.000Z"
+SAME = {"pid": PID, "creation_time": CREATED_AT}
+
+
+def _lc(state, event, **evidence):
+    return P.lifecycle_transition(state, event, evidence)
+
+
+def created(assignment="assigned_at_creation"):
+    return _lc(P.LifecycleState(), "created", pid=PID, creation_time=CREATED_AT,
+               job_assignment=assignment, job_limits_verified=True)
+
+
+def validated():
+    state = _lc(created(), "job_assigned", **SAME, in_job=True)
+    return _lc(state, "validated", **SAME, token_ok=True, image_ok=True)
+
+
+def resumed():
+    return _lc(validated(), "resume_result", **SAME, previous=1, intent_durable=True)
+
+
+class TestLifecyclePolicyStatus:
+    def test_policy_is_design_only(self):
+        assert P.TERMINATION_POLICY == "conditionally_accepted_design_only"
+        assert P.policy_enables_execution() is False
+        assert P.timeout_schedule()["enables_execution"] is False
+        assert P.DISCARD_EXIT_CODE == C.DISCARD_EXIT_CODE
+        harness = (_BENCH / "calibrate_generator.py").read_text(encoding="utf-8")
+        assert "TERMINATION_POLICY" not in harness and "JobObject" not in harness
+
+    def test_lifecycle_code_is_pure(self):
+        start = SOURCE.index("# Job Object lifecycle policy")
+        section = SOURCE[start:SOURCE.index("# Entry point (prints a plan")]
+        for word in ("ctypes", "WinDLL", "windll", "subprocess", "socket", "open(", "Path(",
+                     "os.", "time.sleep", "TerminateJobObject(", "CreateJobObject",
+                     "threading", "harness."):
+            assert word not in section, word
+
+
+class TestLifecycleTransitions:
+    def test_initial_state(self):
+        state = P.LifecycleState()
+        assert state.as_dict() == {
+            "phase": "not_started", "process_created": False, "pid": None,
+            "creation_time": None, "job_assignment": "not_created",
+            "job_limits_verified": False, "execution_history": None, "liveness": None,
+            "termination_cause": None, "exit_code": None, "exit_evidence": None,
+            "handles_retained": False, "cleanup_errors": []}
+
+    def test_happy_path_with_natural_exit(self):
+        state = created()
+        assert (state.phase, state.execution_history, state.liveness) == (
+            "created_suspended", P.NEVER_EXECUTED, P.ALIVE_AT_LAST_CHECK)
+        assert state.handles_retained and state.process_created
+        state = resumed()
+        assert (state.phase, state.execution_history) == ("resumed", P.MAY_HAVE_EXECUTED)
+        state = _lc(state, "wait_result", **SAME, signaled=False, exit_code=None)
+        assert state.liveness == P.ALIVE_AT_LAST_CHECK and state.phase == "resumed"
+        state = _lc(state, "wait_result", **SAME, signaled=True, exit_code=0)
+        assert (state.phase, state.liveness, state.termination_cause, state.exit_code,
+                state.exit_evidence, state.handles_retained) == (
+            "exited", P.CONFIRMED_EXITED, "natural_exit", 0, "wait+exit_code", False)
+        assert state.execution_history == P.MAY_HAVE_EXECUTED
+
+    def test_assignment_after_creation(self):
+        state = _lc(created("unknown"), "job_assigned", **SAME, in_job=True)
+        assert state.job_assignment == "assigned_before_resume"
+        state = _lc(created(), "job_assigned", **SAME, in_job=True)
+        assert state.job_assignment == "assigned_at_creation"
+
+    def test_assignment_failure_then_verified_discard(self):
+        state = _lc(created("unknown"), "assignment_failed", **SAME, reason="access denied")
+        assert state.job_assignment == "assignment_failed" and state.phase == "assignment_failed"
+        state = _lc(state, "terminate_result", **SAME, cause="discarded_before_resume",
+                    api_ok=True, signaled=True, exit_code=P.DISCARD_EXIT_CODE)
+        assert (state.liveness, state.termination_cause, state.execution_history) == (
+            P.CONFIRMED_EXITED, "discarded_before_resume", P.NEVER_EXECUTED)
+
+    def test_rejected_validation_is_discarded(self):
+        state = _lc(created(), "job_assigned", **SAME, in_job=True)
+        state = _lc(state, "validated", **SAME, token_ok=False, image_ok=True)
+        assert state.phase == "rejected"
+        with pytest.raises(P.LifecycleError, match="not allowed in phase rejected"):
+            _lc(state, "resume_result", **SAME, previous=1, intent_durable=True)
+        state = _lc(state, "terminate_result", **SAME, cause="discarded_before_resume",
+                    api_ok=True, signaled=True, exit_code=P.DISCARD_EXIT_CODE)
+        assert state.execution_history == P.NEVER_EXECUTED
+
+    @pytest.mark.parametrize("evidence, phase, history", [
+        ({"previous": 1}, "resumed", P.MAY_HAVE_EXECUTED),
+        ({"previous": 0}, "resume_rejected", P.MAY_HAVE_EXECUTED),
+        ({"previous": 2}, "resume_rejected", P.NEVER_EXECUTED),
+        ({"previous": P.RESUME_FAILED_VALUE}, "resume_rejected", P.STATE_UNKNOWN),
+        ({"error": "ResumeThread failed (Windows error 6)"}, "resume_rejected",
+         P.STATE_UNKNOWN),
+    ])
+    def test_resume_results(self, evidence, phase, history):
+        state = _lc(validated(), "resume_result", **SAME, intent_durable=True, **evidence)
+        assert (state.phase, state.execution_history) == (phase, history)
+
+    def test_no_resume_without_durable_intent(self):
+        with pytest.raises(P.LifecycleError, match="durable resume-intent"):
+            _lc(validated(), "resume_result", **SAME, previous=1, intent_durable=False)
+        with pytest.raises(P.LifecycleError, match="exactly one of previous or error"):
+            _lc(validated(), "resume_result", **SAME, previous=1, error="x", intent_durable=True)
+
+    def test_timeout_termination_verified(self):
+        state = _lc(resumed(), "terminate_result", **SAME, cause="job_terminated_timeout",
+                    api_ok=True, signaled=True, exit_code=P.TIMEOUT_EXIT_CODE)
+        assert (state.liveness, state.termination_cause, state.exit_evidence) == (
+            P.CONFIRMED_EXITED, "job_terminated_timeout", "wait+exit_code")
+        assert state.execution_history == P.MAY_HAVE_EXECUTED and not state.handles_retained
+
+    def test_termination_api_success_without_exit_verification(self):
+        state = _lc(resumed(), "terminate_result", **SAME, cause="job_terminated_timeout",
+                    api_ok=True, signaled=False, exit_code=None)
+        assert (state.phase, state.liveness, state.handles_retained) == (
+            "termination_unverified", P.STATE_UNKNOWN, True)
+        assert "not verified" in state.cleanup_errors[-1]
+        with pytest.raises(P.LifecycleError, match="not allowed in phase termination_unverif"):
+            _lc(state, "terminate_result", **SAME, cause="job_terminated_timeout",
+                api_ok=True, signaled=True, exit_code=P.TIMEOUT_EXIT_CODE)   # no retry
+
+    def test_wrong_exit_code_is_not_a_verified_termination(self):
+        state = _lc(created(), "terminate_result", **SAME, cause="discarded_before_resume",
+                    api_ok=True, signaled=True, exit_code=0)
+        assert state.liveness == P.CONFIRMED_EXITED and state.termination_cause == "unknown"
+        assert state.execution_history == P.STATE_UNKNOWN          # never upgraded
+        state = _lc(resumed(), "terminate_result", **SAME, cause="job_terminated_operator",
+                    api_ok=True, signaled=True, exit_code=P.TIMEOUT_EXIT_CODE)
+        assert state.termination_cause == "unknown" and state.handles_retained
+
+    def test_interrupted_cleanup(self):
+        state = _lc(resumed(), "terminate_result", **SAME, cause="job_terminated_operator",
+                    api_ok=False, signaled=False, exit_code=None)
+        assert state.liveness == P.STATE_UNKNOWN and "call failed" in state.cleanup_errors[-1]
+        state = _lc(state, "parent_lost")
+        assert (state.phase, state.liveness, state.termination_cause) == (
+            "parent_lost", P.STATE_UNKNOWN, "job_closed_parent_exit")
+
+    def test_parent_crash_then_recovery(self):
+        state = _lc(resumed(), "parent_lost")
+        assert state.liveness == P.STATE_UNKNOWN and state.execution_history == \
+            P.MAY_HAVE_EXECUTED
+        gone = _lc(state, "recovery_inspection", pid=PID, found=False)
+        assert (gone.liveness, gone.exit_evidence) == (P.CONFIRMED_EXITED,
+                                                       "absent_from_process_table")
+        reused = _lc(state, "recovery_inspection", pid=PID, found=True, creation_match=False)
+        assert reused.liveness == P.CONFIRMED_EXITED
+        exited = _lc(state, "recovery_inspection", pid=PID, found=True, creation_match=True,
+                     signaled=True, exit_code=1)
+        assert (exited.liveness, exited.exit_code) == (P.CONFIRMED_EXITED, 1)
+        alive = _lc(state, "recovery_inspection", pid=PID, found=True, creation_match=True,
+                    signaled=False, exit_code=None)
+        assert alive.liveness == P.ALIVE_AT_LAST_CHECK and "still alive" in \
+            alive.cleanup_errors[-1]
+        ambiguous = _lc(state, "recovery_inspection", pid=PID, found=True, creation_match=True,
+                        signaled=None, exit_code=None)
+        assert ambiguous.liveness == P.STATE_UNKNOWN
+
+    def test_parent_crash_before_resume_keeps_never_executed(self):
+        state = _lc(created(), "parent_lost")
+        assert state.execution_history == P.NEVER_EXECUTED and state.liveness == P.STATE_UNKNOWN
+
+    @pytest.mark.parametrize("event, evidence", [
+        ("job_assigned", {"pid": 999, "creation_time": CREATED_AT, "in_job": True}),
+        ("job_assigned", {"pid": PID, "creation_time": "2026-10-09T12:00:01.000Z",
+                          "in_job": True}),
+        ("validated", {"pid": 999, "creation_time": CREATED_AT, "token_ok": True,
+                       "image_ok": True}),
+    ])
+    def test_pid_and_creation_time_mismatches(self, event, evidence):
+        state = created() if event == "job_assigned" else _lc(created(), "job_assigned",
+                                                              **SAME, in_job=True)
+        with pytest.raises(P.LifecycleError, match="another process"):
+            P.lifecycle_transition(state, event, evidence)
+        with pytest.raises(P.LifecycleError, match="another PID"):
+            _lc(_lc(resumed(), "parent_lost"), "recovery_inspection", pid=1, found=False)
+
+    @pytest.mark.parametrize("state_factory, event, evidence, message", [
+        (P.LifecycleState, "job_assigned", SAME | {"in_job": True}, "not allowed"),
+        (P.LifecycleState, "resume_result", SAME | {"previous": 1, "intent_durable": True},
+         "not allowed"),
+        (created, "created", {"pid": PID, "creation_time": CREATED_AT,
+                              "job_assignment": "assigned_at_creation",
+                              "job_limits_verified": True}, "not allowed"),
+        (created, "resume_result", SAME | {"previous": 1, "intent_durable": True},
+         "not allowed"),
+        (created, "wait_result", SAME | {"signaled": True, "exit_code": 0}, "not allowed"),
+        (resumed, "terminate_result", SAME | {"cause": "discarded_before_resume",
+                                              "api_ok": True, "signaled": True,
+                                              "exit_code": P.DISCARD_EXIT_CODE},
+         "only possible before a valid resume"),
+        (created, "terminate_result", SAME | {"cause": "job_terminated_timeout",
+                                              "api_ok": True, "signaled": True,
+                                              "exit_code": P.TIMEOUT_EXIT_CODE},
+         "needs a resumed"),
+        (resumed, "terminate_result", SAME | {"cause": "reboot", "api_ok": True,
+                                              "signaled": True, "exit_code": 1},
+         "unknown termination cause"),
+        (P.LifecycleState, "parent_lost", {}, "created child"),
+        (resumed, "recovery_inspection", {"pid": PID, "found": False}, "not allowed"),
+        (resumed, "explode", {}, "unknown lifecycle event"),
+    ])
+    def test_illegal_transitions(self, state_factory, event, evidence, message):
+        with pytest.raises(P.LifecycleError, match=message):
+            P.lifecycle_transition(state_factory(), event, evidence)
+
+    @pytest.mark.parametrize("state_factory, event, evidence, message", [
+        (resumed, "wait_result", SAME | {"signaled": True, "exit_code": None},
+         "needs the exit code"),
+        (resumed, "wait_result", SAME | {"signaled": False, "exit_code": 0}, "contradictory"),
+        (resumed, "terminate_result", SAME | {"cause": "job_terminated_timeout",
+                                              "api_ok": True, "signaled": False,
+                                              "exit_code": 7}, "contradictory"),
+        (resumed, "wait_result", SAME | {"signaled": "yes", "exit_code": 0},
+         "true or false"),
+        (resumed, "wait_result", SAME | {"signaled": True, "exit_code": True},
+         "must be an integer"),
+        (created, "job_assigned", SAME | {"in_job": False}, "use assignment_failed"),
+    ])
+    def test_contradictory_evidence(self, state_factory, event, evidence, message):
+        with pytest.raises(P.LifecycleError, match=message):
+            P.lifecycle_transition(state_factory(), event, evidence)
+
+    @pytest.mark.parametrize("evidence, message", [
+        ({"pid": 0, "creation_time": CREATED_AT, "job_assignment": "assigned_at_creation",
+          "job_limits_verified": True}, "positive PID"),
+        ({"pid": PID, "creation_time": "noon", "job_assignment": "assigned_at_creation",
+          "job_limits_verified": True}, "UTC creation time"),
+        ({"pid": PID, "creation_time": CREATED_AT, "job_assignment": "assigned_at_creation",
+          "job_limits_verified": False}, "job limits are verified"),
+        ({"pid": PID, "creation_time": CREATED_AT, "job_assignment": "assignment_failed",
+          "job_limits_verified": True}, "job_assignment"),
+    ])
+    def test_creation_requirements(self, evidence, message):
+        with pytest.raises(P.LifecycleError, match=message):
+            P.lifecycle_transition(P.LifecycleState(), "created", evidence)
+
+    def test_exited_is_terminal(self):
+        state = _lc(resumed(), "wait_result", **SAME, signaled=True, exit_code=0)
+        for event in ("wait_result", "terminate_result", "parent_lost", "resume_result"):
+            with pytest.raises(P.LifecycleError):
+                _lc(state, event, **SAME, signaled=True, exit_code=0)
+
+
+class TestResumeClassification:
+    @pytest.mark.parametrize("value, history", [
+        (1, P.MAY_HAVE_EXECUTED), (0, P.MAY_HAVE_EXECUTED), (2, P.NEVER_EXECUTED),
+        (127, P.NEVER_EXECUTED), (P.RESUME_FAILED_VALUE, P.STATE_UNKNOWN),
+        (OSError("failed"), P.STATE_UNKNOWN), ("Windows error 6", P.STATE_UNKNOWN),
+    ])
+    def test_classification(self, value, history):
+        assert P.classify_resume(value) == history
+
+    @pytest.mark.parametrize("value", [True, None, 1.0, -1, P.RESUME_FAILED_VALUE + 1])
+    def test_invalid(self, value):
+        with pytest.raises(P.LifecycleError):
+            P.classify_resume(value)
+
+
+class TestTimeoutSchedule:
+    def test_default_plan(self):
+        plan = P.timeout_schedule()
+        assert plan["plan_only"] is True and plan["policy"] == P.TERMINATION_POLICY
+        assert (plan["deadline_s"], plan["grace_s"], plan["hard_deadline_s"]) == (180, 60, 240)
+        assert plan["max_wall_s"] == 240 + 5 + 2 + 5
+        assert plan["evidence_checkpoints"] == ["timeout", "terminate_intent",
+                                                "terminate_result", "final_inspection",
+                                                "complete"]
+        assert plan["exit_verification"] == {"required": True, "signalled_wait": True,
+                                             "exit_code": P.TIMEOUT_EXIT_CODE, "within_s": 5}
+        times = [a["at_s"] for a in plan["actions"]]
+        assert times == sorted(times) and max(times) == 240
+        texts = " | ".join(a["action"] for a in plan["actions"])
+        for phrase in ("durable resume-intent", "durable timeout evidence", "notify the operator",
+                       "durable terminate-intent", "verify the exit", "ownership retained"):
+            assert phrase in texts
+
+    def test_custom_bounds(self):
+        plan = P.timeout_schedule(10, 1, 1, 0.5, 0.5)
+        assert plan["hard_deadline_s"] == 11 and plan["max_wall_s"] == 13
+
+    @pytest.mark.parametrize("kwargs, message", [
+        ({"deadline_s": 0}, "positive"), ({"grace_s": -1}, "positive"),
+        ({"terminate_wait_s": float("inf")}, "finite"), ({"observe_interval_s": float("nan")},
+                                                         "finite"),
+        ({"deadline_s": None}, "finite"), ({"deadline_s": True}, "finite"),
+        ({"deadline_s": 3601}, "exceeds its bound"), ({"grace_s": 601}, "exceeds"),
+        ({"terminate_wait_s": 61}, "exceeds"), ({"observe_timeout_s": 31}, "exceeds"),
+        ({"deadline_s": 3, "observe_timeout_s": 5}, "fit inside the deadline"),
+        ({"policy": "accepted"}, "unsupported termination policy"),
+        ({"policy": "never_terminate"}, "unsupported termination policy"),
+        ({"exit_verification": False}, "exit verification is required"),
+    ])
+    def test_rejections(self, kwargs, message):
+        with pytest.raises(P.LifecycleError, match=message):
+            P.timeout_schedule(**kwargs)
+
+
+GOOD_READBACK = {"limit_flags": P.JOB_LIMIT_POLICY["required_flags"], "active_process_limit": 1,
+                 "job_handle_inheritable": False, "in_job_before_resume": True}
+
+
+class TestJobLimits:
+    def test_policy_and_good_readback(self):
+        assert P.JOB_LIMIT_POLICY["required_flags"] == 0x2000 | 0x8 | 0x400
+        assert P.JOB_LIMIT_POLICY["prohibited_flags"] == 0x800 | 0x1000
+        assert P.job_limits_problems(GOOD_READBACK) == []
+
+    @pytest.mark.parametrize("change, message", [
+        ({"limit_flags": 0x8 | 0x400}, "required limit flags missing: 0x2000"),
+        ({"limit_flags": P.JOB_LIMIT_POLICY["required_flags"] | 0x800}, "breakaway"),
+        ({"limit_flags": P.JOB_LIMIT_POLICY["required_flags"] | 0x1000}, "breakaway"),
+        ({"limit_flags": P.JOB_LIMIT_POLICY["required_flags"] | 0x2}, "unexpected limit flags"),
+        ({"active_process_limit": 2}, "not 1"),
+        ({"active_process_limit": True}, "not 1"),
+        ({"job_handle_inheritable": True}, "inheritable"),
+        ({"job_handle_inheritable": None}, "inheritable"),
+        ({"in_job_before_resume": False}, "not verified before resume"),
+    ])
+    def test_wrong_limits(self, change, message):
+        assert any(message in p for p in P.job_limits_problems({**GOOD_READBACK, **change}))
+
+    def test_malformed_readback(self):
+        assert P.job_limits_problems(None) == ["no job read-back"]
+        assert P.job_limits_problems({"limit_flags": "x"}) == ["limit_flags missing or malformed"]
+
+
+STAGES = list(P.LIFECYCLE_STAGES)
+
+
+class TestStageOrder:
+    def test_happy_progression(self):
+        assert P.next_stage_allowed([], False)["allowed"] == ["prelaunch"]
+        state = P.next_stage_allowed(STAGES[:2], False)
+        assert state["allowed"] == ["process_created"] and state["may_launch"]
+        state = P.next_stage_allowed(STAGES[:5], False)
+        assert state["allowed"] == ["resume_result"] and state["may_resume"]
+        assert not P.next_stage_allowed(STAGES[:4], False)["may_resume"]
+        assert P.next_stage_allowed(STAGES[:6], False)["allowed"] == [
+            "timeout_or_termination", "final_inspection"]
+        assert P.next_stage_allowed(STAGES[:7], False)["allowed"] == ["final_inspection"]
+        skipped = [s for s in STAGES if s != "timeout_or_termination"]
+        assert P.next_stage_allowed(skipped[:-1], False)["allowed"] == ["complete"]
+        assert P.next_stage_allowed(STAGES, False)["allowed"] == []
+
+    @pytest.mark.parametrize("stages, message", [
+        (["job_configured"], "skipped"),
+        (["prelaunch", "process_created"], "skipped"),
+        (["job_configured", "prelaunch"], "out of order"),
+        (["prelaunch", "prelaunch"], "repeated"),
+        (["prelaunch", "bogus"], "unknown"),
+        (STAGES[:5] + ["timeout_or_termination"], "needs a resume result"),
+    ])
+    def test_order_violations(self, stages, message):
+        with pytest.raises(P.LifecycleError, match=message):
+            P.next_stage_allowed(stages, False)
+
+    @pytest.mark.parametrize("stages, containment, allowed", [
+        ([], "none", []),
+        (STAGES[:1], "none", []),
+        (STAGES[:2], "discard_if_created", ["final_inspection"]),
+        (STAGES[:4], "discard_if_created", ["final_inspection"]),
+        (STAGES[:5], "bounded_termination", ["timeout_or_termination", "final_inspection"]),
+        (STAGES[:6], "bounded_termination", ["timeout_or_termination", "final_inspection"]),
+        (STAGES[:8], "bounded_termination", []),
+        (STAGES, "none", []),
+    ])
+    def test_evidence_failure(self, stages, containment, allowed):
+        state = P.next_stage_allowed(stages, True)
+        assert not state["may_launch"] and not state["may_resume"] and state["series_blocked"]
+        assert (state["containment"], state["allowed"]) == (containment, allowed)
+
+    def test_evidence_flag_must_be_boolean(self):
+        with pytest.raises(P.LifecycleError):
+            P.next_stage_allowed([], None)
+
+
+class TestFailureActions:
+    REQUIRED = ("create_job_failed", "set_job_information_failed", "assignment_failed",
+                "nested_job_incompatible", "inheritable_job_handle", "resume_api_failed",
+                "resume_previous_zero", "timeout_live_child", "parent_crash",
+                "parent_forced_termination", "evidence_failure_before_resume",
+                "evidence_failure_after_resume", "interrupted_cleanup",
+                "termination_verified", "termination_unverified")
+
+    def test_matrix_is_complete_and_immutable(self):
+        for key in self.REQUIRED:
+            assert key in P.FAILURE_ACTIONS
+        assert {a["action_class"] for a in P.FAILURE_ACTIONS.values()} == set(P.ACTION_CLASSES)
+        with pytest.raises(TypeError):
+            P.FAILURE_ACTIONS["new"] = {}
+        with pytest.raises(TypeError):
+            P.FAILURE_ACTIONS["parent_crash"]["containment"] = "none"
+        for action in P.FAILURE_ACTIONS.values():
+            assert action["ownership"] == "retained" and action["series_blocked"] is True
+
+    def test_containment_rules(self):
+        after = P.FAILURE_ACTIONS["evidence_failure_after_resume"]
+        assert (after["action_class"], after["containment"]) == ("possible_execution",
+                                                                 "bounded_termination")
+        before = P.FAILURE_ACTIONS["evidence_failure_before_resume"]
+        assert (before["action_class"], before["execution_history"]) == (
+            "discard_before_resume", P.NEVER_EXECUTED)
+        for key in ("create_job_failed", "set_job_information_failed",
+                    "inheritable_job_handle", "nested_job_incompatible"):
+            assert P.FAILURE_ACTIONS[key]["action_class"] == "prelaunch_refusal"
+        assert P.FAILURE_ACTIONS["timeout_live_child"]["liveness"] == "requires_os_evidence"
+        assert P.FAILURE_ACTIONS["termination_unverified"]["liveness"] == P.STATE_UNKNOWN
+        assert P.FAILURE_ACTIONS["interrupted_cleanup"]["action_class"] == "cleanup_incomplete"
+        assert P.FAILURE_ACTIONS["termination_verified"]["liveness"] == P.CONFIRMED_EXITED

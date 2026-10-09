@@ -45,8 +45,9 @@ import os
 import re
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 HERE: Path = Path(__file__).resolve().parent
@@ -1132,6 +1133,518 @@ def launch_permitted(record: Any, *, evidence_durable: bool) -> tuple[bool, str]
     if evidence_durable is not True:
         return False, "evidence_write_failed: the prelaunch record is not durable"
     return True, "passed"
+
+
+# ---------------------------------------------------------------------------
+# Job Object lifecycle policy: pure data and state machine (no Win32, no
+# timers, no processes).  It describes what a future backend must prove; it
+# enables nothing.
+# ---------------------------------------------------------------------------
+
+#: The reviewed timeout/termination policy: accepted as a design only.  It
+#: does not enable execution or termination anywhere.
+TERMINATION_POLICY: str = "conditionally_accepted_design_only"
+SUPPORTED_TERMINATION_POLICIES: tuple[str, ...] = ("conditionally_accepted_design_only",)
+
+NEVER_EXECUTED = "definitely_never_executed"
+MAY_HAVE_EXECUTED = "may_have_executed"
+STATE_UNKNOWN = "state_unknown"
+CONFIRMED_EXITED = "confirmed_exited"
+ALIVE_AT_LAST_CHECK = "alive_at_last_check"
+EXECUTION_HISTORIES: tuple[str, ...] = (NEVER_EXECUTED, MAY_HAVE_EXECUTED, STATE_UNKNOWN)
+LIVENESS_STATES: tuple[str, ...] = (CONFIRMED_EXITED, ALIVE_AT_LAST_CHECK, STATE_UNKNOWN)
+JOB_ASSIGNMENTS: tuple[str, ...] = ("not_created", "assigned_at_creation",
+                                    "assigned_before_resume", "assignment_failed", "unknown")
+TERMINATION_CAUSES: tuple[str, ...] = (
+    "natural_exit", "discarded_before_resume", "job_terminated_timeout",
+    "job_terminated_operator", "job_closed_parent_exit", "unknown")
+EXIT_EVIDENCE_KINDS: tuple[str, ...] = ("wait+exit_code", "absent_from_process_table")
+LIFECYCLE_PHASES: tuple[str, ...] = (
+    "not_started", "created_suspended", "job_assigned", "assignment_failed", "validated",
+    "rejected", "resumed", "resume_rejected", "exited", "termination_unverified",
+    "parent_lost")
+
+#: Exit codes a future backend uses, so an exit code proves who ended it.
+DISCARD_EXIT_CODE: int = 0x0BAD
+TIMEOUT_EXIT_CODE: int = 0x0BAE
+OPERATOR_EXIT_CODE: int = 0x0BAF
+TERMINATION_EXIT_CODES: Mapping[str, int] = {
+    "discarded_before_resume": DISCARD_EXIT_CODE,
+    "job_terminated_timeout": TIMEOUT_EXIT_CODE,
+    "job_terminated_operator": OPERATOR_EXIT_CODE,
+}
+#: ResumeThread's failure return value.
+RESUME_FAILED_VALUE: int = 0xFFFFFFFF
+
+
+def policy_enables_execution() -> bool:
+    """Always False: the lifecycle policy is design data only."""
+    return False
+
+
+@dataclass(frozen=True)
+class LifecycleState:
+    """The evidence about one child.  execution_history and liveness are
+    separate; neither is ever upgraded without OS evidence."""
+    phase: str = "not_started"
+    process_created: bool = False
+    pid: Optional[int] = None
+    creation_time: Optional[str] = None
+    job_assignment: str = "not_created"
+    job_limits_verified: bool = False
+    execution_history: Optional[str] = None
+    liveness: Optional[str] = None
+    termination_cause: Optional[str] = None
+    exit_code: Optional[int] = None
+    exit_evidence: Optional[str] = None
+    handles_retained: bool = False
+    cleanup_errors: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"phase": self.phase, "process_created": self.process_created,
+                "pid": self.pid, "creation_time": self.creation_time,
+                "job_assignment": self.job_assignment,
+                "job_limits_verified": self.job_limits_verified,
+                "execution_history": self.execution_history, "liveness": self.liveness,
+                "termination_cause": self.termination_cause, "exit_code": self.exit_code,
+                "exit_evidence": self.exit_evidence, "handles_retained": self.handles_retained,
+                "cleanup_errors": list(self.cleanup_errors)}
+
+
+class LifecycleError(PreflightError):
+    """An illegal transition or contradictory evidence."""
+
+
+def classify_resume(previous_or_error: Any) -> str:
+    """ResumeThread's result as execution history: 1 resumed and 0 already
+    running mean it may have executed; above 1 it is still suspended; a
+    failed call (an exception, an error text, or 0xFFFFFFFF) is unknown."""
+    if isinstance(previous_or_error, (BaseException, str)):
+        return STATE_UNKNOWN
+    if isinstance(previous_or_error, bool) or not isinstance(previous_or_error, int):
+        raise LifecycleError(f"not a ResumeThread result: {previous_or_error!r}")
+    if previous_or_error == RESUME_FAILED_VALUE:
+        return STATE_UNKNOWN
+    if previous_or_error < 0 or previous_or_error > RESUME_FAILED_VALUE:
+        raise LifecycleError(f"impossible suspend count {previous_or_error}")
+    return MAY_HAVE_EXECUTED if previous_or_error in (0, 1) else NEVER_EXECUTED
+
+
+def _evidence_int(evidence: Mapping[str, Any], key: str, *, optional: bool = False) -> Any:
+    value = evidence.get(key)
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise LifecycleError(f"evidence {key} must be an integer")
+    return value
+
+
+def _evidence_bool(evidence: Mapping[str, Any], key: str) -> bool:
+    value = evidence.get(key)
+    if not isinstance(value, bool):
+        raise LifecycleError(f"evidence {key} must be true or false")
+    return value
+
+
+def _same_process(state: LifecycleState, evidence: Mapping[str, Any]) -> None:
+    if evidence.get("pid") != state.pid or evidence.get("creation_time") != state.creation_time:
+        raise LifecycleError("the evidence is about another process (PID or creation time "
+                             "differs)")
+
+
+def _require_phase(state: LifecycleState, event: str, phases: Sequence[str]) -> None:
+    if state.phase not in phases:
+        raise LifecycleError(f"{event} is not allowed in phase {state.phase}")
+
+
+def _add_error(state: LifecycleState, message: str) -> tuple[str, ...]:
+    return state.cleanup_errors + (message,)
+
+
+#: Phases in which the child was not (validly) resumed yet.
+_BEFORE_RESUME = ("created_suspended", "job_assigned", "assignment_failed", "validated",
+                  "rejected", "resume_rejected")
+#: Phases from which a termination may be requested (once; an unverified
+#: termination is never retried - it goes to recovery inspection).
+_TERMINABLE_PHASES = _BEFORE_RESUME + ("resumed",)
+
+
+def lifecycle_transition(state: LifecycleState, event: str,
+                         evidence: Optional[Mapping[str, Any]] = None) -> LifecycleState:
+    """
+    The next state for one event with its OS evidence (pure).  Illegal
+    transitions and contradictory evidence raise LifecycleError.  A
+    termination counts as confirmed only with a signalled wait and the
+    expected exit code; an API success alone leaves the liveness unknown.
+    """
+    if not isinstance(state, LifecycleState):
+        raise LifecycleError("not a LifecycleState")
+    evidence = dict(evidence or {})
+
+    if event == "created":
+        _require_phase(state, event, ("not_started",))
+        pid = _evidence_int(evidence, "pid")
+        creation = evidence.get("creation_time")
+        if pid <= 0 or _parse_utc(creation) is None:
+            raise LifecycleError("created needs a positive PID and a UTC creation time")
+        if _evidence_bool(evidence, "job_limits_verified") is not True:
+            raise LifecycleError("a child may only be created after the job limits are "
+                                 "verified")
+        assignment = evidence.get("job_assignment")
+        if assignment not in ("assigned_at_creation", "unknown"):
+            raise LifecycleError("created needs job_assignment assigned_at_creation or "
+                                 "unknown (assignment pending)")
+        return replace(state, phase="created_suspended", process_created=True, pid=pid,
+                       creation_time=creation, job_assignment=assignment,
+                       job_limits_verified=True, execution_history=NEVER_EXECUTED,
+                       liveness=ALIVE_AT_LAST_CHECK, handles_retained=True)
+
+    if event == "job_assigned":
+        _require_phase(state, event, ("created_suspended",))
+        _same_process(state, evidence)
+        if _evidence_bool(evidence, "in_job") is not True:
+            raise LifecycleError("job_assigned needs in_job true; use assignment_failed")
+        assignment = ("assigned_before_resume" if state.job_assignment == "unknown"
+                      else state.job_assignment)
+        return replace(state, phase="job_assigned", job_assignment=assignment)
+
+    if event == "assignment_failed":
+        _require_phase(state, event, ("created_suspended",))
+        _same_process(state, evidence)
+        return replace(state, phase="assignment_failed", job_assignment="assignment_failed",
+                       cleanup_errors=_add_error(state, "job assignment failed: "
+                                                 + str(evidence.get("reason", ""))[:200]))
+
+    if event == "validated":
+        _require_phase(state, event, ("job_assigned",))
+        _same_process(state, evidence)
+        ok = _evidence_bool(evidence, "token_ok") and _evidence_bool(evidence, "image_ok")
+        return replace(state, phase="validated" if ok else "rejected")
+
+    if event == "resume_result":
+        _require_phase(state, event, ("validated",))
+        _same_process(state, evidence)
+        if _evidence_bool(evidence, "intent_durable") is not True:
+            raise LifecycleError("no resume without durable resume-intent evidence")
+        has_error = evidence.get("error") is not None
+        has_previous = evidence.get("previous") is not None
+        if has_error == has_previous:
+            raise LifecycleError("resume_result needs exactly one of previous or error")
+        result = evidence["error"] if has_error else _evidence_int(evidence, "previous")
+        history = classify_resume(str(result) if has_error else result)
+        resumed = not has_error and result == 1
+        return replace(state, phase="resumed" if resumed else "resume_rejected",
+                       execution_history=history)
+
+    if event == "wait_result":
+        _require_phase(state, event, ("resumed",))
+        _same_process(state, evidence)
+        signaled = _evidence_bool(evidence, "signaled")
+        exit_code = _evidence_int(evidence, "exit_code", optional=True)
+        if signaled and exit_code is None:
+            raise LifecycleError("a signalled wait needs the exit code")
+        if not signaled and exit_code is not None:
+            raise LifecycleError("an exit code without a signalled wait is contradictory")
+        if not signaled:
+            return replace(state, liveness=ALIVE_AT_LAST_CHECK)
+        return replace(state, phase="exited", liveness=CONFIRMED_EXITED,
+                       termination_cause="natural_exit", exit_code=exit_code,
+                       exit_evidence="wait+exit_code", handles_retained=False)
+
+    if event == "terminate_result":
+        _require_phase(state, event, _TERMINABLE_PHASES)
+        _same_process(state, evidence)
+        cause = evidence.get("cause")
+        if cause not in TERMINATION_EXIT_CODES:
+            raise LifecycleError(f"unknown termination cause {cause!r}")
+        if cause == "discarded_before_resume" and state.phase not in _BEFORE_RESUME:
+            raise LifecycleError("a discard is only possible before a valid resume")
+        if cause != "discarded_before_resume" and state.phase not in (
+                "resumed", "resume_rejected"):
+            raise LifecycleError(f"{cause} needs a resumed (or resume-rejected) child")
+        api_ok = _evidence_bool(evidence, "api_ok")
+        signaled = _evidence_bool(evidence, "signaled")
+        exit_code = _evidence_int(evidence, "exit_code", optional=True)
+        if signaled and exit_code is None:
+            raise LifecycleError("a signalled wait needs the exit code")
+        if not signaled and exit_code is not None:
+            raise LifecycleError("an exit code without a signalled wait is contradictory")
+        if not signaled:
+            note = ("termination requested but exit not verified" if api_ok
+                    else "termination call failed")
+            return replace(state, phase="termination_unverified", liveness=STATE_UNKNOWN,
+                           handles_retained=True, cleanup_errors=_add_error(state, note))
+        expected = TERMINATION_EXIT_CODES[cause]
+        if exit_code != expected:
+            history = (STATE_UNKNOWN if state.execution_history == NEVER_EXECUTED
+                       else state.execution_history)
+            return replace(state, phase="exited", liveness=CONFIRMED_EXITED,
+                           termination_cause="unknown", exit_code=exit_code,
+                           exit_evidence="wait+exit_code", execution_history=history,
+                           handles_retained=True,
+                           cleanup_errors=_add_error(state, f"exit code {exit_code} is not "
+                                                            f"the {cause} code {expected}"))
+        return replace(state, phase="exited", liveness=CONFIRMED_EXITED, termination_cause=cause,
+                       exit_code=exit_code, exit_evidence="wait+exit_code",
+                       handles_retained=False)
+
+    if event == "parent_lost":
+        if not state.process_created or state.phase in ("exited", "parent_lost"):
+            raise LifecycleError("parent_lost needs a created child that has not exited")
+        return replace(state, phase="parent_lost", liveness=STATE_UNKNOWN,
+                       termination_cause="job_closed_parent_exit", handles_retained=False,
+                       cleanup_errors=_add_error(state, "parent lost; recovery inspection "
+                                                        "required"))
+
+    if event == "recovery_inspection":
+        _require_phase(state, event, ("parent_lost", "termination_unverified"))
+        if evidence.get("pid") != state.pid:
+            raise LifecycleError("the inspection is about another PID")
+        found = _evidence_bool(evidence, "found")
+        if not found:
+            return replace(state, liveness=CONFIRMED_EXITED,
+                           exit_evidence="absent_from_process_table", exit_code=None)
+        creation_match = _evidence_bool(evidence, "creation_match")
+        if not creation_match:                      # the PID now belongs to another process
+            return replace(state, liveness=CONFIRMED_EXITED,
+                           exit_evidence="absent_from_process_table", exit_code=None)
+        signaled = evidence.get("signaled")
+        exit_code = _evidence_int(evidence, "exit_code", optional=True)
+        if signaled is True and exit_code is not None:
+            return replace(state, liveness=CONFIRMED_EXITED, exit_evidence="wait+exit_code",
+                           exit_code=exit_code)
+        if signaled is False and exit_code is None:
+            return replace(state, liveness=ALIVE_AT_LAST_CHECK,
+                           cleanup_errors=_add_error(state, "child still alive at recovery "
+                                                            "inspection"))
+        return replace(state, liveness=STATE_UNKNOWN,
+                       cleanup_errors=_add_error(state, "inconclusive recovery inspection"))
+
+    raise LifecycleError(f"unknown lifecycle event {event!r}")
+
+
+#: Upper bounds that keep any schedule finite.
+TIMEOUT_BOUNDS: Mapping[str, float] = {
+    "deadline_s": 3600.0, "grace_s": 600.0, "terminate_wait_s": 60.0,
+    "observe_interval_s": 30.0, "observe_timeout_s": 30.0,
+}
+
+
+def timeout_schedule(deadline_s: Any = 180, grace_s: Any = 60, terminate_wait_s: Any = 5,
+                     observe_interval_s: Any = 2, observe_timeout_s: Any = 5, *,
+                     policy: str = TERMINATION_POLICY,
+                     exit_verification: bool = True) -> dict[str, Any]:
+    """
+    The bounded timeout plan (a plan, not a timer): deadline, evidence,
+    liveness inspection and operator notice, a bounded grace period, then
+    durable terminate intent, termination through the job, and a required
+    exit verification.  It never permits indefinite waiting.
+    """
+    values = {"deadline_s": deadline_s, "grace_s": grace_s,
+              "terminate_wait_s": terminate_wait_s, "observe_interval_s": observe_interval_s,
+              "observe_timeout_s": observe_timeout_s}
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or value != value or value in (float("inf"), float("-inf")):
+            raise LifecycleError(f"{name} must be a finite number")
+        if value <= 0:
+            raise LifecycleError(f"{name} must be positive")
+        if value > TIMEOUT_BOUNDS[name]:
+            raise LifecycleError(f"{name} exceeds its bound {TIMEOUT_BOUNDS[name]}")
+    if observe_timeout_s > deadline_s or observe_interval_s > deadline_s:
+        raise LifecycleError("observation must fit inside the deadline")
+    if policy not in SUPPORTED_TERMINATION_POLICIES:
+        raise LifecycleError(f"unsupported termination policy {policy!r}")
+    if exit_verification is not True:
+        raise LifecycleError("exit verification is required")
+    hard = deadline_s + grace_s
+    max_wall = hard + terminate_wait_s + observe_interval_s + observe_timeout_s
+    actions = [
+        {"at_s": 0, "action": "resume (only after durable resume-intent evidence)"},
+        {"at_s": 0, "action": f"observe every {observe_interval_s} s (each look at most "
+                              f"{observe_timeout_s} s); a natural exit ends the schedule"},
+        {"at_s": deadline_s, "action": "record durable timeout evidence"},
+        {"at_s": deadline_s, "action": "inspect liveness (wait 0 + exit code + one "
+                                       "observation)"},
+        {"at_s": deadline_s, "action": "notify the operator"},
+        {"at_s": deadline_s, "action": f"bounded grace observation for {grace_s} s"},
+        {"at_s": hard, "action": "record durable terminate-intent evidence"},
+        {"at_s": hard, "action": f"terminate through the job with exit code "
+                                 f"{TIMEOUT_EXIT_CODE:#x}"},
+        {"at_s": hard, "action": f"verify the exit within {terminate_wait_s} s (signalled "
+                                 f"wait AND exit code {TIMEOUT_EXIT_CODE:#x}); otherwise "
+                                 "liveness state_unknown, handles retained"},
+        {"at_s": hard, "action": "final inspection, staged-tree re-verification, complete "
+                                 "evidence; ownership retained"},
+    ]
+    return {"policy": policy, "plan_only": True,
+            "enables_execution": policy_enables_execution(),
+            "deadline_s": deadline_s, "grace_s": grace_s, "hard_deadline_s": hard,
+            "max_wall_s": max_wall, "actions": actions,
+            "evidence_checkpoints": ["timeout", "terminate_intent", "terminate_result",
+                                     "final_inspection", "complete"],
+            "exit_verification": {"required": True, "signalled_wait": True,
+                                  "exit_code": TIMEOUT_EXIT_CODE,
+                                  "within_s": terminate_wait_s}}
+
+
+#: JOBOBJECT_BASIC_LIMIT_INFORMATION.LimitFlags values (documented).
+JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400
+JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+JOB_LIMIT_POLICY: Mapping[str, Any] = {
+    "required_flags": (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                       | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION),
+    "prohibited_flags": JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    "active_process_limit": 1,
+    "job_handle_inheritable": False,
+    "assignment_verified_before_resume": True,
+}
+
+
+def job_limits_problems(readback: Any) -> list[str]:
+    """Why a job's read-back limits (as a future backend would report them)
+    do not match JOB_LIMIT_POLICY; empty when they do."""
+    if not isinstance(readback, Mapping):
+        return ["no job read-back"]
+    problems = []
+    flags = readback.get("limit_flags")
+    if isinstance(flags, bool) or not isinstance(flags, int) or flags < 0:
+        return ["limit_flags missing or malformed"]
+    required, prohibited = JOB_LIMIT_POLICY["required_flags"], JOB_LIMIT_POLICY["prohibited_flags"]
+    if flags & required != required:
+        problems.append(f"required limit flags missing: {required & ~flags:#x}")
+    if flags & prohibited:
+        problems.append(f"breakaway flags present: {flags & prohibited:#x}")
+    if flags & ~(required | prohibited):
+        problems.append(f"unexpected limit flags: {flags & ~(required | prohibited):#x}")
+    limit = readback.get("active_process_limit")
+    if limit != JOB_LIMIT_POLICY["active_process_limit"] or isinstance(limit, bool):
+        problems.append(f"active process limit is {limit!r}, not 1")
+    if readback.get("job_handle_inheritable") is not False:
+        problems.append("the job handle is (or may be) inheritable")
+    if readback.get("in_job_before_resume") is not True:
+        problems.append("job membership was not verified before resume")
+    return problems
+
+
+#: Durable evidence stages, in order.  The termination stage is optional.
+LIFECYCLE_STAGES: tuple[str, ...] = (
+    "prelaunch", "job_configured", "process_created", "job_verified_and_validated",
+    "resume_intent", "resume_result", "timeout_or_termination", "final_inspection",
+    "complete",
+)
+OPTIONAL_STAGES: frozenset[str] = frozenset({"timeout_or_termination"})
+
+
+def next_stage_allowed(durable_stages: Sequence[str], evidence_failed: bool) -> dict[str, Any]:
+    """
+    What may happen next given the stages already durable.  The stages must
+    be an in-order prefix (the optional termination stage may be skipped).
+    No launch before the job is durable, no resume without durable
+    resume intent, nothing new after an evidence failure - but a child
+    that exists is still contained (discard before resume, or bounded
+    termination once resume may have happened).
+    """
+    if not isinstance(evidence_failed, bool):
+        raise LifecycleError("evidence_failed must be true or false")
+    stages = list(durable_stages)
+    if len(set(stages)) != len(stages) or any(s not in LIFECYCLE_STAGES for s in stages):
+        raise LifecycleError("unknown or repeated stage")
+    expected = [s for s in LIFECYCLE_STAGES if s in stages]
+    if stages != expected:
+        raise LifecycleError("stages are out of order")
+    mandatory = [s for s in LIFECYCLE_STAGES if s not in OPTIONAL_STAGES]
+    position = len([s for s in stages if s not in OPTIONAL_STAGES])
+    if [s for s in stages if s not in OPTIONAL_STAGES] != mandatory[:position]:
+        raise LifecycleError("a mandatory stage was skipped")
+    if "timeout_or_termination" in stages and "resume_result" not in stages:
+        raise LifecycleError("termination evidence needs a resume result")
+    done = set(stages)
+    remaining = [s for s in mandatory if s not in done]
+    if evidence_failed:
+        if "complete" in done:
+            containment = "none"
+            allowed = []
+        elif "resume_intent" in done:
+            containment = "bounded_termination"
+            allowed = [s for s in ("timeout_or_termination", "final_inspection") if s not in done]
+        elif "job_configured" in done:
+            containment = "discard_if_created"
+            allowed = ["final_inspection"] if "final_inspection" not in done else []
+        else:
+            containment = "none"
+            allowed = []
+        return {"allowed": allowed, "may_launch": False, "may_resume": False,
+                "containment": containment, "series_blocked": True}
+    following = remaining[:1]
+    if following == ["final_inspection"] and "timeout_or_termination" not in done:
+        following = ["timeout_or_termination", "final_inspection"]
+    return {"allowed": following,
+            "may_launch": following == ["process_created"],
+            "may_resume": following == ["resume_result"],
+            "containment": "none", "series_blocked": False}
+
+
+#: The reviewed failure matrix (immutable).  action_class distinguishes a
+#: prelaunch refusal, a discard before resume, possible execution, a
+#: termination requested or verified, unknown liveness and incomplete
+#: cleanup.  "requires_os_evidence" means confirmed_exited only with a
+#: signalled wait and the expected exit code (or absence by PID+creation).
+ACTION_CLASSES: tuple[str, ...] = (
+    "prelaunch_refusal", "discard_before_resume", "possible_execution",
+    "termination_requested", "termination_verified", "unknown_liveness",
+    "cleanup_incomplete",
+)
+
+
+def _action(action_class: str, containment: str, history: Optional[str],
+            liveness: str) -> Mapping[str, Any]:
+    return MappingProxyType({
+        "action_class": action_class, "containment": containment,
+        "execution_history": history, "liveness": liveness, "ownership": "retained",
+        "series_blocked": True})
+
+
+FAILURE_ACTIONS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
+    "create_job_failed": _action("prelaunch_refusal", "none", None, "not_applicable"),
+    "set_job_information_failed": _action("prelaunch_refusal", "none", None,
+                                          "not_applicable"),
+    "job_readback_mismatch": _action("prelaunch_refusal", "none", None, "not_applicable"),
+    "inheritable_job_handle": _action("prelaunch_refusal", "none", None, "not_applicable"),
+    "nested_job_incompatible": _action("prelaunch_refusal", "none", None, "not_applicable"),
+    "assignment_failed": _action("discard_before_resume", "discard", NEVER_EXECUTED,
+                                 "requires_os_evidence"),
+    "not_in_job": _action("discard_before_resume", "discard", NEVER_EXECUTED,
+                          "requires_os_evidence"),
+    "validation_failed": _action("discard_before_resume", "discard", NEVER_EXECUTED,
+                                 "requires_os_evidence"),
+    "evidence_failure_before_resume": _action("discard_before_resume", "discard",
+                                              NEVER_EXECUTED, "requires_os_evidence"),
+    "resume_above_one": _action("discard_before_resume", "discard", NEVER_EXECUTED,
+                                "requires_os_evidence"),
+    "resume_api_failed": _action("possible_execution", "bounded_termination", STATE_UNKNOWN,
+                                 "requires_os_evidence"),
+    "resume_previous_zero": _action("possible_execution", "bounded_termination",
+                                    MAY_HAVE_EXECUTED, "requires_os_evidence"),
+    "evidence_failure_after_resume": _action("possible_execution", "bounded_termination",
+                                             MAY_HAVE_EXECUTED, "requires_os_evidence"),
+    "timeout_live_child": _action("termination_requested", "bounded_termination",
+                                  MAY_HAVE_EXECUTED, "requires_os_evidence"),
+    "termination_verified": _action("termination_verified", "none", MAY_HAVE_EXECUTED,
+                                    CONFIRMED_EXITED),
+    "termination_unverified": _action("unknown_liveness", "recovery_inspection",
+                                      MAY_HAVE_EXECUTED, STATE_UNKNOWN),
+    "parent_crash": _action("unknown_liveness", "recovery_inspection", "unchanged",
+                            STATE_UNKNOWN),
+    "parent_forced_termination": _action("unknown_liveness", "recovery_inspection",
+                                         "unchanged", STATE_UNKNOWN),
+    "interrupted_cleanup": _action("cleanup_incomplete", "recovery_inspection", "unchanged",
+                                   STATE_UNKNOWN),
+})
 
 
 # ---------------------------------------------------------------------------
