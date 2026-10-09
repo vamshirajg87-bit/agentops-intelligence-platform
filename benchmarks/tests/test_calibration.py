@@ -11,7 +11,9 @@ the test.  Where a test opens the execution gate, it does so in memory only.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.abc
+import inspect
 import io
 import json
 import os
@@ -70,11 +72,22 @@ def fail_closed(monkeypatch):
         monkeypatch.delitem(sys.modules, name)
 
 
+SID = "S-1-15-2-99"
+
+
 def open_gate(monkeypatch, ids=("cal-a-01",), head=HEAD):
     """In memory only: enable, approve `ids`, and fake the Git HEAD."""
     monkeypatch.setattr(C, "EXECUTION_ENABLED", True)
     monkeypatch.setattr(C, "APPROVED_CALIBRATIONS", frozenset(ids))
-    monkeypatch.setattr(C, "_git_head", lambda: head)
+    monkeypatch.setattr(C, "_git_head", lambda *require: head)
+
+
+def open_probe_gate(monkeypatch, ids=("probe-01",), head=HEAD, sid=SID):
+    """In memory only: enable and approve the probe, authorize a profile."""
+    monkeypatch.setattr(C, "PROBE_ENABLED", True)
+    monkeypatch.setattr(C, "APPROVED_PROBES", frozenset(ids))
+    monkeypatch.setattr(C, "AUTHORIZED_APPCONTAINER_SID", sid)
+    monkeypatch.setattr(C, "_git_head", lambda *require: head)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +292,16 @@ LEAVES = {
     "production_orchestrator_deps": lambda auth: C.production_orchestrator_deps(auth),
     "AppContainerLauncher": lambda auth: C.AppContainerLauncher(auth, object()),
     "Win32AppContainerApi": lambda auth: C.Win32AppContainerApi(auth),
+    "CtypesWin32": lambda auth: C.CtypesWin32(auth),
+}
+
+#: Leaves only the probe may use; they refuse calibration authorizations too.
+PROBE_LEAVES = {
+    "production_probe_deps": lambda auth: C.production_probe_deps(auth),
+    "production_probe_child_deps": lambda auth: C.production_probe_child_deps(auth),
+    "LoopbackListener": lambda auth: C.LoopbackListener(auth),
+    "_loopback_connect": lambda auth: C._loopback_connect(auth, 50000),
+    "_resolve": lambda auth: C._resolve(auth, "localhost"),
 }
 
 
@@ -358,9 +381,11 @@ class TestExecutionGates:
         deps = C.production_orchestrator_deps(C.authorize(["cal-a-01"], HEAD))
         assert isinstance(deps.launch, C.AppContainerLauncher)
         assert isinstance(deps.launch.api, C.Win32AppContainerApi)
-        assert deps.interpreter == sys.executable and deps.expected_head == HEAD
-        with pytest.raises(C.CalibrationError, match="not implemented"):
-            deps.launch.api.profile_sid(C.APPCONTAINER_PROFILE)
+        assert isinstance(deps.launch.api.win32, C.CtypesWin32)
+        assert deps.launch.api.win32.loaded_dlls == []           # nothing loaded or called
+        assert deps.interpreter == C.base_interpreter() and deps.expected_head == HEAD
+        assert not C.is_venv_launcher(deps.interpreter)
+        assert deps.python_paths == C.venv_paths()
 
     def test_cli_refuses_while_disabled(self, tmp_path, capsys):
         assert C.main(["--execute", "--output-dir", str(tmp_path)]) == 2
@@ -727,17 +752,25 @@ class TestChildCommand:
                                             log_dir=Path("C:/with space"))
 
 
-GOOD_TOKEN = {"is_app_container": True, "app_container_sid": "S-1-15-2-99",
+GOOD_TOKEN = {"is_app_container": True, "app_container_sid": SID,
               "capabilities": [], "integrity_level": "low", "loopback_exempt": False}
+LAUNCH_TOKEN = {**GOOD_TOKEN, "pid": 4242, "image_path": SPACED_PYTHON}
 
 
 class FakeAppContainerApi:
-    def __init__(self, sid="S-1-15-2-99", token=None):
-        self.sid, self.token, self.calls = sid, token or dict(GOOD_TOKEN), []
+    def __init__(self, sid=SID, token=None, folder=True, token_error=None, resume_error=None,
+                 discard_error=None):
+        self.sid, self.token, self.folder = sid, token or dict(LAUNCH_TOKEN), folder
+        self.token_error, self.resume_error = token_error, resume_error
+        self.discard_error, self.calls = discard_error, []
 
     def profile_sid(self, name):
         self.calls.append(("profile_sid", name))
         return self.sid
+
+    def profile_folder_present(self, sid):
+        self.calls.append(("profile_folder_present", sid))
+        return self.folder
 
     def create_suspended(self, command, sid, capabilities, stdout, stderr):
         self.calls.append(("create_suspended", sid, capabilities))
@@ -745,52 +778,176 @@ class FakeAppContainerApi:
 
     def token_info(self, process):
         self.calls.append(("token_info",))
+        if self.token_error:
+            raise self.token_error
         return self.token
 
     def resume(self, process):
         self.calls.append(("resume",))
+        if self.resume_error:
+            raise self.resume_error
 
     def discard_suspended(self, process):
         self.calls.append(("discard_suspended",))
+        if self.discard_error:
+            raise self.discard_error
 
 
-class TestAppContainer:
-    def _launch(self, monkeypatch, tmp_path, api, number=1):
+PREFLIGHT = {"profile_name": C.APPCONTAINER_PROFILE, "app_container_sid": SID,
+             "capabilities": [], "loopback_exempt": False,
+             "verified_by": "separately authorized profile step",
+             "verified_utc": "2026-10-09T10:00:00Z"}
+
+
+def write_preflight(monkeypatch, directory, record=None, raw=None):
+    """An authorized preflight record (its SHA-256 set in memory only)."""
+    data = raw if raw is not None else json.dumps(record or PREFLIGHT).encode("utf-8")
+    path = Path(directory) / "preflight.json"
+    path.write_bytes(data)
+    monkeypatch.setattr(C, "AUTHORIZED_PROFILE_PREFLIGHT_SHA256",
+                        hashlib.sha256(data).hexdigest())
+    return path
+
+
+class TestAppContainerLauncher:
+    def _launch(self, monkeypatch, tmp_path, api, number=1, interpreter=SPACED_PYTHON,
+                preflight=None):
         open_gate(monkeypatch)
-        launcher = C.AppContainerLauncher(C.authorize(["cal-a-01"], HEAD), api)
+        monkeypatch.setattr(C, "AUTHORIZED_APPCONTAINER_SID", SID)
+        path = preflight if preflight is not None else write_preflight(monkeypatch, tmp_path)
+        launcher = C.AppContainerLauncher(C.authorize(["cal-a-01"], HEAD), api,
+                                          preflight_path=path)
         command = C.build_child_command(number, tmp_path, series_token=TOKEN,
-                                        expected_head=HEAD, interpreter=SPACED_PYTHON)
+                                        expected_head=HEAD, interpreter=interpreter)
         return launcher(command, io.BytesIO(), io.BytesIO())
 
     def test_capability_free_launch(self, monkeypatch, tmp_path):
         api = FakeAppContainerApi()
         assert isinstance(self._launch(monkeypatch, tmp_path, api), FakeProcess)
-        assert [c[0] for c in api.calls] == ["profile_sid", "create_suspended", "token_info",
-                                             "resume"]
-        assert api.calls[0][1] == C.APPCONTAINER_PROFILE and api.calls[1][2] == ()
+        assert [c[0] for c in api.calls] == ["profile_sid", "profile_folder_present",
+                                             "create_suspended", "token_info", "resume"]
+        assert api.calls[0][1] == C.APPCONTAINER_PROFILE and api.calls[2][2] == ()
         assert C.APPCONTAINER_CAPABILITIES == ()
 
     @pytest.mark.parametrize("change, message", [
         ({"is_app_container": False}, "not in an AppContainer"),
         ({"app_container_sid": "S-1-15-2-1"}, "SID"),
         ({"capabilities": ["S-1-15-3-1"]}, "internetClient"),
+        ({"capabilities": ["S-1-15-3-3"]}, "privateNetworkClientServer"),
         ({"capabilities": None}, "unknown"),
         ({"integrity_level": "medium"}, "integrity"),
         ({"loopback_exempt": True}, "loopback"),
         ({"loopback_exempt": None}, "loopback"),
+        ({"pid": 999}, "another process"),
+        ({"image_path": r"C:\Windows\System32\cmd.exe"}, "intended interpreter"),
     ])
     def test_rejected_token_is_never_resumed(self, monkeypatch, tmp_path, change, message):
-        api = FakeAppContainerApi(token={**GOOD_TOKEN, **change})
-        with pytest.raises(C.CalibrationError, match=message):
+        api = FakeAppContainerApi(token={**LAUNCH_TOKEN, **change})
+        with pytest.raises(C.LaunchFailure, match=message) as raised:
             self._launch(monkeypatch, tmp_path, api)
+        assert "was discarded and confirmed exited" in str(raised.value)
         assert [c[0] for c in api.calls][-1] == "discard_suspended"
         assert ("resume",) not in api.calls
 
-    def test_missing_profile_is_never_created(self, monkeypatch, tmp_path):
-        api = FakeAppContainerApi(sid=None)
-        with pytest.raises(C.CalibrationError, match="its own authorization"):
+    def test_unreadable_token_is_discarded(self, monkeypatch, tmp_path):
+        api = FakeAppContainerApi(token_error=C.Win32Error("OpenProcessToken", 5))
+        with pytest.raises(C.LaunchFailure, match="token could not be read"):
+            self._launch(monkeypatch, tmp_path, api)
+        assert ("resume",) not in api.calls and api.calls[-1] == ("discard_suspended",)
+
+    def test_resume_failure_is_discarded(self, monkeypatch, tmp_path):
+        api = FakeAppContainerApi(resume_error=C.CalibrationError("suspend count was 0"))
+        with pytest.raises(C.LaunchFailure, match="resume failed"):
+            self._launch(monkeypatch, tmp_path, api)
+        assert api.calls[-1] == ("discard_suspended",)
+
+    def test_failed_discard_keeps_the_evidence(self, monkeypatch, tmp_path):
+        api = FakeAppContainerApi(token={**LAUNCH_TOKEN, "capabilities": ["S-1-15-3-1"]},
+                                  discard_error=C.CalibrationError("TerminateProcess failed"))
+        with pytest.raises(C.LaunchFailure, match="PID 4242 could not be discarded") as raised:
+            self._launch(monkeypatch, tmp_path, api)
+        assert "handles are kept" in str(raised.value)
+        assert raised.value.evidence["pid"] == 4242
+
+    def test_no_authorized_profile(self, monkeypatch, tmp_path):
+        api = FakeAppContainerApi()
+        open_gate(monkeypatch)
+        launcher = C.AppContainerLauncher(C.authorize(["cal-a-01"], HEAD), api)
+        command = C.build_child_command(1, tmp_path, series_token=TOKEN, expected_head=HEAD,
+                                        interpreter=SPACED_PYTHON)
+        with pytest.raises(C.CalibrationError, match="AUTHORIZED_APPCONTAINER_SID is None"):
+            launcher(command, io.BytesIO(), io.BytesIO())
+        assert api.calls == []
+
+    def test_preflight_record_is_required(self, monkeypatch, tmp_path):
+        api = FakeAppContainerApi()
+        open_gate(monkeypatch)
+        monkeypatch.setattr(C, "AUTHORIZED_APPCONTAINER_SID", SID)
+        assert C.AUTHORIZED_PROFILE_PREFLIGHT_SHA256 is None
+        launcher = C.AppContainerLauncher(C.authorize(["cal-a-01"], HEAD), api,
+                                          preflight_path=tmp_path / "preflight.json")
+        command = C.build_child_command(1, tmp_path, series_token=TOKEN, expected_head=HEAD,
+                                        interpreter=SPACED_PYTHON)
+        with pytest.raises(C.CalibrationError, match="no profile-preflight record is authorized"):
+            launcher(command, io.BytesIO(), io.BytesIO())
+        assert api.calls == []
+        assert C.AppContainerLauncher(C.authorize(["cal-a-01"], HEAD), api).preflight_path \
+            == C.DEFAULT_PROFILE_PREFLIGHT
+
+    @pytest.mark.parametrize("case, message", [
+        ("missing", "missing or unreadable"),
+        ("tampered", "not the authorized one"),
+        ("malformed", "malformed"),
+        ("other sid", "another SID"),
+        ("capabilities", "capabilities are present"),
+        ("loopback", "loopback exemption"),
+        ("unattributed", "not attributed"),
+        ("incomplete", "fields are missing"),
+        ("other profile", "another profile name"),
+    ])
+    def test_invalid_preflight_blocks_the_launch(self, monkeypatch, tmp_path, case, message):
+        records = {"other sid": {**PREFLIGHT, "app_container_sid": "S-1-15-2-7"},
+                   "capabilities": {**PREFLIGHT, "capabilities": ["S-1-15-3-1"]},
+                   "loopback": {**PREFLIGHT, "loopback_exempt": True},
+                   "unattributed": {**PREFLIGHT, "verified_by": " "},
+                   "incomplete": {"profile_name": C.APPCONTAINER_PROFILE},
+                   "other profile": {**PREFLIGHT, "profile_name": "x"}}
+        if case == "malformed":
+            path = write_preflight(monkeypatch, tmp_path, raw=b"{not json")
+        else:
+            path = write_preflight(monkeypatch, tmp_path, records.get(case))
+        if case == "missing":
+            path.unlink()
+        if case == "tampered":
+            path.write_bytes(path.read_bytes() + b" ")
+        api = FakeAppContainerApi()
+        with pytest.raises(C.CalibrationError, match=message):
+            self._launch(monkeypatch, tmp_path, api, preflight=path)
+        assert api.calls == []
+
+    def test_other_profile_sid_refused(self, monkeypatch, tmp_path):
+        api = FakeAppContainerApi(sid="S-1-15-2-7")
+        with pytest.raises(C.CalibrationError, match="not the authorized one"):
             self._launch(monkeypatch, tmp_path, api)
         assert [c[0] for c in api.calls] == ["profile_sid"]
+
+    def test_missing_folder_blocks_without_claiming_existence(self, monkeypatch, tmp_path):
+        api = FakeAppContainerApi(folder=False)
+        with pytest.raises(C.CalibrationError, match="not proof either way") as raised:
+            self._launch(monkeypatch, tmp_path, api)
+        assert "its own authorization" in str(raised.value)
+        assert [c[0] for c in api.calls] == ["profile_sid", "profile_folder_present"]
+
+    def test_venv_launcher_refused(self, monkeypatch, tmp_path):
+        venv = tmp_path / "my venv"
+        (venv / "Scripts").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text("home = x\n")
+        launcher_path = str(venv / "Scripts" / "python.exe")
+        assert C.is_venv_launcher(launcher_path)
+        api = FakeAppContainerApi()
+        with pytest.raises(C.CalibrationError, match="not the venv launcher"):
+            self._launch(monkeypatch, tmp_path, api, interpreter=launcher_path)
+        assert api.calls == []
 
     def test_capabilities_constant_is_enforced(self, monkeypatch, tmp_path):
         monkeypatch.setattr(C, "APPCONTAINER_CAPABILITIES", ("S-1-15-3-1",))
@@ -806,8 +963,14 @@ class TestAppContainer:
         assert api.calls == []
 
     def test_token_validation_is_pure(self):
-        assert C.validate_app_container_token(GOOD_TOKEN, "S-1-15-2-99") == []
-        assert C.validate_app_container_token(None, "S-1-15-2-99") == ["no token information"]
+        assert C.validate_app_container_token(GOOD_TOKEN, SID) == []
+        assert C.validate_app_container_token(None, SID) == ["no token information"]
+        assert "no AppContainer profile is authorized" in C.validate_app_container_token(
+            GOOD_TOKEN, None)
+        assert C.validate_app_container_token({**GOOD_TOKEN, "loopback_exempt": None}, SID,
+                                              check_loopback=False) == []
+        assert C.validate_app_container_token(LAUNCH_TOKEN, SID, expected_pid=4242,
+                                              expected_image=SPACED_PYTHON.upper()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -874,8 +1037,8 @@ def _series_record(directory):
     return _read(records[0])
 
 
-def _journal(directory, stage, number):
-    return Path(directory) / "journal" / f"{stage}-{number:02d}.json"
+def _journal(directory, stage, run):
+    return C._journal_path(directory, stage, run)
 
 
 class TestOrchestrator:
@@ -1146,3 +1309,1467 @@ class TestScope:
         code = (_BENCH / "calibrate_generator.py").read_text(encoding="utf-8")
         assert "\nEXECUTION_ENABLED: bool = False\n" in code
         assert "\nAPPROVED_CALIBRATIONS: frozenset[str] = frozenset()\n" in code
+        assert "\nPROBE_ENABLED: bool = False\n" in code
+        assert "\nAPPROVED_PROBES: frozenset[str] = frozenset()\n" in code
+        assert "\nAUTHORIZED_APPCONTAINER_SID: Optional[str] = None\n" in code
+        assert "\nAUTHORIZED_PROFILE_PREFLIGHT_SHA256: Optional[str] = None\n" in code
+        assert (C.PROBE_ENABLED, C.APPROVED_PROBES, C.AUTHORIZED_APPCONTAINER_SID,
+                C.AUTHORIZED_PROFILE_PREFLIGHT_SHA256) == (False, frozenset(), None, None)
+
+    def test_no_profile_or_acl_changes_in_the_source(self):
+        code = (_BENCH / "calibrate_generator.py").read_text(encoding="utf-8").split('"""', 2)[2]
+        for word in ("CreateAppContainerProfile(", "DeleteAppContainerProfile(", "icacls ",
+                     "SetNamedSecurityInfo", "SetFileSecurity", "NetworkIsolationSet",
+                     "netsh", "New-NetFirewallRule"):
+            assert word not in code, word
+
+
+# ---------------------------------------------------------------------------
+# Isolation probe gates
+# ---------------------------------------------------------------------------
+
+class TestProbeGates:
+    def test_probe_refuses_while_disabled(self):
+        with pytest.raises(C.ExecutionDisabled, match="isolation probe is not enabled"):
+            C.authorize_probe("probe-01", HEAD)
+
+    @pytest.mark.parametrize("leaf", sorted(PROBE_LEAVES))
+    def test_probe_leaves_refuse_while_disabled(self, leaf):
+        with pytest.raises(C.ExecutionDisabled, match="isolation probe is not enabled"):
+            PROBE_LEAVES[leaf](None)
+
+    @pytest.mark.parametrize("leaf", sorted(PROBE_LEAVES))
+    def test_probe_flag_alone_is_not_enough(self, monkeypatch, leaf):
+        monkeypatch.setattr(C, "PROBE_ENABLED", True)
+        with pytest.raises(C.ExecutionDisabled, match="APPROVED_PROBES is empty"):
+            PROBE_LEAVES[leaf](None)
+        with pytest.raises(C.ExecutionDisabled, match="APPROVED_PROBES is empty"):
+            C.authorize_probe("probe-01", HEAD)
+
+    def test_the_gates_are_independent(self, monkeypatch):
+        open_gate(monkeypatch)
+        with pytest.raises(C.ExecutionDisabled, match="isolation probe is not enabled"):
+            C.authorize_probe("probe-01", HEAD)
+        monkeypatch.setattr(C, "EXECUTION_ENABLED", False)
+        open_probe_gate(monkeypatch)
+        with pytest.raises(C.ExecutionDisabled, match="real calibration is not enabled"):
+            C.authorize(["cal-a-01"], HEAD)
+
+    def test_a_probe_authorization_never_reaches_the_driver(self, monkeypatch):
+        open_gate(monkeypatch)
+        open_probe_gate(monkeypatch)
+        probe = C.authorize_probe("probe-01", HEAD)
+        for leaf in ("_import_driver", "_memory_exporter", "production_child_deps",
+                     "production_orchestrator_deps"):
+            with pytest.raises(C.ExecutionDisabled, match="no valid calibration authorization"):
+                LEAVES[leaf](probe)
+        calibration = C.authorize(["cal-a-01"], HEAD)
+        for leaf in sorted(PROBE_LEAVES):
+            with pytest.raises(C.ExecutionDisabled, match="no valid probe authorization"):
+                PROBE_LEAVES[leaf](calibration)
+
+    def test_probe_authorization_checks(self, monkeypatch):
+        open_probe_gate(monkeypatch)
+        for probe_id, head, message in (("probe-02", HEAD, "not an approved probe"),
+                                        ("probe-9", HEAD, "probe-01 .. probe-05"),
+                                        (None, HEAD, "probe-01 .. probe-05"),
+                                        ("probe-01", "abc", "full 40"),
+                                        ("probe-01", "b" * 40, "not the expected")):
+            with pytest.raises(C.ExecutionDisabled, match=message):
+                C.authorize_probe(probe_id, head)
+        auth = C.authorize_probe("probe-01", HEAD)
+        assert auth.probe_id == "probe-01"
+        for forged in (C.ProbeAuthorization("probe-01", HEAD),
+                       C.ProbeAuthorization("probe-01", HEAD, object())):
+            with pytest.raises(C.ExecutionDisabled, match="no valid probe authorization"):
+                C.production_probe_deps(forged)
+        monkeypatch.setattr(C, "PROBE_ENABLED", False)
+        with pytest.raises(C.ExecutionDisabled, match="not enabled"):
+            C.production_probe_deps(auth)
+
+    def test_cli_probe_refused_while_disabled(self, tmp_path, capsys):
+        assert C.main(["--probe", "probe-01", "--expect-head", HEAD,
+                       "--output-dir", str(tmp_path)]) == 2
+        assert "isolation probe is not enabled" in capsys.readouterr().err
+        assert C.main(["--probe-child", "probe-01", "--expect-head", HEAD, "--token", TOKEN,
+                       "--port", "50123", "--output-dir", str(tmp_path)]) == 2
+        assert "isolation probe is not enabled" in capsys.readouterr().err
+        assert list(tmp_path.iterdir()) == []
+
+    def test_production_probe_wiring(self, monkeypatch):
+        open_probe_gate(monkeypatch)
+        deps = C.production_probe_deps(C.authorize_probe("probe-01", HEAD))
+        assert isinstance(deps.launch, C.AppContainerLauncher)
+        assert isinstance(deps.launch.api.win32, C.CtypesWin32)
+        assert deps.launch.api.win32.loaded_dlls == []
+        assert deps.interpreter == C.base_interpreter()
+        child = C.production_probe_child_deps(C.authorize_probe("probe-01", HEAD))
+        assert child.import_module is importlib.import_module
+
+
+# ---------------------------------------------------------------------------
+# Git HEAD without a git process
+# ---------------------------------------------------------------------------
+
+SHA2 = "b" * 40
+
+
+def _gitdir(root, head, refs=None, packed=None):
+    git = root / ".git"
+    git.mkdir(parents=True)
+    (git / "HEAD").write_text(head + "\n")
+    for ref, sha in (refs or {}).items():
+        path = git.joinpath(*ref.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(sha + "\n")
+    if packed:
+        (git / "packed-refs").write_text(packed)
+    return git
+
+
+class TestGitHead:
+    def test_this_repository(self):
+        assert C._HEAD_RE.fullmatch(C._read_git_head(_REPO))
+
+    def test_detached_loose_nested_and_packed(self, tmp_path):
+        _gitdir(tmp_path / "a", HEAD)
+        _gitdir(tmp_path / "b", "ref: refs/heads/claude/x", {"refs/heads/claude/x": SHA2})
+        _gitdir(tmp_path / "c", "ref: refs/heads/main",
+                packed=f"# pack-refs with: peeled\n{SHA2} refs/heads/main\n^{HEAD}\n")
+        assert C._read_git_head(tmp_path / "a") == HEAD
+        assert C._read_git_head(tmp_path / "b") == SHA2
+        assert C._read_git_head(tmp_path / "c") == SHA2
+
+    def test_worktree(self, tmp_path):
+        main = _gitdir(tmp_path / "main", "ref: refs/heads/main", {"refs/heads/w": SHA2})
+        wt = main / "worktrees" / "w"
+        wt.mkdir(parents=True)
+        (wt / "HEAD").write_text("ref: refs/heads/w\n")
+        (wt / "commondir").write_text("../..\n")
+        (tmp_path / "w").mkdir()
+        (tmp_path / "w" / ".git").write_text(f"gitdir: {wt}\n")
+        assert C._read_git_head(tmp_path / "w") == SHA2
+
+    @pytest.mark.parametrize("head, refs", [
+        ("ref: refs/heads/gone", {}),
+        ("ref: refs/heads/main", {"refs/heads/main": "not-a-sha"}),
+        ("garbage", {}),
+    ])
+    def test_unresolvable(self, tmp_path, head, refs):
+        _gitdir(tmp_path, head, refs)
+        with pytest.raises(C.ExecutionDisabled, match="cannot be resolved"):
+            C._read_git_head(tmp_path)
+
+    def test_no_repository(self, tmp_path):
+        with pytest.raises(C.ExecutionDisabled, match="cannot be resolved"):
+            C._read_git_head(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Interpreter, environment block and Win32 helpers
+# ---------------------------------------------------------------------------
+
+class TestWin32Helpers:
+    def test_base_interpreter_is_not_the_venv_launcher(self):
+        assert not C.is_venv_launcher(C.base_interpreter())
+        if sys.prefix != sys.base_prefix:
+            assert C.is_venv_launcher(sys.executable)
+
+    def test_venv_paths_reach_the_child(self, tmp_path):
+        command = C.build_child_command(1, tmp_path, series_token=TOKEN, expected_head=HEAD,
+                                        interpreter=SPACED_PYTHON,
+                                        python_paths=(r"C:\my venv\Lib\site-packages",))
+        assert command.env["PYTHONPATH"].split(os.pathsep)[-1] == \
+            r"C:\my venv\Lib\site-packages"
+        with pytest.raises(C.CalibrationError, match="unsafe"):
+            C.build_child_command(1, tmp_path, series_token=TOKEN, expected_head=HEAD,
+                                  interpreter=SPACED_PYTHON, python_paths=("C:\\a%b",))
+
+    def test_environment_block(self):
+        block = C.environment_block({"b": "2", "A": "1", "PATH": r"C:\x y"})
+        assert block == "A=1\0b=2\0PATH=C:\\x y\0"
+        for bad in ({"": "x"}, {"A=B": "x"}, {"A": "x\0y"}, {}):
+            with pytest.raises(C.CalibrationError):
+                C.environment_block(bad)
+
+    def test_filetime_and_integrity(self):
+        from datetime import datetime, timezone
+        epoch = int(datetime(2026, 10, 9, 10, 0, tzinfo=timezone.utc).timestamp())
+        ticks = (epoch + 11644473600) * 10_000_000 + 1_230_000
+        assert C._filetime_iso(ticks & 0xFFFFFFFF, ticks >> 32) == "2026-10-09T10:00:00.123Z"
+        assert C._integrity_name("S-1-16-4096") == "low"
+        assert C._integrity_name("S-1-16-8192") == "medium"
+        assert C._integrity_name("S-1-16-12288") == "high" and C._integrity_name(None) is None
+
+    def test_handle_validity(self):
+        assert C._valid_handle(101) and not C._valid_handle(0)
+        for bad in (None, -1, (1 << 64) - 1, (1 << 32) - 1, True):
+            assert not C._valid_handle(bad)
+
+    def test_documented_structure_layouts(self):
+        t = C._win32_types()
+        c = t.ctypes
+        if c.sizeof(c.c_void_p) == 8:
+            assert c.sizeof(t.STARTUPINFOEXW) == 112 and c.sizeof(t.PROCESS_INFORMATION) == 24
+            assert c.sizeof(t.SECURITY_CAPABILITIES) == 24
+            assert t.TOKEN_GROUPS.Groups.offset == 8 and c.sizeof(t.SID_AND_ATTRIBUTES) == 16
+        assert set(dll for dll, _, _ in C._signatures(t).values()) == set(C.WIN32_DLLS)
+        assert C.CREATION_FLAGS & C.CREATE_SUSPENDED
+        assert C.CREATION_FLAGS & C.EXTENDED_STARTUPINFO_PRESENT
+
+
+# ---------------------------------------------------------------------------
+# Win32 backend logic (mocked primitive layer)
+# ---------------------------------------------------------------------------
+
+class FakeWin32:
+    def __init__(self, **overrides):
+        self.calls = []
+        self.handles = C.Win32Handles(101, 102, 4242, 77)
+        self.pid, self.previous, self.waits = 4242, 1, [True]
+        self.code, self.exempt, self.fail = C.DISCARD_EXIT_CODE, [], {}
+        self.token = {"is_app_container": True, "app_container_sid": SID, "capabilities": [],
+                      "integrity_level": "low"}
+        self.__dict__.update(overrides)
+
+    def _record(self, name, *args):
+        self.calls.append((name, *args))
+        if name in self.fail:
+            raise self.fail[name]
+
+    def derive_sid(self, name):
+        self._record("derive_sid", name)
+        return SID
+
+    def profile_folder(self, sid):
+        self._record("profile_folder", sid)
+        return r"C:\Users\x\AppData\Local\Packages\p"
+
+    def create_process(self, **kwargs):
+        self._record("create_process")
+        self.created = kwargs
+        return self.handles
+
+    def process_id(self, handle):
+        self._record("process_id", handle)
+        return self.pid
+
+    def creation_time(self, handle):
+        self._record("creation_time", handle)
+        return CREATED
+
+    def image_path(self, handle):
+        self._record("image_path", handle)
+        return SPACED_PYTHON
+
+    def token_info(self, handle):
+        self._record("token_info", handle)
+        return dict(self.token)
+
+    def loopback_exempt_sids(self):
+        self._record("loopback_exempt_sids")
+        return list(self.exempt)
+
+    def resume(self, thread):
+        self._record("resume", thread)
+        return self.previous
+
+    def terminate(self, handle, code):
+        self._record("terminate", handle, code)
+
+    def wait(self, handle, milliseconds):
+        self._record("wait", handle, milliseconds)
+        return self.waits.pop(0) if self.waits else True
+
+    def exit_code(self, handle):
+        self._record("exit_code", handle)
+        return self.code
+
+    def close(self, handle):
+        self._record("close", handle)
+
+
+class TestWin32Backend:
+    def _launch(self, monkeypatch, tmp_path, win32):
+        open_probe_gate(monkeypatch)
+        auth = C.authorize_probe("probe-01", HEAD)
+        api = C.Win32AppContainerApi(auth, win32=win32)
+        command = C.build_probe_command("probe-01", tmp_path, series_token=TOKEN,
+                                        expected_head=HEAD, interpreter=SPACED_PYTHON,
+                                        port=50123)
+        launcher = C.AppContainerLauncher(auth, api,
+                                          preflight_path=write_preflight(monkeypatch, tmp_path))
+        return launcher(command, 1, 2), command
+
+    def _names(self, win32):
+        return [c[0] for c in win32.calls]
+
+    def test_validated_launch(self, monkeypatch, tmp_path):
+        win32 = FakeWin32()
+        process, command = self._launch(monkeypatch, tmp_path, win32)
+        assert isinstance(process, C.Win32Process) and process.resumed
+        assert process.pid == 4242 and process.creation_time == CREATED
+        assert process.resume_previous_count == 1
+        assert process.execution_history == C.MAY_HAVE_EXECUTED
+        assert process.liveness == C.ALIVE_AT_LAST_CHECK
+        assert self._names(win32) == [
+            "derive_sid", "profile_folder", "create_process", "process_id", "creation_time",
+            "image_path", "token_info", "loopback_exempt_sids", "process_id", "resume", "close"]
+        assert win32.calls[-1] == ("close", 102)                 # thread handle after resume
+        assert win32.created == {"application": SPACED_PYTHON,
+                                 "command_line": command.command_line, "env": command.env,
+                                 "cwd": str(_REPO), "stdout": 1, "stderr": 2, "sid": SID}
+        assert "terminate" not in self._names(win32)
+
+    def test_exit_status_is_the_real_one(self, monkeypatch, tmp_path):
+        win32 = FakeWin32()
+        process, _ = self._launch(monkeypatch, tmp_path, win32)
+        win32.waits, win32.code = [False, True], 3
+        assert process.poll() is None and process.liveness == C.ALIVE_AT_LAST_CHECK
+        assert process.poll() == 3 and process.returncode == 3
+        assert process.liveness == C.CONFIRMED_EXITED
+        assert process.execution_history == C.MAY_HAVE_EXECUTED
+        assert win32.calls[-1] == ("close", 101) and process.poll() == 3
+
+    @pytest.mark.parametrize("change, message", [
+        ({"token": {"is_app_container": True, "app_container_sid": "S-1-15-2-1",
+                    "capabilities": [], "integrity_level": "low"}}, "SID"),
+        ({"token": {"is_app_container": True, "app_container_sid": SID,
+                    "capabilities": ["S-1-15-3-1"], "integrity_level": "low"}},
+         "internetClient"),
+        ({"token": {"is_app_container": False, "app_container_sid": None,
+                    "capabilities": [], "integrity_level": "medium"}}, "not in an AppContainer"),
+        ({"exempt": [SID]}, "loopback"),
+        ({"fail": {"token_info": C.Win32Error("GetTokenInformation", 87)}},
+         "token could not be read"),
+    ])
+    def test_rejection_before_resume_never_executed(self, monkeypatch, tmp_path, change,
+                                                    message):
+        win32 = FakeWin32(**change)
+        with pytest.raises(C.LaunchFailure, match=message) as raised:
+            self._launch(monkeypatch, tmp_path, win32)
+        evidence = raised.value.evidence
+        assert evidence["execution_history"] == C.NEVER_EXECUTED
+        assert evidence["liveness"] == C.CONFIRMED_EXITED and not evidence["handles_retained"]
+        assert ("terminate", 101, C.DISCARD_EXIT_CODE) in win32.calls
+        assert ("wait", 101, C.DISCARD_WAIT_MILLISECONDS) in win32.calls
+        assert ("close", 101) in win32.calls and "resume" not in self._names(win32)
+
+    @pytest.mark.parametrize("previous, history", [
+        (0, C.MAY_HAVE_EXECUTED), (2, C.NEVER_EXECUTED), (7, C.NEVER_EXECUTED)])
+    def test_resume_count_edge_cases(self, monkeypatch, tmp_path, previous, history):
+        win32 = FakeWin32(previous=previous)
+        with pytest.raises(C.LaunchFailure, match=f"suspend count was {previous}") as raised:
+            self._launch(monkeypatch, tmp_path, win32)
+        evidence = raised.value.evidence
+        assert evidence["execution_history"] == history         # never improved by discard
+        assert evidence["liveness"] == C.CONFIRMED_EXITED
+        assert f"execution history: {history}" in str(raised.value)
+
+    def test_failed_resume_call_is_unknown_history(self, monkeypatch, tmp_path):
+        win32 = FakeWin32(fail={"resume": C.Win32Error("ResumeThread", 6)})
+        with pytest.raises(C.LaunchFailure, match="resume failed") as raised:
+            self._launch(monkeypatch, tmp_path, win32)
+        assert raised.value.evidence["execution_history"] == C.STATE_UNKNOWN
+
+    @pytest.mark.parametrize("handles", [
+        C.Win32Handles(0, 0, 4242, 0), C.Win32Handles(None, None, 4242, 0)])
+    def test_invalid_handles_keep_the_pid(self, monkeypatch, tmp_path, handles):
+        win32 = FakeWin32(handles=handles)
+        with pytest.raises(C.LaunchFailure, match="no valid process handle") as raised:
+            self._launch(monkeypatch, tmp_path, win32)
+        evidence = raised.value.evidence
+        assert "invalid handle" in str(raised.value) and evidence["pid"] == 4242
+        assert evidence["liveness"] == C.STATE_UNKNOWN and evidence["handles_retained"]
+        assert evidence["execution_history"] == C.NEVER_EXECUTED
+        assert "resume" not in self._names(win32)
+
+    def test_invalid_thread_handle_terminates_the_process(self, monkeypatch, tmp_path):
+        win32 = FakeWin32(handles=C.Win32Handles(101, -1, 4242, 0))
+        with pytest.raises(C.LaunchFailure, match="invalid handle"):
+            self._launch(monkeypatch, tmp_path, win32)
+        assert ("terminate", 101, C.DISCARD_EXIT_CODE) in win32.calls
+
+    def test_native_cleanup_errors_discard_the_child(self, monkeypatch, tmp_path):
+        failing = "SetHandleInformation could not reset inheritance of handle 11"
+        win32 = FakeWin32(handles=C.Win32Handles(101, 102, 4242, 77, [failing]))
+        with pytest.raises(C.LaunchFailure, match="native cleanup") as raised:
+            self._launch(monkeypatch, tmp_path, win32)
+        assert failing in raised.value.evidence["cleanup_errors"]
+        assert raised.value.evidence["liveness"] == C.CONFIRMED_EXITED
+        assert "create_process" in self._names(win32) and "resume" not in self._names(win32)
+
+    def test_foreign_pid_is_discarded(self, monkeypatch, tmp_path):
+        win32 = FakeWin32(pid=9)
+        with pytest.raises(C.LaunchFailure, match="does not belong"):
+            self._launch(monkeypatch, tmp_path, win32)
+        assert ("terminate", 101, C.DISCARD_EXIT_CODE) in win32.calls
+
+    @pytest.mark.parametrize("change, message, liveness, history", [
+        ({"waits": [False]}, "did not exit", C.STATE_UNKNOWN, C.NEVER_EXECUTED),
+        ({"code": 0}, "not the discard code", C.CONFIRMED_EXITED, C.STATE_UNKNOWN),
+        ({"fail": {"terminate": C.Win32Error("TerminateProcess", 5)}}, "TerminateProcess",
+         C.STATE_UNKNOWN, C.NEVER_EXECUTED),
+    ])
+    def test_unverified_discard_keeps_handles(self, monkeypatch, tmp_path, change, message,
+                                              liveness, history):
+        win32 = FakeWin32(exempt=[SID], **change)
+        with pytest.raises(C.LaunchFailure, match="could not be discarded") as raised:
+            self._launch(monkeypatch, tmp_path, win32)
+        evidence = raised.value.evidence
+        assert message in str(raised.value) and "inspect it" in str(raised.value)
+        assert evidence["liveness"] == liveness and evidence["execution_history"] == history
+        assert evidence["handles_retained"] and evidence["pid"] == 4242
+        assert ("close", 101) not in win32.calls                 # process handle kept
+
+    def test_missing_folder(self, monkeypatch, tmp_path):
+        win32 = FakeWin32(fail={"profile_folder": C.Win32Error("GetAppContainerFolderPath",
+                                                               0x80070002)})
+        with pytest.raises(C.CalibrationError, match="not proof either way"):
+            self._launch(monkeypatch, tmp_path, win32)
+        assert "create_process" not in self._names(win32)
+
+    def test_capabilities_are_refused_by_the_backend(self, monkeypatch, tmp_path):
+        open_probe_gate(monkeypatch)
+        win32 = FakeWin32()
+        api = C.Win32AppContainerApi(C.authorize_probe("probe-01", HEAD), win32=win32)
+        command = C.build_probe_command("probe-01", tmp_path, series_token=TOKEN,
+                                        expected_head=HEAD, interpreter=SPACED_PYTHON,
+                                        port=50123)
+        with pytest.raises(C.CalibrationError, match="no capabilities"):
+            api.create_suspended(command, SID, ("S-1-15-3-1",), 1, 2)
+        assert win32.calls == []
+
+    def test_closed_gate_stops_every_call(self, monkeypatch):
+        open_probe_gate(monkeypatch)
+        win32 = FakeWin32()
+        api = C.Win32AppContainerApi(C.authorize_probe("probe-01", HEAD), win32=win32)
+        monkeypatch.setattr(C, "PROBE_ENABLED", False)
+        for call in (lambda: api.profile_sid("x"), lambda: api.profile_folder_present(SID),
+                     lambda: api.resume(None), lambda: api.discard_suspended(None),
+                     lambda: api.token_info(None)):
+            with pytest.raises(C.ExecutionDisabled):
+                call()
+        assert win32.calls == []
+
+    def test_evidence_of_untracked_processes_is_unknown(self):
+        evidence = C.process_evidence(object())
+        assert evidence["execution_history"] == C.STATE_UNKNOWN
+        assert evidence["liveness"] == C.STATE_UNKNOWN
+        assert set(C.EXECUTION_HISTORIES) == {C.NEVER_EXECUTED, C.MAY_HAVE_EXECUTED,
+                                              C.STATE_UNKNOWN}
+        assert set(C.LIVENESS_STATES) == {C.CONFIRMED_EXITED, C.ALIVE_AT_LAST_CHECK,
+                                          C.STATE_UNKNOWN}
+
+
+# ---------------------------------------------------------------------------
+# ctypes layer (fake DLLs; no real Windows call)
+# ---------------------------------------------------------------------------
+
+class FakeFunction:
+    def __init__(self, name, implementation, log):
+        self.name, self.implementation, self.log = name, implementation, log
+
+    def __call__(self, *args):
+        self.log.append(self.name)
+        return self.implementation(*args)
+
+
+class FakeDll:
+    def __init__(self, functions, log):
+        self._functions, self._log = functions, log
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name not in self._functions:
+            raise LiveAccessAttempt(f"unexpected Windows API {name}")
+        return FakeFunction(name, self._functions[name], self._log)
+
+
+#: Sentinel SID pointers (outside any token buffer).
+SIDS = {0x5001: SID, 0x6001: "S-1-15-2-1001", 0x6002: "S-1-15-2-1002"}
+#: SIDs placed inside fake token buffers: 16 bytes "FAKESID" + index.
+FAKE_SID_STRINGS = {1: SID, 2: "S-1-16-4096", 3: "S-1-15-3-1", 4: "S-1-15-3-3",
+                    5: "S-1-16-8192"}
+
+
+def _fake_sid(index):
+    return b"FAKESID" + bytes([index]) + b"\0" * 8
+
+
+def _convert_sid(psid, out):
+    value = getattr(psid, "value", psid)
+    if value in SIDS:
+        out._obj.value = SIDS[value]
+        return 1
+    data = C._win32_types().ctypes.string_at(value, 8)
+    if data[:7] != b"FAKESID":
+        return 0
+    out._obj.value = FAKE_SID_STRINGS[data[7]]
+    return 1
+
+
+def _fake_ctypes(monkeypatch, functions, state):
+    open_probe_gate(monkeypatch)
+    log, loaded = [], []
+    base = {"ConvertSidToStringSidW": _convert_sid, "CloseHandle": lambda h: 1,
+            "LocalFree": lambda p: state.setdefault("freed", []).append(p),
+            "FreeSid": lambda p: state.__setitem__("sid_freed", True),
+            "CoTaskMemFree": lambda p: state.__setitem__("cotask_freed", True)}
+
+    def loader(name):
+        loaded.append(name)
+        return FakeDll({**base, **functions}, log)
+
+    win32 = C.CtypesWin32(C.authorize_probe("probe-01", HEAD), loader=loader,
+                          last_error=lambda: state.get("last_error", 0),
+                          os_handle=lambda stream: stream)
+    state["loaded"] = loaded
+    return win32, log
+
+
+def _create_fakes(state):
+    t = C._win32_types()
+    c = t.ctypes
+
+    def to_sid(sid, out):
+        state["sid_in"] = sid
+        out._obj.value = 0x5001
+        return 1
+
+    def inherit(handle, mask, flags):
+        state.setdefault("inherit", []).append((handle, flags))
+        if flags == 0 and state.get("reset_fails"):
+            return 0
+        return 1
+
+    def initialize(address, count, flags, size):
+        if address is None:
+            size._obj.value = 64
+            return 0
+        state["attribute_count"] = count
+        return 1
+
+    def update(address, flags, attribute, value, size, previous, returned):
+        if attribute == C.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES:
+            caps = t.SECURITY_CAPABILITIES.from_address(value)
+            state["capabilities"] = (caps.AppContainerSid, caps.CapabilityCount,
+                                     bool(caps.Capabilities))
+        else:
+            state["inherited"] = list((t.w.HANDLE * 2).from_address(value))
+        return state.get("update_ok", 1)
+
+    def create(app, command, pa, ta, inherit_handles, flags, env, cwd, startup, info):
+        state.update(app=app, command=c.wstring_at(command), flags=flags, cwd=cwd,
+                     inherit_handles=inherit_handles, env=c.wstring_at(env, state["env_len"]))
+        s = startup._obj
+        state["startup"] = (s.StartupInfo.cb, s.StartupInfo.dwFlags, s.StartupInfo.hStdOutput,
+                            s.StartupInfo.hStdError, bool(s.lpAttributeList))
+        if "during_create" in state:
+            state["during_create"]()
+        if not state.get("create_ok", 1):
+            return 0
+        i = info._obj
+        i.hProcess, i.hThread, i.dwProcessId, i.dwThreadId = 101, 102, 4242, 77
+        return 1
+
+    def delete(address):
+        state["deleted"] = True
+        if state.get("delete_raises"):
+            raise OSError("access violation")
+
+    def local_free(pointer):
+        state.setdefault("freed", []).append(pointer)
+        return 0x99 if state.get("local_free_fails") else None
+
+    return {"ConvertStringSidToSidW": to_sid, "SetHandleInformation": inherit,
+            "InitializeProcThreadAttributeList": initialize,
+            "UpdateProcThreadAttribute": update, "CreateProcessW": create,
+            "DeleteProcThreadAttributeList": delete, "LocalFree": local_free}
+
+
+def _probe_command(tmp_path):
+    return C.build_probe_command("probe-01", tmp_path, series_token=TOKEN, expected_head=HEAD,
+                                 interpreter=SPACED_PYTHON, port=50123)
+
+
+def _create(win32, command):
+    return win32.create_process(application=command.argv[0], command_line=command.command_line,
+                                env=command.env, cwd=command.cwd, stdout=11, stderr=12,
+                                sid=SID)
+
+
+class TestCtypesCreateProcess:
+    def test_suspended_without_capabilities(self, monkeypatch, tmp_path):
+        command = _probe_command(tmp_path)
+        state = {"env_len": len(C.environment_block(command.env)) + 1}
+        win32, log = _fake_ctypes(monkeypatch, _create_fakes(state), state)
+        handles = _create(win32, command)
+        assert (handles.process, handles.thread, handles.pid) == (101, 102, 4242)
+        assert handles.cleanup_errors == []
+        assert state["app"] == SPACED_PYTHON and state["command"] == command.command_line
+        assert state["env"] == C.environment_block(command.env) + "\0"
+        assert state["flags"] == C.CREATION_FLAGS and state["flags"] & C.CREATE_SUSPENDED
+        assert state["inherit_handles"] is True and state["cwd"] == str(_REPO)
+        assert state["capabilities"] == (0x5001, 0, False)      # the SID, zero capabilities
+        assert state["inherited"] == [11, 12] and state["sid_in"] == SID
+        t = C._win32_types()
+        assert state["startup"] == (t.ctypes.sizeof(t.STARTUPINFOEXW), C.STARTF_USESTDHANDLES,
+                                    11, 12, True)
+        assert state["inherit"] == [(11, 1), (12, 1), (11, 0), (12, 0)]
+        assert state["deleted"] and state["freed"]
+        assert "ResumeThread" not in log and state["loaded"] == ["advapi32", "kernel32"]
+
+    @pytest.mark.parametrize("failure", ["create_ok", "update_ok"])
+    def test_failure_cleans_up(self, monkeypatch, tmp_path, failure):
+        command = _probe_command(tmp_path)
+        state = {"env_len": len(C.environment_block(command.env)) + 1, failure: 0,
+                 "last_error": 5}
+        win32, _ = _fake_ctypes(monkeypatch, _create_fakes(state), state)
+        with pytest.raises(C.Win32Error, match="Windows error 5"):
+            _create(win32, command)
+        assert state["deleted"] and state["freed"]
+        assert state["inherit"][-2:] == [(11, 0), (12, 0)]
+
+    @pytest.mark.parametrize("fault, expected", [
+        ("reset_fails", "could not reset inheritance"),
+        ("delete_raises", "DeleteProcThreadAttributeList"),
+        ("local_free_fails", "LocalFree of the AppContainer SID failed"),
+    ])
+    def test_cleanup_failure_never_loses_the_process(self, monkeypatch, tmp_path, fault,
+                                                     expected):
+        command = _probe_command(tmp_path)
+        state = {"env_len": len(C.environment_block(command.env)) + 1, fault: True}
+        win32, _ = _fake_ctypes(monkeypatch, _create_fakes(state), state)
+        handles = _create(win32, command)
+        assert (handles.process, handles.thread, handles.pid) == (101, 102, 4242)
+        assert any(expected in e for e in handles.cleanup_errors)
+        assert win32.last_cleanup_errors == handles.cleanup_errors
+
+    def test_gate_closing_during_creation_cannot_lose_the_process(self, monkeypatch, tmp_path):
+        command = _probe_command(tmp_path)
+        state = {"env_len": len(C.environment_block(command.env)) + 1}
+        state["during_create"] = lambda: monkeypatch.setattr(C, "PROBE_ENABLED", False)
+        win32, _ = _fake_ctypes(monkeypatch, _create_fakes(state), state)
+        handles = _create(win32, command)                       # cleanup is pre-bound
+        assert handles.process == 101 and handles.cleanup_errors == []
+        assert state["deleted"] and state["inherit"][-2:] == [(11, 0), (12, 0)]
+        with pytest.raises(C.ExecutionDisabled):
+            win32.process_id(101)
+
+    def test_failed_creation_records_cleanup_errors(self, monkeypatch, tmp_path):
+        command = _probe_command(tmp_path)
+        state = {"env_len": len(C.environment_block(command.env)) + 1, "create_ok": 0,
+                 "reset_fails": True, "last_error": 2}
+        win32, _ = _fake_ctypes(monkeypatch, _create_fakes(state), state)
+        with pytest.raises(C.Win32Error, match="CreateProcessW"):
+            _create(win32, command)
+        assert any("could not reset" in e for e in win32.last_cleanup_errors)
+
+    def test_invalid_output_handle_stops_before_any_call(self, monkeypatch, tmp_path):
+        state = {}
+        win32, log = _fake_ctypes(monkeypatch, _create_fakes(state), state)
+        with pytest.raises(C.Win32Error, match="invalid output handle"):
+            win32.create_process(application=SPACED_PYTHON, command_line="x", env={"A": "1"},
+                                 cwd="C:\\", stdout=-1, stderr=12, sid=SID)
+        assert log == [] and state["loaded"] == []
+
+
+def _token_payloads(capabilities=(), integrity=2, sid=1, flag=1, app_sid_pointer=None,
+                    label_pointer=None):
+    """Builders of GetTokenInformation output; SIDs live inside the buffer."""
+    t = C._win32_types()
+    c, w = t.ctypes, t.w
+    SAA = t.SID_AND_ATTRIBUTES
+
+    def is_app_container(address):
+        return bytes(w.DWORD(flag))
+
+    def app_sid(address):
+        header = c.sizeof(t.TOKEN_APPCONTAINER_INFORMATION)
+        pointer = app_sid_pointer if app_sid_pointer is not None else (
+            address + header if sid else 0)
+        return bytes(t.TOKEN_APPCONTAINER_INFORMATION(pointer)) + (_fake_sid(sid) if sid else b"")
+
+    def caps(address):
+        if not capabilities:
+            return bytes(w.DWORD(0)) + b"\0" * 4
+        n = len(capabilities)
+        at = t.TOKEN_GROUPS.Groups.offset + n * c.sizeof(SAA)
+
+        class Groups(c.Structure):
+            _fields_ = [("GroupCount", w.DWORD), ("Groups", SAA * n)]
+
+        groups = Groups(n, (SAA * n)(*[SAA(address + at + 16 * i, 4) for i in range(n)]))
+        return bytes(groups) + b"".join(_fake_sid(k) for k in capabilities)
+
+    def label(address):
+        header = c.sizeof(t.TOKEN_MANDATORY_LABEL)
+        pointer = label_pointer if label_pointer is not None else address + header
+        return bytes(t.TOKEN_MANDATORY_LABEL(SAA(pointer, 0x20))) + _fake_sid(integrity)
+
+    return {C.TOKEN_IS_APP_CONTAINER: is_app_container, C.TOKEN_APP_CONTAINER_SID: app_sid,
+            C.TOKEN_CAPABILITIES: caps, C.TOKEN_INTEGRITY_LEVEL: label}
+
+
+def _token_fakes(payloads, state):
+    c = C._win32_types().ctypes
+    pointer = c.sizeof(c.c_void_p)
+
+    def open_token(process, access, out):
+        state["access"] = access
+        out._obj.value = 900
+        return state.get("open_ok", 1)
+
+    def query(token, information_class, address, length, returned):
+        build = payloads[information_class]
+        if address is None:
+            state.setdefault("sized", []).append(information_class)
+            returned._obj.value = len(build(0))
+            state["last_error"] = state.get("sizing_error", C.ERROR_INSUFFICIENT_BUFFER)
+            return 0
+        state.setdefault("alignment", []).append(address % pointer)
+        data = build(address)
+        if len(data) > length:
+            return 0
+        c.memmove(address, data, len(data))
+        returned._obj.value = state.get("returned", {}).get(information_class, len(data))
+        return 1
+
+    def close(handle):
+        state.setdefault("closed", []).append(getattr(handle, "value", handle))
+        return 1
+
+    return {"OpenProcessToken": open_token, "GetTokenInformation": query,
+            "CloseHandle": close, "GetCurrentProcess": lambda: -1}
+
+
+class TestCtypesToken:
+    @pytest.mark.parametrize("capabilities, expected", [
+        ((), []), ((3, 4), ["S-1-15-3-1", "S-1-15-3-3"])])
+    def test_token_info(self, monkeypatch, capabilities, expected):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _token_fakes(_token_payloads(capabilities), state),
+                                state)
+        assert win32.token_info(101) == {"is_app_container": True, "app_container_sid": SID,
+                                         "capabilities": expected, "integrity_level": "low"}
+        assert state["access"] == C.TOKEN_QUERY and state["closed"] == [900]
+        assert C.TOKEN_IS_APP_CONTAINER not in state["sized"]   # fixed size, one call
+        assert set(state["alignment"]) == {0}                   # pointer-aligned buffers
+        assert win32.current_token_info()["app_container_sid"] == SID
+
+    def test_not_an_app_container(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _token_fakes(
+            _token_payloads(flag=0, sid=0, integrity=5), state), state)
+        assert win32.token_info(101) == {"is_app_container": False, "app_container_sid": None,
+                                         "capabilities": [], "integrity_level": "medium"}
+
+    @pytest.mark.parametrize("payload_kwargs, state_kwargs, message", [
+        ({"flag": 7}, {}, "unexpected TokenIsAppContainer"),
+        ({"app_sid_pointer": 0x5001}, {}, "outside the returned buffer"),
+        ({"label_pointer": 0}, {}, "outside the returned buffer"),
+        ({}, {"returned": {C.TOKEN_IS_APP_CONTAINER: 2}}, "unexpected length"),
+        ({}, {"returned": {C.TOKEN_APP_CONTAINER_SID: 4}}, "short"),
+        ({}, {"sizing_error": 5}, "Windows error 5"),
+    ])
+    def test_unexpected_layouts_fail_closed(self, monkeypatch, payload_kwargs, state_kwargs,
+                                            message):
+        state = dict(state_kwargs)
+        win32, _ = _fake_ctypes(monkeypatch, _token_fakes(_token_payloads(**payload_kwargs),
+                                                          state), state)
+        with pytest.raises(C.Win32Error, match=message):
+            win32.token_info(101)
+        assert state["closed"] == [900]                      # the token is still closed
+
+    def test_malformed_capabilities(self, monkeypatch):
+        payloads = _token_payloads()
+        payloads[C.TOKEN_CAPABILITIES] = lambda address: bytes(
+            C._win32_types().w.DWORD(3)) + b"\0" * 4
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _token_fakes(payloads, state), state)
+        with pytest.raises(C.Win32Error, match="malformed capabilities"):
+            win32.token_info(101)
+
+    def test_open_token_failure(self, monkeypatch):
+        state = {"open_ok": 0, "last_error": 6}
+        win32, _ = _fake_ctypes(monkeypatch, _token_fakes(_token_payloads(), state), state)
+        with pytest.raises(C.Win32Error, match="OpenProcessToken"):
+            win32.token_info(0)
+
+
+def _heap_fakes(state, sids=(), *, result=0, array=True, null_index=None, fail_free=None):
+    t = C._win32_types()
+    c = t.ctypes
+    SAA = t.SID_AND_ATTRIBUTES
+    entries = [0 if i == null_index else p for i, p in enumerate(sids)]
+    keep = (SAA * max(len(entries), 1))(*[SAA(p, 0) for p in entries])
+    state["array_address"] = c.addressof(keep)
+    state["keep"] = keep
+
+    def config(count, out):
+        count._obj.value = len(entries) if array or entries else 0
+        if array:
+            out._obj.contents = keep[0]
+        if not array and entries:
+            count._obj.value = len(entries)
+        return result
+
+    def heap_free(heap, flags, pointer):
+        value = getattr(pointer, "value", pointer)
+        state.setdefault("heap_freed", []).append((heap, flags, value))
+        return 0 if value == fail_free else 1
+
+    return {"GetProcessHeap": lambda: state.get("heap", 0x77), "HeapFree": heap_free,
+            "NetworkIsolationGetAppContainerConfig": config}
+
+
+class TestLoopbackExemptionMemory:
+    def _freed(self, state):
+        return [value for _, _, value in state.get("heap_freed", [])]
+
+    def test_multiple_entries_free_every_sid_and_the_array(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, (0x6001, 0x6002)), state)
+        assert win32.loopback_exempt_sids() == ["S-1-15-2-1001", "S-1-15-2-1002"]
+        assert self._freed(state) == [0x6001, 0x6002, state["array_address"]]
+        assert all(heap == 0x77 and flags == 0 for heap, flags, _ in state["heap_freed"])
+
+    def test_zero_entries(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, (), array=False), state)
+        assert win32.loopback_exempt_sids() == [] and self._freed(state) == []
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, ()), state)
+        assert win32.loopback_exempt_sids() == []
+        assert self._freed(state) == [state["array_address"]]  # an empty array is freed
+
+    def test_null_sid_and_conversion_failure_still_free_everything(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, (0x6001, 0x6002),
+                                                         null_index=0), state)
+        with pytest.raises(C.Win32Error, match="SID 0 is null"):
+            win32.loopback_exempt_sids()
+        assert self._freed(state) == [0x6002, state["array_address"]]
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, (0x6001, 0x7777)), state)
+        with pytest.raises(C.Win32Error, match="SID 1"):
+            win32.loopback_exempt_sids()
+        assert self._freed(state) == [0x6001, 0x7777, state["array_address"]]
+
+    def test_api_failure_frees_partial_output(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, (0x6001,), result=5), state)
+        with pytest.raises(C.Win32Error, match="Windows error 5"):
+            win32.loopback_exempt_sids()
+        assert self._freed(state) == [0x6001, state["array_address"]]
+
+    def test_heap_free_failure_is_reported_and_freeing_continues(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, (0x6001, 0x6002),
+                                                         fail_free=0x6001), state)
+        with pytest.raises(C.Win32Error, match="HeapFree of SID 0 failed"):
+            win32.loopback_exempt_sids()
+        assert self._freed(state) == [0x6001, 0x6002, state["array_address"]]
+
+    def test_count_without_array(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, _heap_fakes(state, (0x6001,), array=False), state)
+        with pytest.raises(C.Win32Error, match="a count without an array"):
+            win32.loopback_exempt_sids()
+        assert self._freed(state) == []
+
+    def test_invalid_process_heap(self, monkeypatch):
+        state = {"heap": 0, "last_error": 8}
+        win32, log = _fake_ctypes(monkeypatch, _heap_fakes(state, (0x6001,)), state)
+        with pytest.raises(C.Win32Error, match="GetProcessHeap"):
+            win32.loopback_exempt_sids()
+        assert "NetworkIsolationGetAppContainerConfig" not in log
+
+
+class TestCtypesQueries:
+    def test_profile_queries_and_lazy_loading(self, monkeypatch):
+        def derive(name, out):
+            out._obj.value = 0x5001
+            return 0
+
+        def folder(sid, out):
+            out._obj.value = r"C:\Users\x\AppData\Local\Packages\agentops"
+            return 0
+
+        state = {}
+        win32, log = _fake_ctypes(monkeypatch, {
+            "DeriveAppContainerSidFromAppContainerName": derive,
+            "GetAppContainerFolderPath": folder}, state)
+        assert win32.loaded_dlls == []
+        assert win32.derive_sid(C.APPCONTAINER_PROFILE) == SID and state["sid_freed"]
+        assert win32.loaded_dlls == ["advapi32", "kernel32", "userenv"]
+        assert win32.profile_folder(SID).endswith("agentops") and state["cotask_freed"]
+        assert win32.loaded_dlls == ["advapi32", "kernel32", "ole32", "userenv"]
+        assert "firewallapi" not in state["loaded"]
+        assert "CreateAppContainerProfile" not in log
+
+    def test_hresult_failures(self, monkeypatch):
+        state = {}
+        win32, _ = _fake_ctypes(monkeypatch, {
+            "DeriveAppContainerSidFromAppContainerName": lambda n, o: -2147024809,
+            "GetAppContainerFolderPath": lambda s, o: -2147024894}, state)
+        with pytest.raises(C.Win32Error, match=str(0x80070057)):
+            win32.derive_sid("x")
+        with pytest.raises(C.Win32Error, match="GetAppContainerFolderPath"):
+            win32.profile_folder(SID)
+        assert "cotask_freed" not in state                      # nothing was returned
+
+    def test_process_queries_and_control(self, monkeypatch):
+        from datetime import datetime, timezone
+        c = C._win32_types().ctypes
+        epoch = int(datetime(2026, 10, 9, 10, 0, tzinfo=timezone.utc).timestamp())
+        ticks = (epoch + 11644473600) * 10_000_000
+
+        def times(handle, created, exited, kernel, user):
+            created._obj.dwLowDateTime, created._obj.dwHighDateTime = ticks & 0xFFFFFFFF, \
+                ticks >> 32
+            return 1
+
+        def image(handle, flags, address, size):
+            data = SPACED_PYTHON.encode("utf-16-le") + b"\0\0"
+            c.memmove(address, data, len(data))
+            return 1
+
+        def exit_code(handle, out):
+            out._obj.value = 7
+            return 1
+
+        waits = [C.WAIT_OBJECT_0, C.WAIT_TIMEOUT, 0xFFFFFFFF]
+        state = {}
+        win32, log = _fake_ctypes(monkeypatch, {
+            "GetProcessId": lambda h: 4242, "GetProcessTimes": times,
+            "QueryFullProcessImageNameW": image, "GetExitCodeProcess": exit_code,
+            "ResumeThread": lambda h: state.get("resume", 1),
+            "TerminateProcess": lambda h, code: state.setdefault("terminated", code),
+            "WaitForSingleObject": lambda h, ms: waits.pop(0)}, state)
+        assert win32.process_id(101) == 4242 and state["loaded"] == ["kernel32"]
+        assert win32.creation_time(101) == "2026-10-09T10:00:00.000Z"
+        assert win32.image_path(101) == SPACED_PYTHON
+        assert win32.exit_code(101) == 7 and win32.resume(102) == 1
+        win32.terminate(101, C.DISCARD_EXIT_CODE)
+        assert state["terminated"] == C.DISCARD_EXIT_CODE
+        assert win32.wait(101, 0) is True and win32.wait(101, 0) is False
+        with pytest.raises(C.Win32Error, match="WaitForSingleObject"):
+            win32.wait(101, 0)
+        state["resume"] = C.RESUME_FAILED
+        with pytest.raises(C.Win32Error, match="ResumeThread"):
+            win32.resume(102)
+        assert state["loaded"] == ["kernel32"]
+
+    def test_gate_checked_before_loading(self, monkeypatch):
+        state = {}
+        win32, log = _fake_ctypes(monkeypatch, {"GetProcessId": lambda h: 4242}, state)
+        monkeypatch.setattr(C, "APPROVED_PROBES", frozenset())
+        with pytest.raises(C.ExecutionDisabled):
+            win32.process_id(101)
+        assert log == [] and state["loaded"] == []
+
+    def test_default_loader_is_never_used_offline(self, monkeypatch):
+        open_probe_gate(monkeypatch)
+        win32 = C.CtypesWin32(C.authorize_probe("probe-01", HEAD))
+        assert win32.loaded_dlls == [] and win32._loader is C._default_loader
+
+
+# ---------------------------------------------------------------------------
+# Probe child (fakes; the driver is never imported)
+# ---------------------------------------------------------------------------
+
+def _wsa(code, cls=OSError):
+    """An OSError carrying a Windows Sockets error code."""
+    if sys.platform == "win32":
+        return OSError(0, "socket error", None, code)
+    error = cls(0, "socket error")
+    error.winerror = code
+    return error
+
+
+def _probe_own(directory, token=TOKEN):
+    return C.claim_series(directory, calibration_ids=["probe-01"], expected_head=HEAD,
+                          now=lambda: 1_800_000_000.0, new_token=lambda: token,
+                          owner_file=C.PROBE_OWNER_FILE)
+
+
+def _probe_deps(*, token=None, connect=None, resolve=None, import_module=None, imported=None,
+                identity=(4242, SPACED_PYTHON)):
+    imported = [] if imported is None else imported
+
+    def denied(port):
+        raise _wsa(C.WSAEACCES, PermissionError)
+
+    def no_dns(name):
+        raise socket.gaierror(11001, "getaddrinfo failed")
+
+    def fake_import(name):
+        imported.append(name)
+        return types.ModuleType(name)
+
+    return C.ProbeChildDeps(token_info=lambda: dict(token or GOOD_TOKEN),
+                            connect=connect or denied, resolve=resolve or no_dns,
+                            import_module=import_module or fake_import,
+                            identity=lambda: identity, wall=lambda: 1_800_000_000.0)
+
+
+EXPECTED = {"expected_pid": 4242, "expected_executable": SPACED_PYTHON, "expected_sid": SID,
+            "expected_port": 50123}
+
+
+def _fresh_child_process(monkeypatch):
+    """A probe child is a fresh process: hide the driver other tests loaded."""
+    monkeypatch.setattr(C, "AUTHORIZED_APPCONTAINER_SID", SID)
+    for name in C.PROBE_FORBIDDEN_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+
+class TestLoopbackClassification:
+    @pytest.mark.parametrize("make, outcome", [
+        (lambda: _wsa(10013, PermissionError), "access_denied"),
+        (lambda: _wsa(10061, ConnectionRefusedError), "refused"),
+        (lambda: ConnectionRefusedError("refused"), "refused"),
+        (lambda: _wsa(10060, TimeoutError), "timeout"),
+        (lambda: TimeoutError("timed out"), "timeout"),
+        (lambda: socket.timeout("timed out"), "timeout"),
+        (lambda: _wsa(10065), "unreachable"),
+        (lambda: _wsa(10051), "unreachable"),
+        (lambda: PermissionError(13, "denied without a Windows code"), "other"),
+        (lambda: OSError(5, "other"), "other"),
+    ])
+    def test_only_wsaeacces_is_denial(self, make, outcome):
+        evidence = C.classify_loopback_attempt(make())
+        assert evidence["outcome"] == outcome
+        assert evidence["denied"] is (outcome == "access_denied")
+        assert evidence["inconclusive"] is (outcome != "access_denied")
+
+    def test_connection_is_a_failure_not_inconclusive(self):
+        assert C.classify_loopback_attempt(None) == {
+            "outcome": "connected", "denied": False, "inconclusive": False, "error": None,
+            "errno": None, "winerror": None}
+
+
+class TestProbeChild:
+    @pytest.fixture(autouse=True)
+    def fresh(self, monkeypatch):
+        _fresh_child_process(monkeypatch)
+
+    def _run(self, tmp_path, **kwargs):
+        _probe_own(tmp_path)
+        status = C.probe_child_main("probe-01", tmp_path, _probe_deps(**kwargs),
+                                    series_token=TOKEN, port=50123)
+        return status, _read(tmp_path / "probe-01.json")
+
+    def test_pass(self, tmp_path):
+        imported = []
+        status, record = self._run(tmp_path, imported=imported)
+        assert status == C.EXIT_OK and record["status"] == "passed"
+        assert imported == list(C.PROBE_IMPORTS)
+        assert record["loopback"]["outcome"] == "access_denied"
+        assert record["loopback"]["winerror"] == C.WSAEACCES
+        assert record["dns"] == {"name": "localhost", "resolved": False, "error": "gaierror"}
+        assert "supplementary" in record["dns_note"]
+        assert record["scope"] == C.PROBE_SCOPE_NOTE and "NOT tested" in record["scope"]
+        assert (record["pid"], record["executable"], record["port"]) == (4242, SPACED_PYTHON,
+                                                                         50123)
+        assert C.probe_result_problems(record, "probe-01", status, **EXPECTED) == []
+
+    def test_dns_success_does_not_fail_the_probe(self, tmp_path):
+        status, record = self._run(tmp_path, resolve=lambda name: [("x",)])
+        assert status == C.EXIT_OK and record["dns"]["resolved"] is True
+
+    def test_reachable_loopback_fails(self, tmp_path):
+        status, record = self._run(tmp_path, connect=lambda port: None)
+        assert status == C.EXIT_PROBE_FAILED and record["loopback"]["outcome"] == "connected"
+        assert any("WSAEACCES" in p for p in C.probe_result_problems(
+            record, "probe-01", status, **EXPECTED))
+
+    @pytest.mark.parametrize("error, outcome", [
+        (lambda: _wsa(10061, ConnectionRefusedError), "refused"),
+        (lambda: TimeoutError("timed out"), "timeout"),
+        (lambda: _wsa(10065), "unreachable"),
+        (lambda: PermissionError(13, "no Windows code"), "other"),
+    ])
+    def test_inconclusive_errors_fail(self, tmp_path, error, outcome):
+        def connect(port):
+            raise error()
+
+        status, record = self._run(tmp_path, connect=connect)
+        assert status == C.EXIT_PROBE_FAILED and record["status"] == "failed"
+        assert record["loopback"]["outcome"] == outcome and record["loopback"]["inconclusive"]
+
+    def test_non_socket_error_fails(self, tmp_path):
+        def connect(port):
+            raise RuntimeError("unexpected")
+
+        status, record = self._run(tmp_path, connect=connect)
+        assert status == C.EXIT_PROBE_FAILED and "RuntimeError" in record["failure"]
+
+    @pytest.mark.parametrize("token", [
+        {**GOOD_TOKEN, "capabilities": ["S-1-15-3-1"]},
+        {**GOOD_TOKEN, "is_app_container": False},
+        {**GOOD_TOKEN, "app_container_sid": "S-1-15-2-7"},
+    ])
+    def test_wrong_token_fails(self, tmp_path, token):
+        status, record = self._run(tmp_path, token=token)
+        assert status == C.EXIT_PROBE_FAILED and record["token_problems"]
+
+    def test_failed_import_fails(self, tmp_path):
+        def missing(name):
+            if name == "langgraph.graph":
+                raise ImportError("No module named 'langgraph'")
+            return types.ModuleType(name)
+
+        status, record = self._run(tmp_path, import_module=missing)
+        assert status == C.EXIT_PROBE_FAILED
+        assert record["imports"]["langgraph.graph"].startswith("ImportError")
+
+    @pytest.mark.parametrize("leak", ["socket", "native"])
+    def test_network_activity_during_imports(self, tmp_path, leak):
+        def leaking(name):
+            if leak == "socket":
+                try:
+                    socket.getaddrinfo("collector.example", 4317)
+                except OSError:
+                    pass
+            else:
+                import grpc
+                try:
+                    grpc.insecure_channel("localhost:4317")
+                except OSError:
+                    pass
+            return types.ModuleType(name)
+
+        status, record = self._run(tmp_path, import_module=leaking)
+        assert status == C.EXIT_NETWORK and record["status"] == "network_violation"
+        assert record["network_guard_violations"]
+
+    def test_the_driver_cannot_be_imported(self, tmp_path, monkeypatch):
+        sys.path.insert(0, str(_REPO / "workload-generator"))
+        monkeypatch.delitem(sys.modules, "workload_generator.real_driver", raising=False)
+
+        def driver(name):
+            return importlib.import_module("workload_generator.real_driver")
+
+        status, record = self._run(tmp_path, import_module=driver)
+        assert status == C.EXIT_PROBE_FAILED
+        assert record["forbidden_import_attempts"] and record["driver_loaded"] is False
+        assert "workload_generator.real_driver" not in sys.modules
+        assert all(v.startswith("ImportError") for v in record["imports"].values())
+
+    def test_the_probe_code_never_names_the_driver(self):
+        for function in (C.probe_child_main, C.run_probe, C.production_probe_child_deps,
+                         C.production_probe_deps, C._loopback_connect, C._resolve):
+            source = inspect.getsource(function)
+            for word in ("execute(", "_import_driver", "load_demo", "real_driver."):
+                assert word not in source, (function.__name__, word)
+        assert C.PROBE_FORBIDDEN_MODULES == ("workload_generator.real_driver",)
+        assert not any("real_driver" in name for name in C.PROBE_IMPORTS)
+
+    @pytest.mark.parametrize("change, message", [
+        ({"pid": 999}, "PID differs"),
+        ({"executable": r"C:\other\python.exe"}, "another executable"),
+        ({"port": 50124}, "another port"),
+        ({"token": {**GOOD_TOKEN, "app_container_sid": "S-1-15-2-7"}}, "validated AppContainer"),
+        ({"loopback": {"outcome": "access_denied", "winerror": None}}, "WSAEACCES"),
+    ])
+    def test_cross_check_against_the_launched_process(self, tmp_path, change, message):
+        status, record = self._run(tmp_path)
+        record.update(change)
+        problems = C.probe_result_problems(record, "probe-01", status, **EXPECTED)
+        assert any(message in p for p in problems), problems
+
+    def test_ownership_and_no_repeat(self, tmp_path):
+        with pytest.raises(C.CalibrationError, match="no ACTIVE_PROBE"):
+            C.probe_child_main("probe-01", tmp_path, _probe_deps(), series_token=TOKEN,
+                               port=50123)
+        _probe_own(tmp_path)
+        with pytest.raises(C.CalibrationError, match="token does not match"):
+            C.probe_child_main("probe-01", tmp_path, _probe_deps(), series_token="f" * 32,
+                               port=50123)
+        assert not (tmp_path / "probe-01.json").exists()
+        C.probe_child_main("probe-01", tmp_path, _probe_deps(), series_token=TOKEN, port=50123)
+        with pytest.raises(C.CalibrationError, match="never repeated"):
+            C.probe_child_main("probe-01", tmp_path, _probe_deps(), series_token=TOKEN,
+                               port=50123)
+
+    @pytest.mark.parametrize("port", [None, 80, 70000, True])
+    def test_bad_port(self, tmp_path, port):
+        with pytest.raises(C.CalibrationError, match="1024-65535"):
+            C.probe_child_main("probe-01", tmp_path, _probe_deps(), series_token=TOKEN,
+                               port=port)
+
+
+# ---------------------------------------------------------------------------
+# Probe command and orchestrator
+# ---------------------------------------------------------------------------
+
+class TestProbeCommand:
+    def test_explicit_argv_without_the_driver(self, tmp_path):
+        out = tmp_path / "probe out"
+        command = C.build_probe_command("probe-01", out, series_token=TOKEN, expected_head=HEAD,
+                                        interpreter=SPACED_PYTHON, port=50123,
+                                        python_paths=(r"C:\my venv\Lib\site-packages",))
+        assert command.argv == (
+            SPACED_PYTHON, "-B", "-s", str((_BENCH / "calibrate_generator.py").resolve()),
+            "--probe-child", "probe-01", "--output-dir", str(out), "--token", TOKEN,
+            "--expect-head", HEAD, "--port", "50123")
+        assert "--child" not in command.argv and "--authorize" not in command.argv
+        assert command.stdout_path == out / "probe-01.stdout"
+        assert command.env["PYTHONPATH"].endswith(r"C:\my venv\Lib\site-packages")
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows command-line parsing")
+    def test_spaces_survive_windows_quoting(self, tmp_path):
+        command = C.build_probe_command("probe-01", tmp_path / "a b", series_token=TOKEN,
+                                        expected_head=HEAD, interpreter=SPACED_PYTHON,
+                                        port=50123)
+        assert _windows_argv(command.command_line) == list(command.argv)
+
+    @pytest.mark.parametrize("probe_id, port, message", [
+        ("probe-6", 50123, "probe-01"), ("cal-a-01", 50123, "probe-01"),
+        ("probe-01", 22, "1024-65535"), ("probe-01", "50123", "1024-65535")])
+    def test_bad_arguments(self, tmp_path, probe_id, port, message):
+        with pytest.raises(C.CalibrationError, match=message):
+            C.build_probe_command(probe_id, tmp_path, series_token=TOKEN, expected_head=HEAD,
+                                  interpreter=SPACED_PYTHON, port=port)
+
+
+class FakeListener:
+    """Scripted counts: before the child (control), from the child, after
+    (control).  control() can fail."""
+
+    def __init__(self, counts=(1, 0, 1), port=50123, control_error=None):
+        self.port, self.counts, self.control_error = port, list(counts), control_error
+        self.controls, self.closed = 0, False
+
+    def control(self):
+        self.controls += 1
+        if self.control_error:
+            raise self.control_error
+
+    def connections(self):
+        return self.counts.pop(0) if self.counts else 0
+
+    def close(self):
+        self.closed = True
+
+
+def probe_child(*, polls=1, returncode=None, **deps_kwargs):
+    """A fake process whose exit runs the real probe_child_main with fakes."""
+    def make(command):
+        out = Path(_arg(command, "--output-dir"))
+        token, port = _arg(command, "--token"), int(_arg(command, "--port"))
+
+        def finish():
+            return C.probe_child_main("probe-01", out, _probe_deps(**deps_kwargs),
+                                      series_token=token, port=port)
+        return FakeProcess(polls=polls, returncode=returncode, on_exit=finish)
+    return make
+
+
+def _prober(clock, maker, *, observe=good_observe, listener=None):
+    launched = []
+    listener = listener or FakeListener()
+
+    def launch(command, stdout, stderr):
+        launched.append(command)
+        return maker(command)
+
+    deps = C.ProbeDeps(launch=launch, observe=observe, listener=lambda: listener,
+                       clock=clock.clock, pause=clock.pause, now=lambda: 1_800_000_000.0,
+                       interpreter=SPACED_PYTHON, expected_head=HEAD,
+                       python_paths=(r"C:\my venv\Lib\site-packages",))
+    return deps, launched, listener
+
+
+def _probe_record(directory):
+    records = list(Path(directory).glob("probe-record-probe-01-*.json"))
+    assert len(records) == 1
+    return _read(records[0])
+
+
+class TestRunProbe:
+    @pytest.fixture(autouse=True)
+    def fresh(self, monkeypatch):
+        _fresh_child_process(monkeypatch)
+
+    def test_pass_releases_ownership(self, tmp_path):
+        deps, launched, listener = _prober(FakeClock(), probe_child())
+        outcome = C.run_probe("probe-01", tmp_path, deps)
+        assert outcome.passed and outcome.ownership_released, outcome.stopped_reason
+        assert not (tmp_path / C.PROBE_OWNER_FILE).exists() and listener.closed
+        assert listener.controls == 2 and len(launched) == 1
+        assert _arg(launched[0], "--port") == "50123"
+        for stage in ("launch", "process", "complete"):
+            assert _journal(tmp_path, stage, "probe-01").exists()
+        record = _probe_record(tmp_path)
+        assert record["passed"] and record["scope"] == C.PROBE_SCOPE_NOTE
+        assert "not a proof of complete isolation" in record["note"]
+        run = record["run"]
+        assert (run["listener_control_before"], run["listener_child_connections"],
+                run["listener_control_after"]) == (1, 0, 1)
+        assert run["execution_history"] == C.MAY_HAVE_EXECUTED
+        assert run["liveness"] == C.CONFIRMED_EXITED and run["process_created"]
+
+    def _failed(self, tmp_path, maker, launches=1, **kwargs):
+        deps, launched, listener = _prober(FakeClock(), maker, **kwargs)
+        outcome = C.run_probe("probe-01", tmp_path, deps)
+        assert not outcome.passed and not outcome.ownership_released
+        assert (tmp_path / C.PROBE_OWNER_FILE).exists() and listener.closed
+        assert _probe_record(tmp_path)["ownership"] == "retained for review"
+        assert len(launched) == launches
+        return outcome
+
+    @pytest.mark.parametrize("listener, message", [
+        (FakeListener(counts=(0,)), "counted 0 control connections"),
+        (FakeListener(counts=(2,)), "counted 2 control connections"),
+        (FakeListener(control_error=ConnectionRefusedError()), "control connection failed"),
+    ])
+    def test_unverified_listener_blocks_the_launch(self, tmp_path, listener, message):
+        outcome = self._failed(tmp_path, probe_child(), launches=0, listener=listener)
+        assert "not verified before launch" in outcome.stopped_reason
+        assert message in outcome.stopped_reason
+        assert not _journal(tmp_path, "launch", "probe-01").exists()
+
+    def test_reached_listener_fails(self, tmp_path):
+        outcome = self._failed(tmp_path, probe_child(), listener=FakeListener(counts=(1, 1, 1)))
+        assert "loopback is NOT denied" in outcome.stopped_reason
+
+    def test_listener_lost_after_the_child(self, tmp_path):
+        outcome = self._failed(tmp_path, probe_child(), listener=FakeListener(counts=(1, 0, 0)))
+        assert "not verified after the child" in outcome.stopped_reason
+
+    def test_inconclusive_child_error_fails(self, tmp_path):
+        def refused(port):
+            raise _wsa(10061, ConnectionRefusedError)
+
+        outcome = self._failed(tmp_path, probe_child(connect=refused))
+        assert "probe failed" in outcome.stopped_reason
+        assert any("not denied with WSAEACCES (outcome 'refused')" in p
+                   for p in outcome.entry["result_problems"])
+
+    @pytest.mark.parametrize("identity, message", [
+        ((999, SPACED_PYTHON), "PID differs"),
+        ((4242, r"C:\other\python.exe"), "another executable"),
+    ])
+    def test_child_identity_mismatch_fails(self, tmp_path, identity, message):
+        outcome = self._failed(tmp_path, probe_child(identity=identity))
+        assert message in outcome.stopped_reason
+
+    def test_exit_code_mismatch(self, tmp_path):
+        outcome = self._failed(tmp_path, probe_child(returncode=1))
+        assert "probe failed" in outcome.stopped_reason
+
+    def test_launch_failure_keeps_the_process_evidence(self, tmp_path):
+        def failing(command):
+            raise C.LaunchFailure("AppContainer token rejected; could not be discarded",
+                                  pid=4242, execution_history=C.NEVER_EXECUTED,
+                                  liveness=C.STATE_UNKNOWN, handles_retained=True,
+                                  cleanup_errors=["TerminateProcess failed"])
+
+        outcome = self._failed(tmp_path, failing)
+        assert "launch failed" in outcome.stopped_reason
+        run = _probe_record(tmp_path)["run"]
+        assert run["process_created"] and run["pid"] == 4242
+        assert run["execution_history"] == C.NEVER_EXECUTED
+        assert run["liveness"] == C.STATE_UNKNOWN and run["handles_retained"]
+        assert run["cleanup_errors"] == ["TerminateProcess failed"]
+        assert not _journal(tmp_path, "process", "probe-01").exists()
+
+    def test_timeout_keeps_the_child(self, tmp_path):
+        hung = FakeProcess(polls=None, pid=5150)
+        outcome = self._failed(tmp_path, lambda c: hung)
+        assert "PID 5150" in outcome.stopped_reason and not hung.killed
+        run = _probe_record(tmp_path)["run"]
+        assert run["liveness"] == C.ALIVE_AT_LAST_CHECK and run["handles_retained"]
+
+    def test_observed_endpoint_fails(self, tmp_path):
+        outcome = self._failed(tmp_path, lambda c: FakeProcess(polls=None), observe=lambda i: (
+            C.Observation(["network endpoints or native network libraries observed"],
+                          ["tcp 127.0.0.1:50000 127.0.0.1:50123 Established"], [PROC], True)))
+        assert "network endpoints" in outcome.stopped_reason
+
+    def test_listener_failure(self, tmp_path):
+        def no_listener():
+            raise OSError("bind failed")
+
+        deps, launched, _ = _prober(FakeClock(), probe_child())
+        deps.listener = no_listener
+        outcome = C.run_probe("probe-01", tmp_path, deps)
+        assert not outcome.passed and "OSError" in outcome.stopped_reason and launched == []
+        assert (tmp_path / C.PROBE_OWNER_FILE).exists()
+
+    def test_interruption(self, tmp_path):
+        def interrupted(command):
+            raise KeyboardInterrupt
+
+        deps, _, listener = _prober(FakeClock(), interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            C.run_probe("probe-01", tmp_path, deps)
+        record = _probe_record(tmp_path)
+        assert record["stopped_reason"] == "probe interrupted: KeyboardInterrupt"
+        assert (tmp_path / C.PROBE_OWNER_FILE).exists() and listener.closed
+
+    def test_existing_evidence_refused(self, tmp_path):
+        (tmp_path / "probe-01.json").write_text("{}")
+        deps, launched, _ = _prober(FakeClock(), probe_child())
+        with pytest.raises(C.CalibrationError, match="never repeated"):
+            C.run_probe("probe-01", tmp_path, deps)
+        (tmp_path / "probe-01.json").unlink()
+        (tmp_path / C.PROBE_OWNER_FILE).write_text("{}")
+        with pytest.raises(C.CalibrationError, match="owns this directory"):
+            C.run_probe("probe-01", tmp_path, deps)
+        assert launched == []
+
+    def test_explicit_dependencies(self, tmp_path):
+        with pytest.raises(TypeError):
+            C.run_probe("probe-01", tmp_path)
+        with pytest.raises(TypeError):
+            C.run_probe("probe-01", tmp_path, object())
+        with pytest.raises(TypeError):
+            C.probe_child_main("probe-01", tmp_path, object(), series_token=TOKEN, port=50123)
+
+
+# ---------------------------------------------------------------------------
+# Process-state evidence in the calibration journals
+# ---------------------------------------------------------------------------
+
+class TestCalibrationStateEvidence:
+    def test_completed_run(self, tmp_path):
+        deps, _ = _orchestrator(FakeClock(), [real_child()])
+        C.run_series(1, tmp_path, deps)
+        complete = _read(_journal(tmp_path, "complete", 1))
+        assert complete["process_created"] and complete["liveness"] == C.CONFIRMED_EXITED
+        assert complete["execution_history"] == C.MAY_HAVE_EXECUTED
+        assert not complete["handles_retained"] and complete["cleanup_errors"] == []
+
+    def test_launch_failure_evidence_reaches_the_series_record(self, tmp_path):
+        def failing(command):
+            raise C.LaunchFailure("resume failed", pid=4242,
+                                  execution_history=C.MAY_HAVE_EXECUTED,
+                                  liveness=C.CONFIRMED_EXITED)
+
+        deps, _ = _orchestrator(FakeClock(), [failing])
+        C.run_series(1, tmp_path, deps)
+        for run in (_read(_journal(tmp_path, "complete", 1)), _series_record(tmp_path)["runs"][0]):
+            assert run["execution_history"] == C.MAY_HAVE_EXECUTED and run["pid"] == 4242
+            assert run["liveness"] == C.CONFIRMED_EXITED and run["process_created"]
+
+    def test_failure_before_any_process(self, tmp_path):
+        def failing(command):
+            raise C.CalibrationError("no profile-preflight record is authorized")
+
+        deps, _ = _orchestrator(FakeClock(), [failing])
+        C.run_series(1, tmp_path, deps)
+        complete = _read(_journal(tmp_path, "complete", 1))
+        assert complete["process_created"] is False and complete["execution_history"] is None
+
+    def test_timeout_is_alive_at_last_check(self, tmp_path):
+        hung = FakeProcess(polls=None)
+        deps, _ = _orchestrator(FakeClock(), [lambda c: hung])
+        C.run_series(1, tmp_path, deps)
+        complete = _read(_journal(tmp_path, "complete", 1))
+        assert complete["liveness"] == C.ALIVE_AT_LAST_CHECK and complete["handles_retained"]

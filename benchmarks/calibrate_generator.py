@@ -44,10 +44,34 @@ Network safety, stated precisely:
       capabilities (no internetClient, internetClientServer or
       privateNetworkClientServer) and no loopback exemption: Windows then
       refuses the child's outbound and loopback connections in the kernel,
-      for native code too.  The launcher here is an abstraction; its Win32
-      backend is deliberately not implemented and refuses every call.
-      AppContainer compatibility of CPython, the venv and the demo is NOT
-      assumed: it must be shown by an isolation probe first.
+      for native code too.  The Win32 backend (ctypes, documented APIs)
+      starts the base interpreter directly - never the venv launcher, whose
+      own child would be a second process - suspended, inside the profile
+      whose SID is AUTHORIZED_APPCONTAINER_SID (None here) and whose
+      independently verified preflight record matches
+      AUTHORIZED_PROFILE_PREFLIGHT_SHA256 (None here; GetAppContainerFolderPath
+      is supplementary and is not proof that a profile exists).  It checks
+      the real token, process identity and loopback exemption, and only then
+      resumes it; otherwise the suspended child is terminated and its exit
+      verified, or its PID and handles are kept for inspection.  Execution
+      history (never / may have executed / unknown) and liveness (confirmed
+      exited / alive at last check / unknown) are recorded separately in
+      every journal.  AppContainer compatibility of CPython, the venv
+      packages and the demo is NOT assumed: the isolation probe must show
+      it first.
+    - The isolation probe (--probe, separately gated by PROBE_ENABLED and
+      APPROVED_PROBES, both closed here) runs a child in the AppContainer
+      that never imports the workload driver.  It reports interpreter
+      startup, its own token, a loopback connection attempt to a dedicated
+      listener of the orchestrator, the dependency imports under the guard,
+      and a lookup of "localhost" that is supplementary evidence only.  The
+      orchestrator first proves the listener reachable from outside (one
+      control connection), and again after the child; the child's attempt
+      counts as denied only on WSAEACCES (10013) - refusal, timeout,
+      unreachable or other errors are inconclusive failures - and the
+      listener must have received nothing from it.  Only loopback denial is
+      tested, not external network denial.  No external name or service,
+      Kafka, PostgreSQL or OTLP is contacted.
     - Inside the child, as defence in depth only: a Python-level guard
       blocks socket creation, connect/connect_ex/sendto/sendmsg, and name
       resolution (getaddrinfo, getnameinfo, gethostbyname[_ex],
@@ -71,10 +95,11 @@ is performed by this file):
        the venv, the repository and a dedicated output directory; grant the
        profile SID read+execute on the first three and modify on the
        output directory only.
-    3. Run an isolation probe in the AppContainer (no driver): the
-       orchestrator listens on an ephemeral 127.0.0.1 port that the probe
-       must fail to reach; getaddrinfo must fail; CPython and a demo import
-       must work.  No external address is contacted.
+    3. Set AUTHORIZED_APPCONTAINER_SID, PROBE_ENABLED and APPROVED_PROBES
+       (a reviewed code change), then run one isolation probe (--probe):
+       the orchestrator listens on an ephemeral 127.0.0.1 port that the
+       probe must fail to reach; the token must validate; CPython and the
+       dependency imports must work.  No external address is contacted.
     4. Restore the ACLs from the snapshot (icacls /restore) and verify them;
        delete the profile (DeleteAppContainerProfile) unless step 5 is
        authorized in the same window.
@@ -96,7 +121,9 @@ Standard library only at import time.
 from __future__ import annotations
 
 import argparse
+import errno as errno_module
 import hashlib
+import importlib
 import importlib.abc
 import importlib.machinery
 import json
@@ -105,11 +132,12 @@ import platform
 import re
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import types
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -129,6 +157,16 @@ import run_benchmark as RB  # noqa: E402
 EXECUTION_ENABLED: bool = False
 #: Calibration ids that may run.  Empty: none may.
 APPROVED_CALIBRATIONS: frozenset[str] = frozenset()
+#: The isolation probe is gated separately from calibration.
+PROBE_ENABLED: bool = False
+#: Probe ids that may run.  Empty: none may.
+APPROVED_PROBES: frozenset[str] = frozenset()
+#: SID of the existing, explicitly authorized AppContainer profile.  None:
+#: no profile is authorized, so nothing can be launched.
+AUTHORIZED_APPCONTAINER_SID: Optional[str] = None
+#: SHA-256 of the independently verified profile-preflight record.  None:
+#: no record is authorized, so nothing can be launched.
+AUTHORIZED_PROFILE_PREFLIGHT_SHA256: Optional[str] = None
 
 CONDITION: str = "a"
 SEED: int = 42
@@ -155,12 +193,33 @@ CREATION_TOLERANCE_SECONDS: float = 1.0
 SERIES_BUDGET_SECONDS: float = 30 * 60
 
 DEFAULT_OUTPUT: Path = Path(tempfile.gettempdir()) / "agentops-calibration"
+DEFAULT_PROBE_OUTPUT: Path = Path(tempfile.gettempdir()) / "agentops-isolation-probe"
+DEFAULT_PROFILE_PREFLIGHT: Path = (Path(tempfile.gettempdir())
+                                   / "agentops-appcontainer-preflight.json")
 BENCHMARK_OUTPUT: Path = RB.DEFAULT_OUTPUT
 OWNER_FILE: str = "ACTIVE_CALIBRATION"
+PROBE_OWNER_FILE: str = "ACTIVE_PROBE"
 JOURNAL_DIR: str = "journal"
 
 #: Exit statuses of the child.
-EXIT_OK, EXIT_NETWORK, EXIT_FAILED = 0, 3, 4
+EXIT_OK, EXIT_NETWORK, EXIT_FAILED, EXIT_PROBE_FAILED = 0, 3, 4, 5
+
+PROBE_ID_RE = re.compile(r"probe-0[1-5]")
+#: What the probe child imports (never the workload driver).
+PROBE_IMPORTS: tuple[str, ...] = (
+    "pydantic", "langgraph.graph", "opentelemetry.sdk.trace",
+    "opentelemetry.sdk.trace.export.in_memory_span_exporter",
+    "workload_generator.plan", "workload_generator.scenarios", "graph",
+)
+#: Modules the probe child must never import.
+PROBE_FORBIDDEN_MODULES: tuple[str, ...] = ("workload_generator.real_driver",)
+#: The loopback attempt gives up after this long (no connection is the goal).
+PROBE_CONNECT_TIMEOUT_SECONDS: float = 2.0
+#: Resolved only as supplementary evidence; never an external name.
+PROBE_DNS_NAME: str = "localhost"
+#: Exit code given to a suspended child that is discarded before resuming.
+DISCARD_EXIT_CODE: int = 0x0BAD
+DISCARD_WAIT_MILLISECONDS: int = 5000
 
 #: A delayed request: start lag above this belongs to a stall group.
 GROUP_MIN_LAG_SECONDS: float = 0.02
@@ -233,13 +292,53 @@ def _require_authorization(auth: Any, calibration: Optional[str] = None) -> Auth
     return auth
 
 
-def _git_head() -> str:
-    _require_enabled()
-    done = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(REPO), capture_output=True,
-                          text=True, timeout=30)
-    if done.returncode != 0:
-        raise ExecutionDisabled("the Git HEAD cannot be read; nothing was started")
-    return done.stdout.strip()
+def _read_git_head(repo: Path) -> str:
+    """The full HEAD commit, read from the Git files (no git process, so a
+    child inside an AppContainer can check it too)."""
+    def fail(why: str) -> ExecutionDisabled:
+        return ExecutionDisabled(f"the Git HEAD cannot be resolved ({why}); nothing was started")
+
+    try:
+        git = repo / ".git"
+        if git.is_file():
+            text = git.read_text(encoding="utf-8").strip()
+            if not text.startswith("gitdir:"):
+                raise fail(".git file without gitdir")
+            gitdir = Path(text[len("gitdir:"):].strip())
+            gitdir = gitdir if gitdir.is_absolute() else (repo / gitdir)
+        else:
+            gitdir = git
+        common = gitdir
+        if (gitdir / "commondir").is_file():
+            relative = Path((gitdir / "commondir").read_text(encoding="utf-8").strip())
+            common = relative if relative.is_absolute() else (gitdir / relative)
+        head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+        if _HEAD_RE.fullmatch(head):
+            return head
+        if not head.startswith("ref: "):
+            raise fail("unexpected HEAD")
+        ref = head[len("ref: "):].strip()
+        for base in (gitdir, common):
+            loose = base.joinpath(*ref.split("/"))
+            if loose.is_file():
+                value = loose.read_text(encoding="utf-8").strip()
+                if _HEAD_RE.fullmatch(value):
+                    return value
+                raise fail("malformed ref")
+        packed = common / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(encoding="utf-8").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref and _HEAD_RE.fullmatch(parts[0]):
+                    return parts[0]
+    except OSError as exc:
+        raise fail(type(exc).__name__) from None
+    raise fail("ref not found")
+
+
+def _git_head(require: Optional[Callable[[], None]] = None) -> str:
+    (require or _require_enabled)()
+    return _read_git_head(REPO)
 
 
 def authorize(calibration_ids: Sequence[str], expected_head: Optional[str]) -> Authorization:
@@ -258,6 +357,56 @@ def authorize(calibration_ids: Sequence[str], expected_head: Optional[str]) -> A
         raise ExecutionDisabled(f"Git HEAD is {actual[:12]}, not the expected "
                                 f"{expected_head[:12]}; nothing was started")
     return Authorization(ids, expected_head, _SEAL)
+
+
+@dataclass(frozen=True)
+class ProbeAuthorization:
+    """Proof that authorize_probe() passed.  It never authorizes calibration."""
+    probe_id: str
+    expected_head: str
+    seal: object = field(default=None, repr=False, compare=False)
+
+
+def _require_probe_enabled() -> None:
+    if not PROBE_ENABLED:
+        raise ExecutionDisabled("the isolation probe is not enabled; nothing was started")
+    if not APPROVED_PROBES:
+        raise ExecutionDisabled("no isolation probe is approved (APPROVED_PROBES is empty); "
+                                "nothing was started")
+
+
+def _require_probe_authorization(auth: Any, run: Optional[str] = None) -> ProbeAuthorization:
+    _require_probe_enabled()
+    if not isinstance(auth, ProbeAuthorization) or auth.seal is not _SEAL:
+        raise ExecutionDisabled("no valid probe authorization; nothing was started")
+    if auth.probe_id not in APPROVED_PROBES:
+        raise ExecutionDisabled(f"not approved: {auth.probe_id}; nothing was started")
+    if run is not None and run != auth.probe_id:
+        raise ExecutionDisabled(f"{run} is not covered by this authorization")
+    return auth
+
+
+def _require_any_authorization(auth: Any, run: Optional[str] = None) -> Any:
+    """The gate of functions shared by calibration and the isolation probe."""
+    if isinstance(auth, ProbeAuthorization):
+        return _require_probe_authorization(auth, run)
+    return _require_authorization(auth, run)
+
+
+def authorize_probe(probe_id: Any, expected_head: Optional[str]) -> ProbeAuthorization:
+    """A ProbeAuthorization for exactly this approved probe at this HEAD."""
+    _require_probe_enabled()
+    if not isinstance(probe_id, str) or not PROBE_ID_RE.fullmatch(probe_id):
+        raise ExecutionDisabled("a probe id is probe-01 .. probe-05")
+    if probe_id not in APPROVED_PROBES:
+        raise ExecutionDisabled(f"{probe_id} is not an approved probe; nothing was started")
+    if not isinstance(expected_head, str) or not _HEAD_RE.fullmatch(expected_head):
+        raise ExecutionDisabled("--expect-head must be the full 40-character Git HEAD")
+    actual = _git_head(_require_probe_enabled)
+    if actual != expected_head:
+        raise ExecutionDisabled(f"Git HEAD is {actual[:12]}, not the expected "
+                                f"{expected_head[:12]}; nothing was started")
+    return ProbeAuthorization(probe_id, expected_head, _SEAL)
 
 
 # ---------------------------------------------------------------------------
@@ -339,14 +488,15 @@ def _exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def claim_series(output_dir: Path, *, calibration_ids: Sequence[str], expected_head: str,
                  now: Callable[[], float], pid: Callable[[], int] = os.getpid,
-                 new_token: Callable[[], str] = lambda: uuid.uuid4().hex) -> tuple[Path, str]:
-    """Take the one ACTIVE_CALIBRATION ownership; refuse if it exists.
-    Returns (record path, series token)."""
+                 new_token: Callable[[], str] = lambda: uuid.uuid4().hex,
+                 owner_file: str = OWNER_FILE) -> tuple[Path, str]:
+    """Take the one ownership record (ACTIVE_CALIBRATION, or ACTIVE_PROBE for
+    the probe); refuse if it exists.  Returns (record path, series token)."""
     output_dir = check_output_dir(output_dir)
     token = new_token()
     if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
         raise CalibrationError("a series token is 32 lowercase hex characters")
-    owner = output_dir / OWNER_FILE
+    owner = output_dir / owner_file
     try:
         _exclusive_json(owner, {"condition": CONDITION, "calibration_ids": list(calibration_ids),
                                 "series_token": token, "expected_head": expected_head,
@@ -361,30 +511,35 @@ def claim_series(output_dir: Path, *, calibration_ids: Sequence[str], expected_h
 
 def check_ownership(output_dir: Path, number: int, series_token: Any) -> None:
     """A child runs only inside the series that owns its directory."""
-    owner = Path(output_dir) / OWNER_FILE
+    _check_owner(output_dir, calibration_id(number), series_token, OWNER_FILE)
+
+
+def _check_owner(output_dir: Path, run_id: str, series_token: Any, owner_file: str) -> None:
+    owner = Path(output_dir) / owner_file
     try:
         record = json.loads(owner.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        raise CalibrationError("no ACTIVE_CALIBRATION: a child runs only inside an owned "
+        raise CalibrationError(f"no {owner_file}: a child runs only inside an owned "
                                "series") from None
     except (OSError, ValueError):
-        raise CalibrationError("ACTIVE_CALIBRATION is unreadable or malformed; review it") \
+        raise CalibrationError(f"{owner_file} is unreadable or malformed; review it") \
             from None
     if not isinstance(record, dict) or not isinstance(record.get("series_token"), str) \
             or not isinstance(record.get("calibration_ids"), list):
-        raise CalibrationError("ACTIVE_CALIBRATION is malformed; review it")
+        raise CalibrationError(f"{owner_file} is malformed; review it")
     if not isinstance(series_token, str) or record["series_token"] != series_token:
-        raise CalibrationError("the series token does not match ACTIVE_CALIBRATION")
-    if calibration_id(number) not in record["calibration_ids"]:
-        raise CalibrationError(f"{calibration_id(number)} is not part of the owning series")
+        raise CalibrationError(f"the series token does not match {owner_file}")
+    if run_id not in record["calibration_ids"]:
+        raise CalibrationError(f"{run_id} is not part of the owning series")
 
 
 def result_path(output_dir: Path, number: int) -> Path:
     return Path(output_dir) / f"{calibration_id(number)}.json"
 
 
-def _journal_path(output_dir: Path, stage: str, number: int) -> Path:
-    return Path(output_dir) / JOURNAL_DIR / f"{stage}-{number:02d}.json"
+def _journal_path(output_dir: Path, stage: str, run: Any) -> Path:
+    name = f"{run:02d}" if isinstance(run, int) else str(run)
+    return Path(output_dir) / JOURNAL_DIR / f"{stage}-{name}.json"
 
 
 def _iso(epoch: float) -> str:
@@ -794,14 +949,35 @@ class ChildCommand:
         return sorted(self.env)
 
 
-def child_environment(temp_dir: Path) -> dict[str, str]:
-    """The child's whole environment: an explicit allowlist, nothing more."""
+def child_environment(temp_dir: Path, python_paths: Sequence[str] = ()) -> dict[str, str]:
+    """The child's whole environment: an explicit allowlist, nothing more.
+    python_paths carries the venv's site-packages, because the child runs
+    the base interpreter directly, not the venv launcher."""
     env = {name: os.environ[name] for name in ("SYSTEMROOT", "SYSTEMDRIVE", "PATH")
            if name in os.environ}
-    env.update(PYTHONPATH=os.pathsep.join((str(GENERATOR_DIR), str(DEMO_DIR))),
+    env.update(PYTHONPATH=os.pathsep.join((str(GENERATOR_DIR), str(DEMO_DIR),
+                                           *map(str, python_paths))),
                PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
                TEMP=str(temp_dir), TMP=str(temp_dir))
     return env
+
+
+def base_interpreter() -> str:
+    """The real python.exe behind the venv (the venv launcher would start
+    it as a second process)."""
+    return str(getattr(sys, "_base_executable", None) or sys.executable)
+
+
+def venv_paths() -> tuple[str, ...]:
+    paths = sysconfig.get_paths()
+    return tuple(dict.fromkeys(str(paths[k]) for k in ("purelib", "platlib")))
+
+
+def is_venv_launcher(interpreter: str) -> bool:
+    """True when `interpreter` sits in a venv (pyvenv.cfg beside it or one
+    level up), i.e. it is the launcher, not the interpreter itself."""
+    here = Path(interpreter).parent
+    return (here / "pyvenv.cfg").is_file() or (here.parent / "pyvenv.cfg").is_file()
 
 
 def _check_argument(part: str) -> str:
@@ -810,25 +986,52 @@ def _check_argument(part: str) -> str:
     return part
 
 
-def build_child_command(number: int, output_dir: Path, *, series_token: str,
-                        expected_head: str, interpreter: str) -> ChildCommand:
-    """The exact child command.  Paths may contain spaces; quoting is done
-    by list2cmdline, never by hand."""
-    cid = calibration_id(number)
+def _command(run_id: str, mode: Sequence[str], output_dir: Path, *, series_token: str,
+             expected_head: str, interpreter: str, python_paths: Sequence[str]) -> ChildCommand:
     if not isinstance(series_token, str) or not _TOKEN_RE.fullmatch(series_token):
         raise CalibrationError("a series token is 32 lowercase hex characters")
     if not isinstance(expected_head, str) or not _HEAD_RE.fullmatch(expected_head):
         raise CalibrationError("the expected head is the full 40-character Git HEAD")
     output_dir = Path(output_dir)
     argv = tuple(_check_argument(str(part)) for part in (
-        interpreter, "-B", "-s", str(Path(__file__).resolve()), "--child", str(number),
-        "--output-dir", str(output_dir), "--token", series_token, "--authorize", cid,
+        interpreter, "-B", "-s", str(Path(__file__).resolve()), *mode,
+        "--output-dir", str(output_dir), "--token", series_token,
         "--expect-head", expected_head))
-    temp_dir = output_dir / "temp" / cid
-    return ChildCommand(calibration_id=cid, argv=argv, cwd=str(REPO),
-                        env=child_environment(temp_dir), temp_dir=temp_dir,
-                        stdout_path=output_dir / f"{cid}.stdout",
-                        stderr_path=output_dir / f"{cid}.stderr")
+    for path in python_paths:
+        _check_argument(str(path))
+    temp_dir = output_dir / "temp" / run_id
+    return ChildCommand(calibration_id=run_id, argv=argv, cwd=str(REPO),
+                        env=child_environment(temp_dir, python_paths), temp_dir=temp_dir,
+                        stdout_path=output_dir / f"{run_id}.stdout",
+                        stderr_path=output_dir / f"{run_id}.stderr")
+
+
+def build_child_command(number: int, output_dir: Path, *, series_token: str,
+                        expected_head: str, interpreter: str,
+                        python_paths: Sequence[str] = ()) -> ChildCommand:
+    """The exact child command.  Paths may contain spaces; quoting is done
+    by list2cmdline, never by hand."""
+    cid = calibration_id(number)
+    command = _command(cid, ("--child", str(number)), output_dir, series_token=series_token,
+                       expected_head=expected_head, interpreter=interpreter,
+                       python_paths=python_paths)
+    argv = list(command.argv)        # keep --authorize before --expect-head
+    argv[-2:-2] = ["--authorize", cid]
+    return replace(command, argv=tuple(argv))
+
+
+def build_probe_command(probe_id: str, output_dir: Path, *, series_token: str,
+                        expected_head: str, interpreter: str, port: int,
+                        python_paths: Sequence[str] = ()) -> ChildCommand:
+    """The exact probe-child command: no --child, so no workload driver."""
+    if not isinstance(probe_id, str) or not PROBE_ID_RE.fullmatch(probe_id):
+        raise CalibrationError("a probe id is probe-01 .. probe-05")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise CalibrationError("the probe listener port must be 1024-65535")
+    command = _command(probe_id, ("--probe-child", probe_id), output_dir,
+                       series_token=series_token, expected_head=expected_head,
+                       interpreter=interpreter, python_paths=python_paths)
+    return replace(command, argv=command.argv + ("--port", str(port)))
 
 
 def detached_orchestrator_command(*, interpreter: str, runs: int, output_dir: Path,
@@ -853,16 +1056,25 @@ def detached_orchestrator_command(*, interpreter: str, runs: int, output_dir: Pa
             f">{log}\\orchestrator.exit echo exit_code=!errorlevel!\"'")
 
 
-def validate_app_container_token(info: Any, expected_sid: str) -> list[str]:
-    """Why a launched child's token is not the capability-free calibration
+def _norm_image(path: Any) -> Optional[str]:
+    return os.path.normcase(os.path.normpath(str(path))) if path else None
+
+
+def validate_app_container_token(info: Any, expected_sid: Optional[str], *,
+                                 expected_pid: Optional[int] = None,
+                                 expected_image: Optional[str] = None,
+                                 check_loopback: bool = True) -> list[str]:
+    """Why a child's token or identity is not the capability-free, authorized
     AppContainer; empty when it is."""
     if not isinstance(info, Mapping):
         return ["no token information"]
     problems = []
+    if not expected_sid:
+        problems.append("no AppContainer profile is authorized")
     if info.get("is_app_container") is not True:
         problems.append("the process is not in an AppContainer")
-    if info.get("app_container_sid") != expected_sid:
-        problems.append("the AppContainer SID is not the calibration profile's")
+    if not expected_sid or info.get("app_container_sid") != expected_sid:
+        problems.append("the AppContainer SID is not the authorized profile's")
     capabilities = info.get("capabilities")
     if not isinstance(capabilities, (list, tuple)):
         problems.append("the token capabilities are unknown")
@@ -871,57 +1083,877 @@ def validate_app_container_token(info: Any, expected_sid: str) -> list[str]:
         problems.append("the token has capabilities: " + ", ".join(map(str, named)))
     if info.get("integrity_level") != "low":
         problems.append("the token integrity level is not low")
-    if info.get("loopback_exempt") is not False:
+    if check_loopback and info.get("loopback_exempt") is not False:
         problems.append("absence of a loopback exemption is not shown")
+    if expected_pid is not None and info.get("pid") != expected_pid:
+        problems.append("the token was read from another process")
+    if expected_image is not None and _norm_image(info.get("image_path")) != \
+            _norm_image(expected_image):
+        problems.append("the process image is not the intended interpreter")
     return problems
+
+
+#: Process evidence.  Execution history and current liveness are separate:
+#: a confirmed exit never turns "may have executed" into "never executed".
+NEVER_EXECUTED = "definitely_never_executed"
+MAY_HAVE_EXECUTED = "may_have_executed"
+CONFIRMED_EXITED = "confirmed_exited"
+STATE_UNKNOWN = "state_unknown"
+ALIVE_AT_LAST_CHECK = "alive_at_last_check"
+EXECUTION_HISTORIES = (NEVER_EXECUTED, MAY_HAVE_EXECUTED, STATE_UNKNOWN)
+LIVENESS_STATES = (CONFIRMED_EXITED, ALIVE_AT_LAST_CHECK, STATE_UNKNOWN)
+
+
+class LaunchFailure(CalibrationError):
+    """A launch that failed after a process was (or may have been) created.
+    Carries the process evidence for the journals."""
+
+    def __init__(self, message: str, *, pid: Any = None, creation_time: Any = None,
+                 execution_history: str = STATE_UNKNOWN, liveness: str = STATE_UNKNOWN,
+                 handles_retained: bool = False, cleanup_errors: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.evidence = {"process_created": True, "pid": pid, "creation_time": creation_time,
+                         "execution_history": execution_history, "liveness": liveness,
+                         "handles_retained": handles_retained,
+                         "cleanup_errors": list(cleanup_errors)}
+
+
+def process_evidence(process: Any) -> dict[str, Any]:
+    """The evidence fields of a created process (unknown where not tracked)."""
+    return {"process_created": True, "pid": getattr(process, "pid", None),
+            "creation_time": getattr(process, "creation_time", None),
+            "execution_history": getattr(process, "execution_history", STATE_UNKNOWN),
+            "liveness": getattr(process, "liveness", STATE_UNKNOWN),
+            "handles_retained": bool(getattr(process, "handles_retained", False)),
+            "cleanup_errors": list(getattr(process, "cleanup_errors", []))}
+
+
+def _launch_failure(message: str, process: Any) -> LaunchFailure:
+    evidence = process_evidence(process)
+    evidence.pop("process_created")
+    return LaunchFailure(message, **evidence)
+
+
+#: Required profile-preflight fields and their exact expected values.
+PREFLIGHT_RECORD_FIELDS = ("profile_name", "app_container_sid", "capabilities",
+                           "loopback_exempt", "verified_by", "verified_utc")
+
+
+def check_profile_preflight(path: Path) -> dict[str, Any]:
+    """
+    The independently verified profile-preflight record, authorized by its
+    exact SHA-256 (AUTHORIZED_PROFILE_PREFLIGHT_SHA256).  The record is
+    produced outside this file, by the separately authorized profile step.
+    Nothing here proves the profile exists by itself; without this record
+    every launch is blocked.
+    """
+    if not AUTHORIZED_PROFILE_PREFLIGHT_SHA256:
+        raise CalibrationError("no profile-preflight record is authorized "
+                               "(AUTHORIZED_PROFILE_PREFLIGHT_SHA256 is None); launch blocked")
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        raise CalibrationError(f"the profile-preflight record {path} is missing or unreadable; "
+                               "launch blocked") from None
+    if hashlib.sha256(raw).hexdigest() != AUTHORIZED_PROFILE_PREFLIGHT_SHA256:
+        raise CalibrationError("the profile-preflight record is not the authorized one; "
+                               "launch blocked")
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        raise CalibrationError("the profile-preflight record is malformed; launch blocked") \
+            from None
+    problems = []
+    if not isinstance(record, dict) or set(PREFLIGHT_RECORD_FIELDS) - set(record):
+        problems.append("fields are missing")
+    else:
+        if record["profile_name"] != APPCONTAINER_PROFILE:
+            problems.append("another profile name")
+        if not AUTHORIZED_APPCONTAINER_SID or \
+                record["app_container_sid"] != AUTHORIZED_APPCONTAINER_SID:
+            problems.append("another SID")
+        if record["capabilities"] != []:
+            problems.append("capabilities are present")
+        if record["loopback_exempt"] is not False:
+            problems.append("a loopback exemption is not excluded")
+        if not isinstance(record["verified_by"], str) or not record["verified_by"].strip() \
+                or not isinstance(record["verified_utc"], str):
+            problems.append("the verification is not attributed")
+    if problems:
+        raise CalibrationError("the profile-preflight record is invalid (" + "; ".join(problems)
+                               + "); launch blocked")
+    return record
 
 
 class AppContainerLauncher:
     """
-    Starts a child suspended inside the existing calibration AppContainer
-    profile, with no capabilities, checks the token, and only then resumes
-    it.  It never creates the profile and never changes ACLs.  A child whose
-    token is rejected never ran any code; it is discarded while suspended.
+    Starts a child suspended inside the authorized AppContainer profile,
+    with no capabilities, checks the real token and the process identity,
+    and only then resumes it.  It never creates the profile and never
+    changes ACLs.  A child that fails a check before a successful
+    ResumeThread never executed; after it, it may have.  A discarded child
+    is reported as confirmed exited only when its exit was verified; else
+    its PID and handles are kept for inspection.
     """
 
-    def __init__(self, auth: Any, api: Any) -> None:
-        self.auth = _require_authorization(auth)
+    def __init__(self, auth: Any, api: Any, *,
+                 preflight_path: Optional[Path] = None) -> None:
+        self.auth = _require_any_authorization(auth)
         self.api = api
+        self.preflight_path = preflight_path or DEFAULT_PROFILE_PREFLIGHT
 
     def __call__(self, command: ChildCommand, stdout: Any, stderr: Any) -> Any:
-        _require_authorization(self.auth, command.calibration_id)
+        _require_any_authorization(self.auth, command.calibration_id)
         if APPCONTAINER_CAPABILITIES:
             raise CalibrationError("the calibration AppContainer must have no capabilities")
+        if not AUTHORIZED_APPCONTAINER_SID:
+            raise CalibrationError("no AppContainer profile is authorized "
+                                   "(AUTHORIZED_APPCONTAINER_SID is None)")
+        if is_venv_launcher(command.argv[0]):
+            raise CalibrationError("the child must be the base interpreter, not the venv "
+                                   "launcher (its own child would be a second process)")
+        check_profile_preflight(self.preflight_path)
         sid = self.api.profile_sid(APPCONTAINER_PROFILE)
-        if not sid:
-            raise CalibrationError(f"AppContainer profile {APPCONTAINER_PROFILE} does not exist; "
-                                   "creating it needs its own authorization")
+        if sid != AUTHORIZED_APPCONTAINER_SID:
+            raise CalibrationError(f"profile {APPCONTAINER_PROFILE} has SID {sid}, not the "
+                                   "authorized one")
+        if not self.api.profile_folder_present(sid):
+            raise CalibrationError("GetAppContainerFolderPath found no folder for the profile "
+                                   "(not proof either way); launch blocked; a profile is "
+                                   "never created here - that needs its own authorization")
         process = self.api.create_suspended(command, sid, APPCONTAINER_CAPABILITIES,
                                             stdout, stderr)
-        problems = validate_app_container_token(self.api.token_info(process), sid)
+        try:
+            problems = validate_app_container_token(
+                self.api.token_info(process), sid, expected_pid=process.pid,
+                expected_image=command.argv[0])
+        except Exception as exc:
+            problems = [f"the token could not be read: {type(exc).__name__}: {exc}"]
         if problems:
-            self.api.discard_suspended(process)
-            raise CalibrationError("AppContainer token rejected: " + "; ".join(problems))
-        self.api.resume(process)
+            self._discard(process, "token rejected: " + "; ".join(problems))
+        try:
+            self.api.resume(process)
+        except Exception as exc:
+            self._discard(process, f"resume failed: {type(exc).__name__}: {exc}")
         return process
+
+    def _discard(self, process: Any, why: str) -> None:
+        try:
+            self.api.discard_suspended(process)
+        except Exception as exc:
+            raise _launch_failure(
+                f"AppContainer {why}; and the child PID {getattr(process, 'pid', None)} could "
+                f"not be discarded ({exc}); its handles are kept; inspect it", process) from None
+        history = getattr(process, "execution_history", STATE_UNKNOWN)
+        raise _launch_failure(f"AppContainer {why}; the child was discarded and confirmed "
+                              f"exited (execution history: {history})", process)
+
+
+# Win32 constants (documented values).
+CREATE_SUSPENDED = 0x00000004
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_UNICODE_ENVIRONMENT = 0x00000400
+EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+CREATE_NO_WINDOW = 0x08000000
+CREATION_FLAGS = (CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT
+                  | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW)
+STARTF_USESTDHANDLES = 0x00000100
+HANDLE_FLAG_INHERIT = 0x00000001
+PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
+TOKEN_QUERY = 0x0008
+TOKEN_INTEGRITY_LEVEL, TOKEN_IS_APP_CONTAINER = 25, 29
+TOKEN_CAPABILITIES, TOKEN_APP_CONTAINER_SID = 30, 31
+ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER = 24, 122
+WAIT_OBJECT_0, WAIT_TIMEOUT = 0x0, 0x102
+RESUME_FAILED = 0xFFFFFFFF
+INTEGRITY_LEVELS: Mapping[int, str] = {0x0: "untrusted", 0x1000: "low", 0x2000: "medium",
+                                       0x2100: "medium-plus", 0x3000: "high", 0x4000: "system"}
+_INVALID_HANDLES = frozenset({0, -1, (1 << 32) - 1, (1 << 64) - 1})
+
+
+def _valid_handle(handle: Any) -> bool:
+    return isinstance(handle, int) and not isinstance(handle, bool) \
+        and handle not in _INVALID_HANDLES
+
+
+class Win32Error(CalibrationError):
+    def __init__(self, api: str, code: Any) -> None:
+        super().__init__(f"{api} failed (Windows error {code})")
+        self.api, self.code = api, code
+
+
+def environment_block(env: Mapping[str, str]) -> str:
+    """A CREATE_UNICODE_ENVIRONMENT block, sorted case-insensitively; the
+    final NUL is added by the buffer."""
+    for key, value in env.items():
+        if not key or "=" in key or "\0" in key or "\0" in str(value):
+            raise CalibrationError(f"unusable environment entry: {key[:40]!r}")
+    if not env:
+        raise CalibrationError("the child environment is empty")
+    return "".join(f"{k}={v}\0" for k, v in sorted(env.items(), key=lambda kv: kv[0].upper()))
+
+
+def _filetime_iso(low: int, high: int) -> str:
+    ticks = (int(high) << 32) | int(low)
+    epoch = (ticks - 116444736000000000) / 10_000_000
+    moment = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def _integrity_name(sid: Optional[str]) -> Optional[str]:
+    if not sid:
+        return None
+    try:
+        rid = int(sid.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    return INTEGRITY_LEVELS.get(rid, f"rid-{rid}")
+
+
+_TYPES: Optional[types.SimpleNamespace] = None
+
+
+def _win32_types() -> types.SimpleNamespace:
+    """ctypes structures of the documented Win32 types (built on first use)."""
+    global _TYPES
+    if _TYPES is None:
+        import ctypes
+        from ctypes import wintypes as w
+
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", w.DWORD)]
+
+        class SECURITY_CAPABILITIES(ctypes.Structure):
+            _fields_ = [("AppContainerSid", ctypes.c_void_p),
+                        ("Capabilities", ctypes.POINTER(SID_AND_ATTRIBUTES)),
+                        ("CapabilityCount", w.DWORD), ("Reserved", w.DWORD)]
+
+        class STARTUPINFOW(ctypes.Structure):
+            _fields_ = [("cb", w.DWORD), ("lpReserved", w.LPWSTR), ("lpDesktop", w.LPWSTR),
+                        ("lpTitle", w.LPWSTR), ("dwX", w.DWORD), ("dwY", w.DWORD),
+                        ("dwXSize", w.DWORD), ("dwYSize", w.DWORD), ("dwXCountChars", w.DWORD),
+                        ("dwYCountChars", w.DWORD), ("dwFillAttribute", w.DWORD),
+                        ("dwFlags", w.DWORD), ("wShowWindow", w.WORD), ("cbReserved2", w.WORD),
+                        ("lpReserved2", ctypes.c_void_p), ("hStdInput", w.HANDLE),
+                        ("hStdOutput", w.HANDLE), ("hStdError", w.HANDLE)]
+
+        class STARTUPINFOEXW(ctypes.Structure):
+            _fields_ = [("StartupInfo", STARTUPINFOW), ("lpAttributeList", ctypes.c_void_p)]
+
+        class PROCESS_INFORMATION(ctypes.Structure):
+            _fields_ = [("hProcess", w.HANDLE), ("hThread", w.HANDLE),
+                        ("dwProcessId", w.DWORD), ("dwThreadId", w.DWORD)]
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", w.DWORD), ("dwHighDateTime", w.DWORD)]
+
+        class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+            _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
+        class TOKEN_APPCONTAINER_INFORMATION(ctypes.Structure):
+            _fields_ = [("TokenAppContainer", ctypes.c_void_p)]
+
+        class TOKEN_GROUPS(ctypes.Structure):
+            _fields_ = [("GroupCount", w.DWORD), ("Groups", SID_AND_ATTRIBUTES * 1)]
+
+        _TYPES = types.SimpleNamespace(
+            ctypes=ctypes, w=w, SID_AND_ATTRIBUTES=SID_AND_ATTRIBUTES,
+            SECURITY_CAPABILITIES=SECURITY_CAPABILITIES, STARTUPINFOW=STARTUPINFOW,
+            STARTUPINFOEXW=STARTUPINFOEXW, PROCESS_INFORMATION=PROCESS_INFORMATION,
+            FILETIME=FILETIME, TOKEN_MANDATORY_LABEL=TOKEN_MANDATORY_LABEL,
+            TOKEN_APPCONTAINER_INFORMATION=TOKEN_APPCONTAINER_INFORMATION,
+            TOKEN_GROUPS=TOKEN_GROUPS)
+    return _TYPES
+
+
+def _signatures(t: types.SimpleNamespace) -> dict[str, tuple[str, Any, list[Any]]]:
+    """name -> (DLL, restype, argtypes) of every Win32 function used."""
+    c, w = t.ctypes, t.w
+    P = c.POINTER
+    return {
+        "CreateProcessW": ("kernel32", w.BOOL, [
+            w.LPCWSTR, c.c_void_p, c.c_void_p, c.c_void_p, w.BOOL, w.DWORD, c.c_void_p,
+            w.LPCWSTR, P(t.STARTUPINFOEXW), P(t.PROCESS_INFORMATION)]),
+        "InitializeProcThreadAttributeList": ("kernel32", w.BOOL,
+                                              [c.c_void_p, w.DWORD, w.DWORD, P(c.c_size_t)]),
+        "UpdateProcThreadAttribute": ("kernel32", w.BOOL, [
+            c.c_void_p, w.DWORD, c.c_size_t, c.c_void_p, c.c_size_t, c.c_void_p, c.c_void_p]),
+        "DeleteProcThreadAttributeList": ("kernel32", None, [c.c_void_p]),
+        "SetHandleInformation": ("kernel32", w.BOOL, [w.HANDLE, w.DWORD, w.DWORD]),
+        "ResumeThread": ("kernel32", w.DWORD, [w.HANDLE]),
+        "TerminateProcess": ("kernel32", w.BOOL, [w.HANDLE, w.UINT]),
+        "WaitForSingleObject": ("kernel32", w.DWORD, [w.HANDLE, w.DWORD]),
+        "GetExitCodeProcess": ("kernel32", w.BOOL, [w.HANDLE, P(w.DWORD)]),
+        "GetProcessId": ("kernel32", w.DWORD, [w.HANDLE]),
+        "GetProcessTimes": ("kernel32", w.BOOL, [w.HANDLE] + [P(t.FILETIME)] * 4),
+        "QueryFullProcessImageNameW": ("kernel32", w.BOOL,
+                                       [w.HANDLE, w.DWORD, c.c_void_p, P(w.DWORD)]),
+        "CloseHandle": ("kernel32", w.BOOL, [w.HANDLE]),
+        "GetCurrentProcess": ("kernel32", w.HANDLE, []),
+        "GetProcessHeap": ("kernel32", w.HANDLE, []),
+        "HeapFree": ("kernel32", w.BOOL, [w.HANDLE, w.DWORD, c.c_void_p]),
+        "LocalFree": ("kernel32", c.c_void_p, [c.c_void_p]),
+        "OpenProcessToken": ("advapi32", w.BOOL, [w.HANDLE, w.DWORD, P(w.HANDLE)]),
+        "GetTokenInformation": ("advapi32", w.BOOL,
+                                [w.HANDLE, c.c_int, c.c_void_p, w.DWORD, P(w.DWORD)]),
+        "ConvertSidToStringSidW": ("advapi32", w.BOOL, [c.c_void_p, P(w.LPWSTR)]),
+        "ConvertStringSidToSidW": ("advapi32", w.BOOL, [w.LPCWSTR, P(c.c_void_p)]),
+        "FreeSid": ("advapi32", c.c_void_p, [c.c_void_p]),
+        "DeriveAppContainerSidFromAppContainerName": ("userenv", c.c_long,
+                                                      [w.LPCWSTR, P(c.c_void_p)]),
+        "GetAppContainerFolderPath": ("userenv", c.c_long, [w.LPCWSTR, P(w.LPWSTR)]),
+        "CoTaskMemFree": ("ole32", None, [c.c_void_p]),
+        "NetworkIsolationGetAppContainerConfig": ("firewallapi", w.DWORD,
+                                                  [P(w.DWORD), P(P(t.SID_AND_ATTRIBUTES))]),
+    }
+
+
+WIN32_DLLS: tuple[str, ...] = ("kernel32", "advapi32", "userenv", "ole32", "firewallapi")
+#: Upper bound for one token information buffer (fail closed beyond it).
+TOKEN_BUFFER_LIMIT: int = 64 * 1024
+#: Smallest SID: revision, count, authority (8 bytes) - a pointer to a SID
+#: inside a token buffer must leave at least this much room.
+MIN_SID_BYTES: int = 8
+
+
+@dataclass
+class Win32Handles:
+    process: Any
+    thread: Any
+    pid: int
+    tid: int
+    cleanup_errors: list[str] = field(default_factory=list)
+
+
+def _default_loader(name: str) -> Any:
+    import ctypes
+    return ctypes.WinDLL(name, use_last_error=True)
+
+
+class CtypesWin32:
+    """
+    The documented Win32 calls, through ctypes.  Every call re-checks the
+    authorization; each DLL is loaded only when an operation first needs it.
+    Tests pass a fake loader, a fake last-error source and a fake
+    file-handle lookup.
+    """
+
+    def __init__(self, auth: Any, *, loader: Optional[Callable[[str], Any]] = None,
+                 last_error: Optional[Callable[[], int]] = None,
+                 os_handle: Optional[Callable[[Any], int]] = None) -> None:
+        self.auth = _require_any_authorization(auth)
+        self._loader = loader or _default_loader
+        self._loaded: dict[str, Any] = {}
+        self._last_error = last_error
+        self._os_handle = os_handle
+        self.last_cleanup_errors: list[str] = []
+
+    @property
+    def loaded_dlls(self) -> list[str]:
+        return sorted(self._loaded)
+
+    def _api(self, name: str) -> Any:
+        _require_any_authorization(self.auth)
+        t = _win32_types()
+        dll, restype, argtypes = _signatures(t)[name]
+        if dll not in self._loaded:
+            self._loaded[dll] = self._loader(dll)
+        function = getattr(self._loaded[dll], name)
+        function.restype, function.argtypes = restype, argtypes
+        return function
+
+    def _code(self) -> Any:
+        return (self._last_error or _win32_types().ctypes.get_last_error)()
+
+    def _error(self, api: str) -> Win32Error:
+        return Win32Error(api, self._code())
+
+    def _sid_string(self, psid: Any) -> str:
+        t = _win32_types()
+        c = t.ctypes
+        local_free = self._api("LocalFree")
+        text = t.w.LPWSTR()
+        if not self._api("ConvertSidToStringSidW")(psid, c.byref(text)):
+            raise self._error("ConvertSidToStringSidW")
+        value = str(text.value)
+        if local_free(c.cast(text, c.c_void_p)):
+            raise Win32Error("LocalFree", self._code())
+        return value
+
+    def derive_sid(self, name: str) -> str:
+        c = _win32_types().ctypes
+        free_sid = self._api("FreeSid")
+        psid = c.c_void_p()
+        result = self._api("DeriveAppContainerSidFromAppContainerName")(name, c.byref(psid))
+        if result != 0 or not psid.value:
+            raise Win32Error("DeriveAppContainerSidFromAppContainerName", result & 0xFFFFFFFF)
+        try:
+            return self._sid_string(psid.value)
+        finally:
+            free_sid(psid)
+
+    def profile_folder(self, sid: str) -> str:
+        """GetAppContainerFolderPath.  Supplementary only: it is not
+        documented as a test of profile existence."""
+        t = _win32_types()
+        c = t.ctypes
+        co_task_mem_free = self._api("CoTaskMemFree")
+        path = t.w.LPWSTR()
+        result = self._api("GetAppContainerFolderPath")(sid, c.byref(path))
+        try:
+            if result != 0:
+                raise Win32Error("GetAppContainerFolderPath", result & 0xFFFFFFFF)
+            return str(path.value)
+        finally:
+            if path.value is not None:
+                co_task_mem_free(c.cast(path, c.c_void_p))
+
+    def loopback_exempt_sids(self) -> list[str]:
+        """
+        NetworkIsolationGetAppContainerConfig, then Microsoft's documented
+        release: HeapFree(GetProcessHeap(), 0, sid) for every returned SID
+        and HeapFree(GetProcessHeap(), 0, array) for the array - also after
+        a failure, for whatever was returned.  Any conversion or release
+        problem fails the call.
+        """
+        t = _win32_types()
+        c = t.ctypes
+        heap_free = self._api("HeapFree")
+        heap = self._api("GetProcessHeap")()
+        if not _valid_handle(heap):
+            raise self._error("GetProcessHeap")
+        count = t.w.DWORD(0)
+        array = c.POINTER(t.SID_AND_ATTRIBUTES)()
+        result = self._api("NetworkIsolationGetAppContainerConfig")(c.byref(count),
+                                                                     c.byref(array))
+        entries = count.value if array else 0
+        problems: list[str] = []
+        if count.value and not array:
+            problems.append("a count without an array")
+        sids: list[str] = []
+        try:
+            if result == 0:
+                for index in range(entries):
+                    psid = array[index].Sid
+                    if not psid:
+                        problems.append(f"SID {index} is null")
+                        continue
+                    try:
+                        sids.append(self._sid_string(psid))
+                    except Exception as exc:
+                        problems.append(f"SID {index}: {type(exc).__name__}: {exc}")
+        finally:
+            for index in range(entries):
+                psid = array[index].Sid
+                if psid and not heap_free(heap, 0, psid):
+                    problems.append(f"HeapFree of SID {index} failed")
+            if array and not heap_free(heap, 0, c.cast(array, c.c_void_p)):
+                problems.append("HeapFree of the array failed")
+        if result != 0:
+            raise Win32Error("NetworkIsolationGetAppContainerConfig", result)
+        if problems:
+            raise Win32Error("NetworkIsolationGetAppContainerConfig", "; ".join(problems))
+        return sids
+
+    def _handle_of(self, stream: Any) -> int:
+        if self._os_handle is not None:
+            return self._os_handle(stream)
+        import msvcrt
+        return msvcrt.get_osfhandle(stream.fileno())
+
+    def create_process(self, *, application: str, command_line: str, env: Mapping[str, str],
+                       cwd: str, stdout: Any, stderr: Any, sid: str) -> Win32Handles:
+        """
+        CreateProcessW, suspended, in the AppContainer `sid` with NO
+        capabilities, inheriting exactly the stdout and stderr handles.  The
+        cleanup functions are bound before anything is allocated and the
+        cleanup never raises, so a created process is always returned (with
+        any cleanup errors attached), never lost.
+        """
+        t = _win32_types()
+        c, w = t.ctypes, t.w
+        handles = [self._handle_of(stdout), self._handle_of(stderr)]
+        if not all(_valid_handle(h) for h in handles):
+            raise Win32Error("get_osfhandle", "invalid output handle")
+        command_buffer = c.create_unicode_buffer(command_line)
+        environment = c.create_unicode_buffer(environment_block(env))
+        convert = self._api("ConvertStringSidToSidW")
+        set_information = self._api("SetHandleInformation")
+        initialize = self._api("InitializeProcThreadAttributeList")
+        update = self._api("UpdateProcThreadAttribute")
+        delete = self._api("DeleteProcThreadAttributeList")
+        local_free = self._api("LocalFree")
+        create = self._api("CreateProcessW")
+        psid = c.c_void_p()
+        if not convert(sid, c.byref(psid)):
+            raise self._error("ConvertStringSidToSidW")
+        attributes = None
+        initialized = False
+        inheritable: list[int] = []
+        created: Optional[Win32Handles] = None
+        cleanup_errors: list[str] = []
+        try:
+            for handle in handles:
+                if not set_information(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT):
+                    raise self._error("SetHandleInformation")
+                inheritable.append(handle)
+            size = c.c_size_t(0)
+            initialize(None, 2, 0, c.byref(size))
+            if not size.value:
+                raise self._error("InitializeProcThreadAttributeList")
+            attributes = c.create_string_buffer(size.value)
+            if not initialize(c.addressof(attributes), 2, 0, c.byref(size)):
+                raise self._error("InitializeProcThreadAttributeList")
+            initialized = True
+            capabilities = t.SECURITY_CAPABILITIES(psid.value, None, 0, 0)
+            inherited = (w.HANDLE * 2)(*handles)
+            for attribute, value in ((PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, capabilities),
+                                     (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited)):
+                if not update(c.addressof(attributes), 0, attribute, c.addressof(value),
+                              c.sizeof(value), None, None):
+                    raise self._error("UpdateProcThreadAttribute")
+            startup = t.STARTUPINFOEXW()
+            startup.StartupInfo.cb = c.sizeof(startup)
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+            startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError = handles
+            startup.lpAttributeList = c.addressof(attributes)
+            info = t.PROCESS_INFORMATION()
+            if not create(application, c.addressof(command_buffer), None, None, True,
+                          CREATION_FLAGS, c.addressof(environment), cwd, c.byref(startup),
+                          c.byref(info)):
+                raise self._error("CreateProcessW")
+            created = Win32Handles(info.hProcess, info.hThread, info.dwProcessId,
+                                   info.dwThreadId)
+        finally:
+            if initialized:
+                try:
+                    delete(c.addressof(attributes))
+                except Exception as exc:
+                    cleanup_errors.append(f"DeleteProcThreadAttributeList: {type(exc).__name__}")
+            for handle in inheritable:
+                try:
+                    if not set_information(handle, HANDLE_FLAG_INHERIT, 0):
+                        cleanup_errors.append(f"SetHandleInformation could not reset "
+                                              f"inheritance of handle {handle}")
+                except Exception as exc:
+                    cleanup_errors.append(f"SetHandleInformation: {type(exc).__name__}")
+            try:
+                if local_free(psid):
+                    cleanup_errors.append("LocalFree of the AppContainer SID failed")
+            except Exception as exc:
+                cleanup_errors.append(f"LocalFree: {type(exc).__name__}")
+            self.last_cleanup_errors = list(cleanup_errors)
+            if created is not None:
+                created.cleanup_errors.extend(cleanup_errors)
+        return created
+
+    def process_id(self, process: Any) -> int:
+        pid = self._api("GetProcessId")(process)
+        if not pid:
+            raise self._error("GetProcessId")
+        return int(pid)
+
+    def creation_time(self, process: Any) -> str:
+        t = _win32_types()
+        times = [t.FILETIME() for _ in range(4)]
+        if not self._api("GetProcessTimes")(process, *[t.ctypes.byref(f) for f in times]):
+            raise self._error("GetProcessTimes")
+        return _filetime_iso(times[0].dwLowDateTime, times[0].dwHighDateTime)
+
+    def image_path(self, process: Any) -> str:
+        t = _win32_types()
+        c = t.ctypes
+        buffer = c.create_unicode_buffer(32768)
+        size = t.w.DWORD(32768)
+        if not self._api("QueryFullProcessImageNameW")(process, 0, c.addressof(buffer),
+                                                       c.byref(size)):
+            raise self._error("QueryFullProcessImageNameW")
+        return buffer.value
+
+    def _token_query(self, token: Any, information_class: int) -> tuple[Any, int]:
+        """(pointer-aligned buffer, returned length).  Fixed-size classes use
+        their documented size and one call; variable ones are sized first."""
+        t = _win32_types()
+        c = t.ctypes
+        query = self._api("GetTokenInformation")
+        fixed = {TOKEN_IS_APP_CONTAINER: t.w.DWORD}.get(information_class)
+        if fixed is not None:
+            needed = c.sizeof(fixed)
+        else:
+            size = t.w.DWORD(0)
+            if query(token, information_class, None, 0, c.byref(size)):
+                raise Win32Error("GetTokenInformation", "unexpected success without a buffer")
+            code = self._code()
+            if code not in (ERROR_INSUFFICIENT_BUFFER, ERROR_BAD_LENGTH) or not size.value:
+                raise Win32Error("GetTokenInformation", code)
+            needed = size.value
+        if not 0 < needed <= TOKEN_BUFFER_LIMIT:
+            raise Win32Error("GetTokenInformation", f"implausible size {needed}")
+        pointer = c.sizeof(c.c_void_p)
+        buffer = (c.c_void_p * max(1, -(-needed // pointer)))()
+        returned = t.w.DWORD(0)
+        if not query(token, information_class, c.addressof(buffer), needed, c.byref(returned)):
+            raise self._error("GetTokenInformation")
+        if returned.value > c.sizeof(buffer) or (fixed is not None and returned.value != needed):
+            raise Win32Error("GetTokenInformation", f"unexpected length {returned.value}")
+        return buffer, returned.value
+
+    @staticmethod
+    def _need(length: int, size: int, what: str) -> None:
+        if length < size:
+            raise Win32Error("GetTokenInformation", f"short {what}")
+
+    @staticmethod
+    def _inside(buffer: Any, length: int, pointer: int, what: str) -> None:
+        """A SID pointer must point into the returned buffer (fail closed)."""
+        base = _win32_types().ctypes.addressof(buffer)
+        if not pointer or not base <= pointer <= base + length - MIN_SID_BYTES:
+            raise Win32Error("GetTokenInformation", f"{what} outside the returned buffer")
+
+    def token_info(self, process: Any) -> dict[str, Any]:
+        """The token's AppContainer flag, AppContainer SID, capability SIDs
+        and integrity level, with every layout checked."""
+        t = _win32_types()
+        c, w = t.ctypes, t.w
+        close = self._api("CloseHandle")
+        token = w.HANDLE()
+        if not self._api("OpenProcessToken")(process, TOKEN_QUERY, c.byref(token)):
+            raise self._error("OpenProcessToken")
+        try:
+            raw, length = self._token_query(token, TOKEN_IS_APP_CONTAINER)
+            flag = w.DWORD.from_buffer(raw).value
+            if flag not in (0, 1):
+                raise Win32Error("GetTokenInformation", f"unexpected TokenIsAppContainer {flag}")
+            raw, length = self._token_query(token, TOKEN_APP_CONTAINER_SID)
+            self._need(length, c.sizeof(t.TOKEN_APPCONTAINER_INFORMATION), "TokenAppContainerSid")
+            psid = t.TOKEN_APPCONTAINER_INFORMATION.from_buffer(raw).TokenAppContainer
+            sid = None
+            if psid:
+                self._inside(raw, length, psid, "the AppContainer SID")
+                sid = self._sid_string(psid)
+            raw, length = self._token_query(token, TOKEN_CAPABILITIES)
+            self._need(length, c.sizeof(w.DWORD), "TokenCapabilities")
+            count = w.DWORD.from_buffer(raw).value
+            offset = t.TOKEN_GROUPS.Groups.offset
+            if count and offset + count * c.sizeof(t.SID_AND_ATTRIBUTES) > length:
+                raise Win32Error("GetTokenInformation", "malformed capabilities")
+            capabilities = []
+            for group in ((t.SID_AND_ATTRIBUTES * count).from_buffer(raw, offset)
+                          if count else []):
+                self._inside(raw, length, group.Sid, "a capability SID")
+                capabilities.append(self._sid_string(group.Sid))
+            raw, length = self._token_query(token, TOKEN_INTEGRITY_LEVEL)
+            self._need(length, c.sizeof(t.TOKEN_MANDATORY_LABEL), "TokenIntegrityLevel")
+            label = t.TOKEN_MANDATORY_LABEL.from_buffer(raw).Label.Sid
+            self._inside(raw, length, label, "the integrity label")
+            integrity = _integrity_name(self._sid_string(label))
+        finally:
+            close(token)
+        return {"is_app_container": flag == 1, "app_container_sid": sid,
+                "capabilities": capabilities, "integrity_level": integrity}
+
+    def current_token_info(self) -> dict[str, Any]:
+        return self.token_info(self._api("GetCurrentProcess")())
+
+    def resume(self, thread: Any) -> int:
+        previous = self._api("ResumeThread")(thread)
+        if previous == RESUME_FAILED:
+            raise self._error("ResumeThread")
+        return int(previous)
+
+    def terminate(self, process: Any, code: int) -> None:
+        if not self._api("TerminateProcess")(process, code):
+            raise self._error("TerminateProcess")
+
+    def wait(self, process: Any, milliseconds: int) -> bool:
+        result = self._api("WaitForSingleObject")(process, milliseconds)
+        if result == WAIT_OBJECT_0:
+            return True
+        if result == WAIT_TIMEOUT:
+            return False
+        raise self._error("WaitForSingleObject")
+
+    def exit_code(self, process: Any) -> int:
+        t = _win32_types()
+        code = t.w.DWORD()
+        if not self._api("GetExitCodeProcess")(process, t.ctypes.byref(code)):
+            raise self._error("GetExitCodeProcess")
+        return int(code.value)
+
+    def close(self, handle: Any) -> None:
+        if not self._api("CloseHandle")(handle):
+            raise self._error("CloseHandle")
+
+
+class Win32Process:
+    """
+    A child created suspended by Win32AppContainerApi; pid, creation_time,
+    poll() and returncode as the orchestrator expects, plus its evidence:
+    execution_history (never / may have / unknown) and liveness
+    (confirmed exited / alive at last check / unknown), kept separately.
+    """
+
+    def __init__(self, win32: Any, handles: Win32Handles) -> None:
+        self.win32, self.handles = win32, handles
+        self.pid = handles.pid
+        self.creation_time: Optional[str] = None
+        self.image_path: Optional[str] = None
+        self.returncode: Optional[int] = None
+        self.execution_history = NEVER_EXECUTED          # created suspended
+        self.liveness = ALIVE_AT_LAST_CHECK
+        self.resume_previous_count: Optional[int] = None
+        self.handles_retained = False
+        self.cleanup_errors: list[str] = list(handles.cleanup_errors)
+        self.resumed = False
+        self.discarded = False
+
+    def _close(self, which: str) -> None:
+        handle = getattr(self.handles, which)
+        if _valid_handle(handle):
+            self.win32.close(handle)
+            setattr(self.handles, which, None)
+
+    def poll(self) -> Optional[int]:
+        """The actual exit status (GetExitCodeProcess) once the process has
+        exited, else None."""
+        if self.returncode is not None:
+            return self.returncode
+        if not self.win32.wait(self.handles.process, 0):
+            return None
+        self.returncode = self.win32.exit_code(self.handles.process)
+        self.liveness = CONFIRMED_EXITED
+        try:
+            self._close("process")
+        except Exception as exc:
+            self.cleanup_errors.append(f"closing the process handle failed: {exc}")
+        return self.returncode
 
 
 class Win32AppContainerApi:
-    """
-    The Win32 backend of AppContainerLauncher.  Deliberately not
-    implemented: it is written and reviewed together with the isolation
-    probe.  Every method checks the authorization and then refuses.
-    """
+    """The Win32 backend of AppContainerLauncher.  Every method re-checks the
+    authorization.  It never creates or deletes a profile and never changes
+    ACLs."""
 
-    def __init__(self, auth: Any) -> None:
-        self.auth = _require_authorization(auth)
+    def __init__(self, auth: Any, *, win32: Any = None) -> None:
+        self.auth = _require_any_authorization(auth)
+        self.win32 = win32 if win32 is not None else CtypesWin32(auth)
 
-    def _refuse(self, *args: Any, **kwargs: Any) -> Any:
-        _require_authorization(self.auth)
-        raise CalibrationError("the Win32 AppContainer backend is not implemented; it is "
-                               "written with the isolation probe")
+    def _gate(self) -> None:
+        _require_any_authorization(self.auth)
 
-    profile_sid = create_suspended = token_info = resume = discard_suspended = _refuse
+    def profile_sid(self, name: str) -> str:
+        self._gate()
+        return self.win32.derive_sid(name)
+
+    def profile_folder_present(self, sid: str) -> bool:
+        """Supplementary, necessary-not-sufficient: GetAppContainerFolderPath
+        is not documented as a profile-existence test."""
+        self._gate()
+        try:
+            return bool(self.win32.profile_folder(sid))
+        except Win32Error:
+            return False
+
+    def create_suspended(self, command: ChildCommand, sid: str, capabilities: Sequence[str],
+                         stdout: Any, stderr: Any) -> Win32Process:
+        self._gate()
+        if capabilities:
+            raise CalibrationError("the calibration AppContainer must have no capabilities")
+        handles = self.win32.create_process(
+            application=command.argv[0], command_line=command.command_line, env=command.env,
+            cwd=command.cwd, stdout=stdout, stderr=stderr, sid=sid)
+        process = Win32Process(self.win32, handles)
+        try:
+            if handles.cleanup_errors:
+                raise CalibrationError("native cleanup after CreateProcessW failed: "
+                                       + "; ".join(handles.cleanup_errors))
+            if not _valid_handle(handles.process) or not _valid_handle(handles.thread):
+                raise CalibrationError("CreateProcessW returned an invalid handle")
+            if self.win32.process_id(handles.process) != handles.pid:
+                raise CalibrationError("the process handle does not belong to the created PID")
+            process.creation_time = self.win32.creation_time(handles.process)
+            process.image_path = self.win32.image_path(handles.process)
+        except Exception as exc:
+            try:
+                self.discard_suspended(process)
+            except CalibrationError as failed:
+                raise _launch_failure(f"{exc}; {failed}", process) from None
+            raise _launch_failure(f"{exc}; the child was discarded and confirmed exited "
+                                  f"(execution history: {process.execution_history})",
+                                  process) from None
+        return process
+
+    def token_info(self, process: Win32Process) -> dict[str, Any]:
+        self._gate()
+        info = dict(self.win32.token_info(process.handles.process))
+        info["loopback_exempt"] = info.get("app_container_sid") in set(
+            self.win32.loopback_exempt_sids())
+        info["pid"] = self.win32.process_id(process.handles.process)
+        info["image_path"] = process.image_path
+        return info
+
+    def resume(self, process: Win32Process) -> None:
+        """ResumeThread.  A previous count of 1 resumes the child: from then
+        on it may have executed.  A count of 0 means it was already running
+        (may have executed); above 1 it stays suspended (never executed);
+        a failed call leaves its history unknown."""
+        self._gate()
+        try:
+            previous = self.win32.resume(process.handles.thread)
+        except Exception:
+            process.execution_history = STATE_UNKNOWN
+            raise
+        process.resume_previous_count = previous
+        if previous in (0, 1):
+            process.execution_history = MAY_HAVE_EXECUTED
+        if previous != 1:
+            raise CalibrationError(f"the child's suspend count was {previous}, not 1")
+        process.resumed = True
+        try:
+            process._close("thread")
+        except Exception as exc:
+            process.cleanup_errors.append(f"closing the thread handle failed: {exc}")
+
+    def discard_suspended(self, process: Win32Process) -> None:
+        """
+        Terminate a child that was not validly resumed and verify its exit
+        (signalled, exit code DISCARD_EXIT_CODE).  Only then is it
+        confirmed exited and are its handles closed.  Otherwise its liveness
+        is unknown, its PID and handles are kept, and this raises.  The
+        execution history is never improved by a discard.
+        """
+        self._gate()
+        errors: list[str] = []
+        handle = process.handles.process
+        exited = False
+        if _valid_handle(handle):
+            try:
+                self.win32.terminate(handle, DISCARD_EXIT_CODE)
+                if not self.win32.wait(handle, DISCARD_WAIT_MILLISECONDS):
+                    errors.append("it did not exit after termination")
+                else:
+                    exited = True
+                    if self.win32.exit_code(handle) != DISCARD_EXIT_CODE:
+                        errors.append("its exit code is not the discard code")
+                        if process.execution_history == NEVER_EXECUTED:
+                            process.execution_history = STATE_UNKNOWN
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+        else:
+            errors.append("there is no valid process handle")
+        process.liveness = CONFIRMED_EXITED if exited else STATE_UNKNOWN
+        if errors:
+            process.handles_retained = True
+            process.cleanup_errors.extend(errors)
+            raise CalibrationError(f"the child PID {process.pid} could not be discarded: "
+                                   + "; ".join(errors) + "; its handles are kept; inspect it")
+        for which in ("thread", "process"):
+            try:
+                process._close(which)
+            except Exception as exc:
+                process.cleanup_errors.append(f"closing the {which} handle failed: {exc}")
+        process.discarded = True
 
 
 # ---------------------------------------------------------------------------
@@ -1015,7 +2047,7 @@ def parse_observation(returncode: Any, stdout: str, stderr: str,
 
 
 def _run_powershell(auth: Any, script: str, timeout: float) -> tuple[int, str, str]:
-    _require_authorization(auth)
+    _require_any_authorization(auth)
     done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                           capture_output=True, text=True, timeout=timeout)
     return done.returncode, done.stdout, done.stderr
@@ -1027,7 +2059,7 @@ def observe_process(auth: Any, identity: ProcessIdentity, *,
     """One OS-level look at the child.  Incomplete network evidence: a
     connection opened and closed between looks, or name resolution done by
     the DNS Client service, is not seen."""
-    _require_authorization(auth)
+    _require_any_authorization(auth)
     run = runner or (lambda script, timeout: _run_powershell(auth, script, timeout))
     try:
         code, out, err = run(observation_script(identity.pid), OBSERVE_TIMEOUT_SECONDS)
@@ -1054,6 +2086,7 @@ class OrchestratorDeps:
     now: Callable[[], float]
     interpreter: str
     expected_head: str
+    python_paths: tuple[str, ...] = ()
 
 
 def production_orchestrator_deps(auth: Any) -> OrchestratorDeps:
@@ -1063,7 +2096,8 @@ def production_orchestrator_deps(auth: Any) -> OrchestratorDeps:
         launch=AppContainerLauncher(auth, Win32AppContainerApi(auth)),
         observe=lambda identity: observe_process(auth, identity),
         clock=time.monotonic, pause=time.sleep, now=time.time,
-        interpreter=sys.executable, expected_head=auth.expected_head)
+        interpreter=base_interpreter(), expected_head=auth.expected_head,
+        python_paths=venv_paths())
 
 
 @dataclass
@@ -1124,18 +2158,43 @@ def _read_result_problems(output_dir: Path, number: int, exit_status: Optional[i
     return result_problems(record, number, exit_status)
 
 
+def _state_fields() -> dict[str, Any]:
+    """Process evidence of a journal entry before anything was launched."""
+    return {"process_created": False, "execution_history": None, "liveness": None,
+            "handles_retained": False, "cleanup_errors": []}
+
+
+def _record_launch_failure(entry: dict[str, Any], exc: BaseException) -> None:
+    """A launch failure keeps whatever process evidence it carries."""
+    evidence = getattr(exc, "evidence", None)
+    if isinstance(evidence, Mapping):
+        entry.update(evidence)
+
+
+def _record_process_state(entry: dict[str, Any], handle: Any) -> None:
+    """A returned process was resumed, so it may have executed; its liveness
+    is confirmed only by an observed exit."""
+    entry["process_created"] = True
+    entry["execution_history"] = getattr(handle, "execution_history", MAY_HAVE_EXECUTED)
+    entry["liveness"] = CONFIRMED_EXITED if handle.returncode is not None \
+        else ALIVE_AT_LAST_CHECK
+    entry["handles_retained"] = handle.returncode is None
+    entry["cleanup_errors"] = list(getattr(handle, "cleanup_errors", []))
+
+
 def _run_one(number: int, output_dir: Path, token: str, deps: OrchestratorDeps,
              outcome: SeriesOutcome) -> Optional[str]:
     """Launch, watch and validate one child.  A stop reason, or None."""
     command = build_child_command(number, output_dir, series_token=token,
                                   expected_head=deps.expected_head,
-                                  interpreter=deps.interpreter)
+                                  interpreter=deps.interpreter,
+                                  python_paths=deps.python_paths)
     cid = command.calibration_id
     entry: dict[str, Any] = {
         "calibration_id": cid, "argv_fingerprint": command.argv_fingerprint,
         "environment_names": command.environment_names, "pid": None, "creation_time": None,
         "exit_status": None, "samples": 0, "observations": [], "result_problems": None,
-        "child_left_running": False,
+        "child_left_running": False, **_state_fields(),
     }
     outcome.runs.append(entry)
     _exclusive_json(_journal_path(output_dir, "launch", number), {
@@ -1149,6 +2208,7 @@ def _run_one(number: int, output_dir: Path, token: str, deps: OrchestratorDeps,
             handle = deps.launch(command, stdout, stderr)
         except Exception as exc:
             reason = f"{cid}: launch failed: {type(exc).__name__}: {exc}"[:500]
+            _record_launch_failure(entry, exc)
         if handle is not None:
             identity = ProcessIdentity(int(handle.pid), str(handle.creation_time))
             entry["pid"], entry["creation_time"] = identity.pid, identity.creation_time
@@ -1157,7 +2217,10 @@ def _run_one(number: int, output_dir: Path, token: str, deps: OrchestratorDeps,
                 "creation_time": identity.creation_time,
                 "argv_fingerprint": command.argv_fingerprint,
                 "environment_names": command.environment_names, "utc": _iso(deps.now())})
-            reason = _wait_for_child(handle, identity, deps, entry)
+            try:
+                reason = _wait_for_child(handle, identity, deps, entry)
+            finally:
+                _record_process_state(entry, handle)
     if handle is not None and reason is None:
         entry["exit_status"] = handle.returncode
         entry["result_problems"] = _read_result_problems(output_dir, number, handle.returncode)
@@ -1226,6 +2289,449 @@ def run_series(runs: int, output_dir: Path, deps: OrchestratorDeps) -> SeriesOut
 
 
 # ---------------------------------------------------------------------------
+# Isolation probe (never imports or runs the workload driver)
+# ---------------------------------------------------------------------------
+
+class _ForbiddenImports(importlib.abc.MetaPathFinder):
+    """Refuses (and records) any import of the workload driver."""
+
+    def __init__(self) -> None:
+        self.attempts: list[str] = []
+
+    def find_spec(self, name: str, path: Any = None, target: Any = None) -> Any:
+        if any(name == m or name.startswith(m + ".") for m in PROBE_FORBIDDEN_MODULES):
+            self.attempts.append(name)
+            raise ImportError(f"{name} is never imported by the isolation probe")
+        return None
+
+
+@dataclass
+class ProbeChildDeps:
+    """What a probe child needs, always given explicitly; tests pass fakes."""
+    token_info: Callable[[], Mapping[str, Any]]
+    connect: Callable[[int], None]
+    resolve: Callable[[str], Any]
+    import_module: Callable[[str], Any]
+    identity: Callable[[], tuple[int, str]]
+    wall: Callable[[], float]
+    guard_factory: Callable[[], NetworkGuard] = NetworkGuard
+
+
+#: Windows Sockets error codes of a loopback connection attempt.
+WSAEACCES, WSAENETUNREACH, WSAETIMEDOUT, WSAECONNREFUSED, WSAEHOSTUNREACH = (
+    10013, 10051, 10060, 10061, 10065)
+PROBE_SCOPE_NOTE = ("only the denial of a loopback connection to the orchestrator's local "
+                    "test listener is tested; denial of external (non-loopback) network "
+                    "access is NOT tested")
+
+
+def classify_loopback_attempt(exc: Optional[BaseException]) -> dict[str, Any]:
+    """The probe's loopback evidence.  Only an access-denied result
+    (WSAEACCES, 10013) counts as denial; refusal, timeout, unreachable and
+    anything else are inconclusive, and a connection is a failure."""
+    if exc is None:
+        return {"outcome": "connected", "denied": False, "inconclusive": False,
+                "error": None, "errno": None, "winerror": None}
+    winerror = getattr(exc, "winerror", None)
+    error_number = getattr(exc, "errno", None)
+    if isinstance(exc, OSError) and winerror == WSAEACCES:
+        outcome = "access_denied"
+    elif isinstance(exc, ConnectionRefusedError) or winerror == WSAECONNREFUSED:
+        outcome = "refused"
+    elif isinstance(exc, TimeoutError) or winerror == WSAETIMEDOUT:
+        outcome = "timeout"
+    elif winerror in (WSAENETUNREACH, WSAEHOSTUNREACH) or error_number in (
+            getattr(errno_module, "ENETUNREACH", None), getattr(errno_module, "EHOSTUNREACH", None)):
+        outcome = "unreachable"
+    else:
+        outcome = "other"
+    return {"outcome": outcome, "denied": outcome == "access_denied",
+            "inconclusive": outcome != "access_denied", "error": type(exc).__name__,
+            "errno": error_number, "winerror": winerror}
+
+
+def _loopback_connect(auth: Any, port: int) -> None:
+    """The one connection attempt of the probe: to the orchestrator's own
+    test listener on 127.0.0.1.  Inside the AppContainer it must be refused
+    with access denied."""
+    _require_probe_authorization(auth)
+    import socket
+    with socket.create_connection(("127.0.0.1", int(port)),
+                                  timeout=PROBE_CONNECT_TIMEOUT_SECONDS):
+        pass
+
+
+def _resolve(auth: Any, name: str) -> Any:
+    _require_probe_authorization(auth)
+    if name != PROBE_DNS_NAME:
+        raise CalibrationError("the probe resolves only localhost")
+    import socket
+    return socket.getaddrinfo(name, None)
+
+
+def production_probe_child_deps(auth: Any) -> ProbeChildDeps:
+    """The real dependencies of an authorized probe child."""
+    auth = _require_probe_authorization(auth)
+    win32 = CtypesWin32(auth)
+    return ProbeChildDeps(token_info=win32.current_token_info,
+                          connect=lambda port: _loopback_connect(auth, port),
+                          resolve=lambda name: _resolve(auth, name),
+                          import_module=importlib.import_module,
+                          identity=lambda: (os.getpid(), sys.executable), wall=time.time)
+
+
+def probe_result_path(output_dir: Path, probe_id: str) -> Path:
+    return Path(output_dir) / f"{probe_id}.json"
+
+
+def probe_child_main(probe_id: str, output_dir: Path, deps: ProbeChildDeps, *,
+                     series_token: str, port: int) -> int:
+    """
+    The probe inside the AppContainer: ownership -> own token -> loopback
+    attempt (must be refused with access denied) -> localhost lookup
+    (supplementary) -> the dependency imports under the network guard.  The
+    workload driver is refused at import.  Every outcome is written to the
+    probe's result.
+    """
+    if not isinstance(deps, ProbeChildDeps):
+        raise TypeError("probe_child_main needs explicit ProbeChildDeps")
+    if not isinstance(probe_id, str) or not PROBE_ID_RE.fullmatch(probe_id):
+        raise CalibrationError("a probe id is probe-01 .. probe-05")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise CalibrationError("the probe listener port must be 1024-65535")
+    output_dir = check_output_dir(output_dir)
+    path = probe_result_path(output_dir, probe_id)
+    if path.exists():
+        raise CalibrationError(f"{path} exists; a probe is never repeated")
+    _check_owner(output_dir, probe_id, series_token, PROBE_OWNER_FILE)
+    forbidden = _ForbiddenImports()
+    sys.meta_path.insert(0, forbidden)
+    guard: Optional[NetworkGuard] = None
+    pid, executable = deps.identity()
+    record: dict[str, Any] = {
+        "probe_id": probe_id,
+        "kind": "AppContainer isolation probe; the workload driver is never imported",
+        "scope": PROBE_SCOPE_NOTE,
+        "started_utc": _iso(deps.wall()), "python": platform.python_version(),
+        "executable": executable, "pid": pid, "os": _os_description(), "port": port,
+        "status": "failed", "token": None, "token_problems": None, "loopback": None,
+        "dns": None, "imports": {}, "network_guard_violations": [],
+        "dns_note": "supplementary evidence only; a failed lookup does not prove isolation",
+    }
+    status = EXIT_PROBE_FAILED
+    try:
+        token = dict(deps.token_info())
+        record["token"] = token
+        record["token_problems"] = validate_app_container_token(
+            token, AUTHORIZED_APPCONTAINER_SID, check_loopback=False)
+        try:
+            deps.connect(port)
+            record["loopback"] = classify_loopback_attempt(None)
+        except OSError as exc:
+            record["loopback"] = classify_loopback_attempt(exc)
+        try:
+            deps.resolve(PROBE_DNS_NAME)
+            record["dns"] = {"name": PROBE_DNS_NAME, "resolved": True}
+        except OSError as exc:
+            record["dns"] = {"name": PROBE_DNS_NAME, "resolved": False,
+                             "error": type(exc).__name__}
+        guard = deps.guard_factory().install()
+        for name in PROBE_IMPORTS:
+            try:
+                deps.import_module(name)
+                record["imports"][name] = "ok"
+            except Exception as exc:
+                record["imports"][name] = f"{type(exc).__name__}: {exc}"[:300]
+        passed = (record["token_problems"] == []
+                  and record["loopback"]["outcome"] == "access_denied"
+                  and all(v == "ok" for v in record["imports"].values())
+                  and not guard.violations and not forbidden.attempts)
+        record["status"] = "passed" if passed else "failed"
+        status = EXIT_OK if passed else EXIT_PROBE_FAILED
+    except Exception as exc:  # recorded as evidence; never retried
+        record["status"] = "failed"
+        record["failure"] = f"{type(exc).__name__}: {exc}"[:500]
+    finally:
+        if guard is not None:
+            record["network_guard_violations"] = list(guard.violations)
+            record["stubbed_native_imports"] = sorted(set(guard.stubbed_imports))
+            guard.uninstall()
+        if forbidden in sys.meta_path:
+            sys.meta_path.remove(forbidden)
+        record["forbidden_import_attempts"] = list(forbidden.attempts)
+        record["driver_loaded"] = any(m in sys.modules for m in PROBE_FORBIDDEN_MODULES)
+        if record["network_guard_violations"]:
+            record["status"], status = "network_violation", EXIT_NETWORK
+        elif record["driver_loaded"] or forbidden.attempts:
+            record["status"], status = "failed", EXIT_PROBE_FAILED
+        record["finished_utc"] = _iso(deps.wall())
+        record["child_exit_status"] = status
+        _exclusive_json(path, record)
+    return status
+
+
+def probe_result_problems(record: Any, probe_id: str, exit_status: Optional[int], *,
+                          expected_pid: Any, expected_executable: Any,
+                          expected_sid: Any, expected_port: Any) -> list[str]:
+    """Why a probe result is not a pass for exactly the launched, validated
+    process; empty when it is."""
+    if not isinstance(record, Mapping):
+        return ["the probe result is not a JSON object"]
+    problems: list[str] = []
+    for key, value in (("probe_id", probe_id), ("status", "passed"),
+                       ("child_exit_status", EXIT_OK)):
+        if record.get(key) != value:
+            problems.append(f"{key} is {record.get(key)!r}, expected {value!r}")
+    if exit_status != EXIT_OK or record.get("child_exit_status") != exit_status:
+        problems.append(f"actual probe exit status {exit_status!r} is not a recorded pass")
+    if record.get("token_problems") != []:
+        problems.append("the probe's own token did not validate")
+    loopback = record.get("loopback")
+    if not isinstance(loopback, Mapping) or loopback.get("outcome") != "access_denied" \
+            or loopback.get("winerror") != WSAEACCES:
+        outcome = loopback.get("outcome") if isinstance(loopback, Mapping) else None
+        problems.append(f"the loopback attempt was not denied with WSAEACCES "
+                        f"(outcome {outcome!r})")
+    imports = record.get("imports")
+    if not isinstance(imports, Mapping) or set(imports) != set(PROBE_IMPORTS) \
+            or any(v != "ok" for v in imports.values()):
+        problems.append("the dependency imports did not all succeed")
+    if record.get("network_guard_violations") != []:
+        problems.append("network guard violations are recorded or missing")
+    if record.get("forbidden_import_attempts") != [] or record.get("driver_loaded") is not False:
+        problems.append("the workload driver was imported or attempted")
+    if expected_pid is None or record.get("pid") != expected_pid:
+        problems.append("the probe result was written by another process (PID differs)")
+    if not expected_executable or _norm_image(record.get("executable")) != \
+            _norm_image(expected_executable):
+        problems.append("the probe result names another executable")
+    token = record.get("token")
+    if not expected_sid or not isinstance(token, Mapping) or \
+            token.get("app_container_sid") != expected_sid:
+        problems.append("the probe's own token is not the validated AppContainer SID")
+    if record.get("port") != expected_port:
+        problems.append("the probe attempted another port")
+    return problems
+
+
+class LoopbackListener:
+    """The probe's dedicated, harmless test listener: 127.0.0.1, an
+    ephemeral port, never reads data; connections are only counted.
+    control() is the positive control from outside the AppContainer."""
+
+    def __init__(self, auth: Any) -> None:
+        self._auth = _require_probe_authorization(auth)
+        import socket
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self._socket.bind(("127.0.0.1", 0))
+            self._socket.listen(4)
+            self._socket.setblocking(False)
+        except BaseException:
+            self._socket.close()
+            raise
+        self.port: int = self._socket.getsockname()[1]
+
+    def control(self) -> None:
+        """One connection from the orchestrator itself; it must succeed."""
+        _require_probe_authorization(self._auth)
+        import socket
+        with socket.create_connection(("127.0.0.1", self.port),
+                                      timeout=PROBE_CONNECT_TIMEOUT_SECONDS):
+            pass
+
+    def connections(self) -> int:
+        count = 0
+        while True:
+            try:
+                connection, _ = self._socket.accept()
+            except (BlockingIOError, InterruptedError):
+                return count
+            connection.close()
+            count += 1
+
+    def close(self) -> None:
+        self._socket.close()
+
+
+@dataclass
+class ProbeDeps:
+    """What the probe orchestrator needs, always given explicitly."""
+    launch: Callable[[ChildCommand, Any, Any], Any]
+    observe: Callable[[ProcessIdentity], Observation]
+    listener: Callable[[], Any]
+    clock: Callable[[], float]
+    pause: Callable[[float], None]
+    now: Callable[[], float]
+    interpreter: str
+    expected_head: str
+    python_paths: tuple[str, ...] = ()
+
+
+def production_probe_deps(auth: Any) -> ProbeDeps:
+    """The real dependencies of an authorized probe."""
+    auth = _require_probe_authorization(auth)
+    return ProbeDeps(
+        launch=AppContainerLauncher(auth, Win32AppContainerApi(auth)),
+        observe=lambda identity: observe_process(auth, identity),
+        listener=lambda: LoopbackListener(auth),
+        clock=time.monotonic, pause=time.sleep, now=time.time,
+        interpreter=base_interpreter(), expected_head=auth.expected_head,
+        python_paths=venv_paths())
+
+
+@dataclass
+class ProbeOutcome:
+    passed: bool = False
+    stopped_reason: Optional[str] = None
+    ownership_released: bool = False
+    entry: dict[str, Any] = field(default_factory=dict)
+
+
+def _read_probe_problems(output_dir: Path, probe_id: str, exit_status: Optional[int],
+                         **expected: Any) -> list[str]:
+    path = probe_result_path(output_dir, probe_id)
+    if not path.exists():
+        return ["no probe result file"]
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"the probe result is unreadable: {type(exc).__name__}"]
+    return probe_result_problems(record, probe_id, exit_status, **expected)
+
+
+def _control(listener: Any, entry: dict[str, Any], key: str) -> Optional[str]:
+    """Positive control: the orchestrator's own connection must arrive."""
+    try:
+        listener.control()
+        entry[key] = listener.connections()
+    except Exception as exc:
+        entry[key] = None
+        return f"the listener control connection failed ({type(exc).__name__})"
+    if entry[key] != 1:
+        return f"the listener counted {entry[key]} control connections, not 1"
+    return None
+
+
+def run_probe(probe_id: str, output_dir: Path, deps: ProbeDeps) -> ProbeOutcome:
+    """
+    One isolation probe under ACTIVE_PROBE: listener -> positive control
+    (1 connection) -> launch in the AppContainer -> observe until exit ->
+    the listener must have received 0 connections from the child -> second
+    positive control (1 connection) -> the probe result must be a pass for
+    exactly the launched process.  Never retried; a record is written in
+    every case; ownership is released only after a pass.
+    """
+    if not isinstance(deps, ProbeDeps):
+        raise TypeError("run_probe needs explicit ProbeDeps")
+    if not isinstance(probe_id, str) or not PROBE_ID_RE.fullmatch(probe_id):
+        raise CalibrationError("a probe id is probe-01 .. probe-05")
+    output_dir = check_output_dir(output_dir)
+    for existing in (probe_result_path(output_dir, probe_id),
+                     _journal_path(output_dir, "launch", probe_id)):
+        if existing.exists():
+            raise CalibrationError(f"{existing.name} exists; a probe is never repeated")
+    owner, token = claim_series(output_dir, calibration_ids=[probe_id],
+                                expected_head=deps.expected_head, now=deps.now,
+                                owner_file=PROBE_OWNER_FILE)
+    outcome = ProbeOutcome()
+    entry: dict[str, Any] = {
+        "calibration_id": probe_id, "argv_fingerprint": None, "environment_names": None,
+        "pid": None, "creation_time": None, "exit_status": None, "samples": 0,
+        "observations": [], "child_left_running": False, "listener_port": None,
+        "listener_control_before": None, "listener_child_connections": None,
+        "listener_control_after": None, "result_problems": None, **_state_fields(),
+    }
+    outcome.entry = entry
+    listener = None
+    reason: Optional[str] = None
+    try:
+        listener = deps.listener()
+        entry["listener_port"] = listener.port
+        reason = _control(listener, entry, "listener_control_before")
+        if reason is not None:
+            reason = f"{probe_id}: listener not verified before launch: {reason}"
+            return outcome
+        command = build_probe_command(probe_id, output_dir, series_token=token,
+                                      expected_head=deps.expected_head,
+                                      interpreter=deps.interpreter, port=listener.port,
+                                      python_paths=deps.python_paths)
+        entry["argv_fingerprint"] = command.argv_fingerprint
+        entry["environment_names"] = command.environment_names
+        _exclusive_json(_journal_path(output_dir, "launch", probe_id), {
+            "probe_id": probe_id, "argv_fingerprint": command.argv_fingerprint,
+            "environment_names": command.environment_names, "utc": _iso(deps.now())})
+        command.temp_dir.mkdir(parents=True, exist_ok=False)
+        handle = None
+        with open(command.stdout_path, "xb") as stdout, \
+                open(command.stderr_path, "xb") as stderr:
+            try:
+                handle = deps.launch(command, stdout, stderr)
+            except Exception as exc:
+                reason = f"{probe_id}: launch failed: {type(exc).__name__}: {exc}"[:500]
+                _record_launch_failure(entry, exc)
+            if handle is not None:
+                identity = ProcessIdentity(int(handle.pid), str(handle.creation_time))
+                entry["pid"], entry["creation_time"] = identity.pid, identity.creation_time
+                _exclusive_json(_journal_path(output_dir, "process", probe_id), {
+                    "probe_id": probe_id, "pid": identity.pid,
+                    "creation_time": identity.creation_time,
+                    "argv_fingerprint": command.argv_fingerprint, "utc": _iso(deps.now())})
+                try:
+                    reason = _wait_for_child(handle, identity, deps, entry)
+                finally:
+                    _record_process_state(entry, handle)
+        if handle is not None and reason is None:
+            entry["exit_status"] = handle.returncode
+            entry["listener_child_connections"] = listener.connections()
+            if entry["listener_child_connections"]:
+                reason = f"{probe_id}: the test listener was reached: loopback is NOT denied"
+        if handle is not None and reason is None:
+            control = _control(listener, entry, "listener_control_after")
+            if control is not None:
+                reason = f"{probe_id}: listener not verified after the child: {control}"
+        if handle is not None and reason is None:
+            entry["result_problems"] = _read_probe_problems(
+                output_dir, probe_id, handle.returncode, expected_pid=identity.pid,
+                expected_executable=deps.interpreter, expected_sid=AUTHORIZED_APPCONTAINER_SID,
+                expected_port=listener.port)
+            if entry["result_problems"]:
+                reason = f"{probe_id}: probe failed: {entry['result_problems'][0]}"
+    except Exception as exc:
+        reason = f"probe failed: {type(exc).__name__}: {exc}"[:500]
+    except BaseException as exc:
+        reason = f"probe interrupted: {type(exc).__name__}"
+        raise
+    finally:
+        if listener is not None:
+            try:
+                if entry["listener_child_connections"] is None and \
+                        entry["listener_control_before"] == 1:
+                    entry["listener_child_connections"] = listener.connections()
+            except Exception as exc:
+                entry["observations"].append(f"listener check failed: {type(exc).__name__}")
+            finally:
+                listener.close()
+        outcome.stopped_reason = reason
+        outcome.passed = reason is None
+        _exclusive_json(_journal_path(output_dir, "complete", probe_id),
+                        {**entry, "stop_reason": reason, "utc": _iso(deps.now())})
+        _exclusive_json(output_dir / f"probe-record-{probe_id}-{int(deps.now())}.json", {
+            "probe_id": probe_id, "passed": outcome.passed, "stopped_reason": reason,
+            "run": entry, "ownership": "released" if outcome.passed else "retained for review",
+            "scope": PROBE_SCOPE_NOTE,
+            "note": "a pass shows that this loopback attempt was refused with access denied "
+                    "while the listener was demonstrably reachable from outside, and that "
+                    "this run's observations were clean; it is not a proof of complete "
+                    "isolation, and the localhost lookup is supplementary evidence only",
+        })
+        if outcome.passed:
+            owner.unlink()
+            outcome.ownership_released = True
+    return outcome
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1235,19 +2741,44 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
                                      description="Generator-only start-lag calibration "
                                                  "(condition A). Without --execute it plans.")
     parser.add_argument("--runs", type=int, default=MAX_RUNS)
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT))
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--authorize", action="append", default=[], metavar="CAL_ID")
     parser.add_argument("--expect-head", default=None)
+    parser.add_argument("--probe", default=None, metavar="PROBE_ID",
+                        help="run one AppContainer isolation probe (separately gated)")
     parser.add_argument("--child", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--probe-child", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--port", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--token", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    probing = args.probe is not None or args.probe_child is not None
     try:
-        output_dir = check_output_dir(Path(args.output_dir))
+        output_dir = check_output_dir(Path(args.output_dir or (
+            DEFAULT_PROBE_OUTPUT if probing else DEFAULT_OUTPUT)))
         if not 1 <= args.runs <= MAX_RUNS:
             raise CalibrationError(f"--runs must be 1-{MAX_RUNS}")
     except CalibrationError as exc:
         parser.error(str(exc))
+    if args.probe_child is not None:
+        try:
+            auth = authorize_probe(args.probe_child, args.expect_head)
+            return probe_child_main(args.probe_child, output_dir,
+                                    production_probe_child_deps(auth),
+                                    series_token=args.token, port=args.port)
+        except CalibrationError as exc:
+            sys.stderr.write(f"calibrate_generator: error: {exc}\n")
+            return 2
+    if args.probe is not None:
+        try:
+            auth = authorize_probe(args.probe, args.expect_head)
+            probe = run_probe(args.probe, output_dir, production_probe_deps(auth))
+        except CalibrationError as exc:
+            sys.stderr.write(f"calibrate_generator: error: {exc}\n")
+            return 2
+        out.write(f"probe {args.probe}: {'passed' if probe.passed else 'FAILED'}; "
+                  f"stopped: {probe.stopped_reason}\n")
+        return 0 if probe.passed else 1
     if args.child is not None:
         try:
             auth = authorize([calibration_id(args.child)], args.expect_head)
