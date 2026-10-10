@@ -857,12 +857,23 @@ class ContainmentAdapter:
         self.errors.append(f"{key}: {message}")
         return ContainmentRefused(key, message)
 
-    def _retain_child(self) -> None:
-        """A child exists but is not verified: the job handle is retained
-        (closing it would terminate the child) and nothing is retried."""
-        if self.controller is not None and self.controller.ownership in (
-                "owned_empty", "owned_with_child"):
-            self.controller.ownership, self.controller.membership = "retained_unverified", None
+    def _retain_child(self, cause: Optional[BaseException] = None) -> None:
+        """A child may exist and is not verified: the job handle is retained
+        (closing it would terminate the child) and nothing is retried.  A
+        retention that cannot be confirmed is refused explicitly, never
+        assumed safe."""
+        controller = self.controller
+        try:
+            if controller is not None and controller.ownership in (
+                    "owned_empty", "owned_with_child"):
+                controller.ownership, controller.membership = "retained_unverified", None
+            retained = controller is not None and controller.ownership in (
+                "retained_unverified", "retained_close_failed")
+        except Exception:
+            retained = False
+        if not retained:
+            raise self._refuse("retention_failed", "the job could not be confirmed retained "
+                                                   "after an uncertain creation outcome") from cause
 
     def prepare(self, stdout: Any, stderr: Any) -> ContainmentResult:
         C._require_any_authorization(self.auth)
@@ -880,18 +891,20 @@ class ContainmentAdapter:
             raise self._refuse("plan_refused", str(exc)) from None
         try:
             created = self._create(plan)        # exactly once; never a fallback
-        except C.ExecutionDisabled:
+        except BaseException as exc:
+            # Entered the creator: an exception never proves that no child was created.
+            self._retain_child(exc)
+            if isinstance(exc, Exception) and not isinstance(exc, C.ExecutionDisabled):
+                raise self._refuse("creation_failed", f"{type(exc).__name__}: {exc}") from None
             raise
-        except Exception as exc:
-            raise self._refuse("creation_failed", f"{type(exc).__name__}: {exc}") from None
         try:
             return self._bind(plan, job, created)
-        except (C.ExecutionDisabled, ContainmentRefused, JobFailure, ProvenanceRefused):
-            self._retain_child()
+        except BaseException as exc:
+            self._retain_child(exc)
+            if isinstance(exc, Exception) and not isinstance(exc, (
+                    C.ExecutionDisabled, ContainmentRefused, JobFailure, ProvenanceRefused)):
+                raise self._refuse("not_in_job", f"{type(exc).__name__}: {exc}") from None
             raise
-        except Exception as exc:
-            self._retain_child()
-            raise self._refuse("not_in_job", f"{type(exc).__name__}: {exc}") from None
 
     def _bind(self, plan: AttributePlan, job: int, created: Any) -> ContainmentResult:
         if not isinstance(created, C.Win32Handles):

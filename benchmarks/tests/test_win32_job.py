@@ -1442,17 +1442,109 @@ class TestContainmentAdapter:
         with pytest.raises(W.ContainmentRefused, match="no creation result"):
             prepare(adapter)
 
+    def test_failure_before_the_creator_is_entered_keeps_owned_empty(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(monkeypatch)
+        with pytest.raises(W.ContainmentRefused, match="plan_refused"):
+            adapter.prepare(JOB, STDERR_HANDLE)
+        assert creation.plans == []                       # the creator was never entered
+        assert adapter.controller.ownership == "owned_empty"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
     def test_creation_failure_has_no_fallback(self, monkeypatch):
         adapter, kernel32, creation = make_adapter(
             monkeypatch, creation=FakeCreation(raises=C.Win32Error("CreateProcessW", 5)))
         with pytest.raises(W.ContainmentRefused, match="creation_failed"):
             prepare(adapter)
         assert len(creation.plans) == 1
-        assert adapter.controller.ownership == "owned_empty"
+        assert adapter.controller.ownership == "retained_unverified"   # outcome unknown
+        assert adapter.controller.membership is None
         assert kernel32.closed == [] and kernel32.terminated == []
         with pytest.raises(W.ContainmentRefused, match="already used"):
             prepare(adapter)
-        assert len(creation.plans) == 1
+        assert len(creation.plans) == 1                   # no retry
+
+    def test_side_effect_then_exception_retains_and_blocks_close(self, monkeypatch):
+        class SideEffectCreation(FakeCreation):
+            child_created = False
+
+            def create(self, plan):
+                self.plans.append(plan)
+                self.child_created = True                 # a suspended child now exists
+                raise RuntimeError("failed after the child was created")
+
+        creation = SideEffectCreation()
+        # The unsafe case: nothing in the job, so an accounting check alone would pass.
+        adapter, kernel32, _ = make_adapter(
+            monkeypatch, creation=creation,
+            accounting={"active": 0, "total": 0, "terminated": 0})
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        assert creation.child_created and adapter.controller.ownership == "retained_unverified"
+        with pytest.raises(W.JobFailure, match="unsafe_close_refused"):
+            adapter.controller.close()
+        assert kernel32.closed == [] and kernel32.terminated == []
+        assert adapter.controller.ownership == "retained_unverified"
+
+    def test_creator_execution_disabled_propagates_and_retains(self, monkeypatch):
+        error = C.ExecutionDisabled("gate closed while creating")
+        adapter, kernel32, creation = make_adapter(monkeypatch,
+                                                   creation=FakeCreation(raises=error))
+        with pytest.raises(C.ExecutionDisabled) as raised:
+            prepare(adapter)
+        assert raised.value is error
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == [] and len(creation.plans) == 1
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(3),
+                                           GeneratorExit()])
+    def test_creator_base_exception_propagates_unchanged_and_retains(self, monkeypatch,
+                                                                     interrupt):
+        adapter, kernel32, creation = make_adapter(monkeypatch,
+                                                   creation=FakeCreation(raises=interrupt))
+        with pytest.raises(type(interrupt)) as raised:
+            prepare(adapter)
+        assert raised.value is interrupt
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == [] and len(creation.plans) == 1
+
+    @pytest.mark.parametrize("error", [KeyboardInterrupt(), SystemExit(1),
+                                       RuntimeError("bind broke"), C.ExecutionDisabled("x")])
+    def test_bind_abnormal_exit_retains(self, monkeypatch, error):
+        adapter, kernel32, creation = make_adapter(monkeypatch)
+
+        def broken(self, plan, job, created):
+            raise error
+
+        monkeypatch.setattr(W.ContainmentAdapter, "_bind", broken)
+        expected = W.ContainmentRefused if type(error) is RuntimeError else type(error)
+        with pytest.raises(expected) as raised:
+            prepare(adapter)
+        if expected is type(error):
+            assert raised.value is error                  # propagated unchanged
+        else:
+            assert raised.value.key == "not_in_job"
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == [] and len(creation.plans) == 1
+
+    def test_unconfirmed_retention_is_an_explicit_failure(self, monkeypatch):
+        class StubbornController(W.JobController):
+            @property
+            def ownership(self):
+                return self.__dict__.get("_o", "none")
+
+            @ownership.setter
+            def ownership(self, value):
+                if value != "retained_unverified":      # retention silently does not stick
+                    self.__dict__["_o"] = value
+
+        monkeypatch.setattr(W, "JobController", StubbornController)
+        original = RuntimeError("creator failed")
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=FakeCreation(raises=original))
+        with pytest.raises(W.ContainmentRefused, match="retention_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "retention_failed" and raised.value.__cause__ is original
+        assert kernel32.closed == [] and kernel32.terminated == []
 
     @pytest.mark.parametrize("pid, process", [(0, PROCESS), (True, PROCESS), ("1", PROCESS),
                                               (PID, 0), (PID, None), (PID, -1)])
