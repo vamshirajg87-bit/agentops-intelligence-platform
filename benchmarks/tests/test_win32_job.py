@@ -1270,3 +1270,259 @@ class TestNaturalExitAndClose:
         assert W.OWNERSHIP_STATES == (
             "none", "owned_empty", "owned_with_child", "child_exited",
             "retained_unverified", "retained_close_failed", "closed")
+
+
+# ---------------------------------------------------------------------------
+# Offline containment adapter
+# ---------------------------------------------------------------------------
+
+THREAD = 0x102
+
+
+def good_receipt(job=JOB, **changes):
+    fields = {"applied_attributes": C.PLAN_ATTRIBUTES, "job_list_handles": (job,),
+              "create_process_ok": True, "planned": True}
+    fields.update(changes)
+    return C.CreationReceipt(**fields)
+
+
+class FakeCreation:
+    """An injected creator and identity reader; no native layer."""
+
+    def __init__(self, receipt="good", pid=PID, process=PROCESS, raises=None,
+                 identity=None):
+        self.receipt, self.pid, self.process, self.raises = receipt, pid, process, raises
+        self.plans, self.identity_calls = [], []
+        self.identity = identity if identity is not None else (lambda p: (PID, CREATED))
+
+    def create(self, plan):
+        self.plans.append(plan)
+        if self.raises:
+            raise self.raises
+        receipt = good_receipt(plan.entries[-1].handles[0]) if self.receipt == "good" \
+            else self.receipt
+        return C.Win32Handles(self.process, THREAD, self.pid, 77, receipt=receipt)
+
+    def process_identity(self, process):
+        self.identity_calls.append(process)
+        return self.identity(process)
+
+
+def make_adapter(monkeypatch, *, integrated=True, creation=None, **kernel_overrides):
+    api, kernel32 = make_api(monkeypatch, **kernel_overrides)
+    creation = creation or FakeCreation()
+    monkeypatch.setattr(W, "JOB_LIST_CREATION_INTEGRATED", integrated)
+    adapter = W.ContainmentAdapter(api.auth, api, create=creation.create,
+                                   process_identity=creation.process_identity)
+    return adapter, kernel32, creation
+
+
+def prepare(adapter):
+    return adapter.prepare(STDOUT_HANDLE, STDERR_HANDLE)
+
+
+class TestContainmentAdapter:
+    def test_success_with_in_memory_gate(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(monkeypatch)
+        result = prepare(adapter)
+        assert (result.job, result.pid, result.creation_time) == (JOB, PID, CREATED)
+        assert isinstance(result.assertion, W.CreationAssertion)
+        assert result.assertion.seal is W._CREATION_SEAL
+        assert result.membership.evidence["job_assignment"] == "assigned_at_creation"
+        assert P.job_membership_problems(result.membership.evidence, expected_pid=PID,
+                                         expected_creation_time=CREATED) == []
+        assert adapter.controller.ownership == "owned_with_child"
+        assert len(creation.plans) == 1
+        assert [e.name for e in creation.plans[0].entries] == [
+            "security_capabilities", "handle_list", "job_list"]
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_no_assertion_while_the_gate_is_closed(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(monkeypatch, integrated=False)
+        with pytest.raises(W.ProvenanceRefused, match="no JOB_LIST integration"):
+            prepare(adapter)
+        assert W.JOB_LIST_CREATION_INTEGRATED is False
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_parent_in_job_refuses_before_any_job_exists(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(monkeypatch, parent_in_job=1)
+        with pytest.raises(W.ContainmentRefused) as raised:
+            prepare(adapter)
+        assert raised.value.key == W.PARENT_JOB_REFUSAL
+        assert creation.plans == [] and kernel32.created_with is None
+        assert "CreateJobObjectW" not in kernel32.log and adapter.controller is None
+
+    def test_unknown_parent_status_refuses(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(monkeypatch, fail={"IsProcessInJob"})
+        with pytest.raises(W.ContainmentRefused, match="unknown") as raised:
+            prepare(adapter)
+        assert raised.value.key == W.PARENT_JOB_REFUSAL
+        assert creation.plans == [] and "CreateJobObjectW" not in kernel32.log
+
+    @pytest.mark.parametrize("fail, key", [
+        ({"CreateJobObjectW"}, "create_job_failed"),
+        ({"SetInformationJobObject"}, "set_job_information_failed")])
+    def test_configuration_failure(self, monkeypatch, fail, key):
+        adapter, kernel32, creation = make_adapter(monkeypatch, fail=fail)
+        with pytest.raises(W.JobFailure) as raised:
+            prepare(adapter)
+        assert raised.value.key == key
+        assert creation.plans == []
+
+    def test_wrong_readback_refuses(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(monkeypatch, readback=(0, 0))
+        with pytest.raises(W.JobFailure) as raised:
+            prepare(adapter)
+        assert raised.value.key == "job_readback_mismatch" and creation.plans == []
+
+    def test_inheritable_job_handle_refuses(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(monkeypatch, inherit_flags=1)
+        with pytest.raises(W.JobFailure) as raised:
+            prepare(adapter)
+        assert raised.value.key == "inheritable_job_handle" and creation.plans == []
+
+    @pytest.mark.parametrize("stdout, stderr", [
+        (JOB, STDERR_HANDLE), (STDOUT_HANDLE, STDOUT_HANDLE), (0, STDERR_HANDLE),
+        (STDOUT_HANDLE, None)])
+    def test_bad_output_handles_refuse_before_creation(self, monkeypatch, stdout, stderr):
+        adapter, kernel32, creation = make_adapter(monkeypatch)
+        with pytest.raises(W.ContainmentRefused, match="plan_refused"):
+            adapter.prepare(stdout, stderr)
+        assert creation.plans == []
+
+    @pytest.mark.parametrize("receipt, message", [
+        (None, "no creation receipt"),
+        (good_receipt(planned=False, applied_attributes=C.PLAN_ATTRIBUTES[:2],
+                      job_list_handles=()), "legacy/unplanned"),
+        (good_receipt(applied_attributes=C.PLAN_ATTRIBUTES[:2]), "JOB_LIST was not applied"),
+        (good_receipt(applied_attributes=C.PLAN_ATTRIBUTES[1:]), "incomplete"),
+        (good_receipt(applied_attributes=(C.PLAN_ATTRIBUTES[1], C.PLAN_ATTRIBUTES[0],
+                                          C.PLAN_ATTRIBUTES[2])), "reordered"),
+        (good_receipt(applied_attributes=C.PLAN_ATTRIBUTES + (C.PLAN_ATTRIBUTES[0],)),
+         "duplicate"),
+        (good_receipt(applied_attributes=C.PLAN_ATTRIBUTES + (0x20010,)), "unexpected"),
+        (good_receipt(job_list_handles=(0x900,)), "another job"),
+        (good_receipt(job_list_handles=(JOB, 0x900)), "another job"),
+        (good_receipt(job_list_handles=()), "another job"),
+        (good_receipt(create_process_ok=False), "CreateProcessW success"),
+        (good_receipt(create_process_ok=1), "CreateProcessW success"),
+        (good_receipt(applied_attributes=list(C.PLAN_ATTRIBUTES)), "malformed"),
+        (object(), "not a CreationReceipt"),
+        ({"applied_attributes": C.PLAN_ATTRIBUTES}, "not a CreationReceipt"),
+    ])
+    def test_bad_receipts_refuse_without_an_assertion(self, monkeypatch, receipt, message):
+        adapter, kernel32, creation = make_adapter(monkeypatch,
+                                                   creation=FakeCreation(receipt=receipt))
+        minted = []
+        real = W._assert_created_with_job_list
+        monkeypatch.setattr(W, "_assert_created_with_job_list",
+                            lambda *a: minted.append(a) or real(*a))
+        with pytest.raises(W.ContainmentRefused, match=message):
+            prepare(adapter)
+        assert minted == [] and creation.identity_calls == []
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+        assert len(creation.plans) == 1                  # no retry, no fallback
+
+    def test_a_caller_supplied_receipt_is_never_consulted(self, monkeypatch):
+        # prepare() has no receipt parameter: only the creator's own result counts.
+        adapter, _, creation = make_adapter(monkeypatch,
+                                            creation=FakeCreation(receipt=None))
+        with pytest.raises(W.ContainmentRefused, match="no creation receipt"):
+            prepare(adapter)
+        with pytest.raises(TypeError):
+            adapter.prepare(STDOUT_HANDLE, STDERR_HANDLE, receipt=good_receipt())
+
+    @pytest.mark.parametrize("created", [None, object(), "handles"])
+    def test_missing_or_foreign_creation_result_refuses(self, monkeypatch, created):
+        creation = FakeCreation(receipt=None)
+        creation.create = lambda plan: created
+        adapter, _, _ = make_adapter(monkeypatch, creation=creation)
+        with pytest.raises(W.ContainmentRefused, match="no creation result"):
+            prepare(adapter)
+
+    def test_creation_failure_has_no_fallback(self, monkeypatch):
+        adapter, kernel32, creation = make_adapter(
+            monkeypatch, creation=FakeCreation(raises=C.Win32Error("CreateProcessW", 5)))
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        assert len(creation.plans) == 1
+        assert adapter.controller.ownership == "owned_empty"
+        assert kernel32.closed == [] and kernel32.terminated == []
+        with pytest.raises(W.ContainmentRefused, match="already used"):
+            prepare(adapter)
+        assert len(creation.plans) == 1
+
+    @pytest.mark.parametrize("pid, process", [(0, PROCESS), (True, PROCESS), ("1", PROCESS),
+                                              (PID, 0), (PID, None), (PID, -1)])
+    def test_malformed_process_identity_refuses(self, monkeypatch, pid, process):
+        adapter, _, _ = make_adapter(monkeypatch,
+                                     creation=FakeCreation(pid=pid, process=process))
+        with pytest.raises(W.ContainmentRefused, match="not_in_job"):
+            prepare(adapter)
+        assert adapter.controller.ownership == "retained_unverified"
+
+    @pytest.mark.parametrize("identity", [
+        lambda p: None, lambda p: (PID,), lambda p: (PID, ""), lambda p: (PID, None),
+        lambda p: (True, CREATED), lambda p: (0, CREATED)])
+    def test_malformed_reported_identity_refuses(self, monkeypatch, identity):
+        adapter, _, _ = make_adapter(monkeypatch, creation=FakeCreation(identity=identity))
+        with pytest.raises(W.ContainmentRefused, match="malformed"):
+            prepare(adapter)
+
+    def test_pid_mismatch_refuses(self, monkeypatch):
+        adapter, _, _ = make_adapter(
+            monkeypatch, creation=FakeCreation(identity=lambda p: (PID + 1, CREATED)))
+        with pytest.raises(W.ContainmentRefused, match="reports PID"):
+            prepare(adapter)
+        assert adapter.controller.ownership == "retained_unverified"
+
+    def test_creation_time_mismatch_refuses(self, monkeypatch):
+        times = iter([CREATED, "2026-10-09T12:00:01.000Z"])
+        adapter, _, _ = make_adapter(
+            monkeypatch, creation=FakeCreation(identity=lambda p: (PID, next(times))))
+        with pytest.raises(W.ContainmentRefused, match="creation time changed"):
+            prepare(adapter)
+        assert adapter.controller.ownership == "retained_unverified"
+
+    @pytest.mark.parametrize("overrides, message", [
+        ({"in_job": 0}, "outside the job"),
+        ({"pids": [PID + 1]}, "job members are"),
+        ({"pids": [PID, PID + 1]}, "job members are"),
+        ({"accounting": {"active": 2, "total": 2, "terminated": 0}}, "active processes"),
+        ({"accounting": {"active": 1, "total": 2, "terminated": 1}}, "have been in the job"),
+    ])
+    def test_incorrect_membership_evidence_refuses(self, monkeypatch, overrides, message):
+        adapter, kernel32, _ = make_adapter(monkeypatch, **overrides)
+        with pytest.raises(W.JobFailure, match=message):
+            prepare(adapter)
+        assert adapter.controller.ownership == "retained_unverified"
+        assert adapter.controller.membership is None
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_no_implicit_close_or_termination_and_no_native_load(self, monkeypatch):
+        adapter, kernel32, _ = make_adapter(monkeypatch)
+        prepare(adapter)
+        assert kernel32.closed == [] and kernel32.terminated == []
+        assert "TerminateJobObject" not in kernel32.log and "CloseHandle" not in kernel32.log
+        assert kernel32.loads == ["kernel32"]            # the injected fake only
+
+    def test_adapter_needs_authorization(self):
+        with pytest.raises(C.ExecutionDisabled):
+            W.ContainmentAdapter(None, object(), create=lambda p: None,
+                                 process_identity=lambda p: None)
+
+    def test_gates_and_wiring_stay_closed(self):
+        import evidence_store as E
+        assert W.JOB_LIST_CREATION_INTEGRATED is False
+        assert P.HOST_INVENTORY_ENABLED is False and E.EVIDENCE_WRITES_ENABLED is False
+        assert P.TERMINATION_POLICY == "conditionally_accepted_design_only"
+        assert C.PROBE_ENABLED is False
+        for name in ("calibrate_generator.py", "appcontainer_preflight.py",
+                     "evidence_store.py"):
+            text = (_BENCH / name).read_text(encoding="utf-8")
+            assert "ContainmentAdapter" not in text and "import win32_job" not in text
+        assert "AssignProcessToJobObject" not in SOURCE
+        for name in ("assign", "close", "terminate"):
+            assert not hasattr(W.ContainmentAdapter, name)

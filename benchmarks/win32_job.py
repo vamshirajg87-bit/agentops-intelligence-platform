@@ -768,3 +768,160 @@ class JobController:
             self.ownership = "retained_close_failed"
             raise self._fail("close_failed", str(exc)) from None
         self.ownership, self.job = "closed", None
+
+
+# ---------------------------------------------------------------------------
+# Offline containment adapter (nothing calls it)
+# ---------------------------------------------------------------------------
+
+class ContainmentRefused(C.CalibrationError):
+    """The containment preparation was refused; `key` is the FAILURE_ACTIONS
+    key.  Nothing is retried, closed or terminated by the refusal."""
+
+    def __init__(self, key: str, message: str) -> None:
+        super().__init__(f"{key}: {message}")
+        self.key = key
+
+
+@dataclass(frozen=True)
+class ContainmentResult:
+    """A verified contained child: its dedicated job, identity, the sealed
+    creation assertion and the membership snapshot with its evidence."""
+    job: int
+    pid: int
+    creation_time: str
+    assertion: CreationAssertion
+    membership: Membership
+
+
+def receipt_problems(receipt: Any, job: Any) -> list[str]:
+    """Why a creation receipt does not show that CreateProcessW ran with
+    exactly the planned attributes and a JOB_LIST naming exactly this job;
+    empty when it does.  The plan's own rules live in C._validated_plan."""
+    if receipt is None:
+        return ["no creation receipt"]
+    if not isinstance(receipt, C.CreationReceipt):
+        return ["the creation receipt is not a CreationReceipt"]
+    problems: list[str] = []
+    if receipt.planned is not True:
+        problems.append("the creation was legacy/unplanned (uncontained)")
+    if receipt.create_process_ok is not True:
+        problems.append("CreateProcessW success is not established")
+    applied = receipt.applied_attributes
+    if not isinstance(applied, tuple) or not all(
+            isinstance(a, int) and not isinstance(a, bool) for a in applied):
+        problems.append("the applied attributes are malformed")
+    elif applied != C.PLAN_ATTRIBUTES:
+        if PROC_THREAD_ATTRIBUTE_JOB_LIST not in applied:
+            problems.append("JOB_LIST was not applied")
+        if len(set(applied)) != len(applied):
+            problems.append("the applied attributes contain a duplicate")
+        if any(a not in C.PLAN_ATTRIBUTES for a in applied):
+            problems.append("the applied attributes contain an unexpected attribute")
+        if any(a not in applied for a in C.PLAN_ATTRIBUTES):
+            problems.append("the applied attribute list is incomplete")
+        if sorted(applied) == sorted(C.PLAN_ATTRIBUTES):
+            problems.append("the applied attributes are reordered")
+    handles = receipt.job_list_handles
+    if not isinstance(handles, tuple) or handles != (job,):
+        problems.append("the JOB_LIST references another job, or not exactly one job")
+    return problems
+
+
+class ContainmentAdapter:
+    """
+    Composes the existing pieces into one offline containment preparation:
+    parent-job inventory, a dedicated configured job, the JOB_LIST plan, one
+    injected creation, receipt validation and identity binding, the sealed
+    creation assertion, and membership verification.  Everything native is
+    injected: `create(plan)` returns the harness's Win32Handles (its receipt
+    is judged against the job this adapter configured, never against a
+    receipt the caller supplies) and `process_identity(process)` returns the
+    (pid, creation_time) the process handle reports.
+
+    The assertion is minted by the module's own sealed function, so it stays
+    refused while JOB_LIST_CREATION_INTEGRATED is False.  No fallback to an
+    uncontained creation, no after-creation assignment, no resume, no
+    implicit close or termination.
+    """
+
+    def __init__(self, auth: Any, api: Any, *, create: Callable[[AttributePlan], Any],
+                 process_identity: Callable[[Any], Any]) -> None:
+        self.auth = C._require_any_authorization(auth)
+        self.api = api
+        self._create, self._identity = create, process_identity
+        self.controller: Optional[JobController] = None
+        self.errors: list[str] = []
+
+    def _refuse(self, key: str, message: str) -> ContainmentRefused:
+        self.errors.append(f"{key}: {message}")
+        return ContainmentRefused(key, message)
+
+    def _retain_child(self) -> None:
+        """A child exists but is not verified: the job handle is retained
+        (closing it would terminate the child) and nothing is retried."""
+        if self.controller is not None and self.controller.ownership in (
+                "owned_empty", "owned_with_child"):
+            self.controller.ownership, self.controller.membership = "retained_unverified", None
+
+    def prepare(self, stdout: Any, stderr: Any) -> ContainmentResult:
+        C._require_any_authorization(self.auth)
+        if self.controller is not None:
+            raise self._refuse("job_readback_mismatch", "the adapter was already used")
+        inventory = parent_job_inventory(self.api)
+        if inventory.decision != "proceed" or inventory.in_job is not False:
+            raise self._refuse(inventory.key or PARENT_JOB_REFUSAL, inventory.reason)
+        self.controller = JobController(self.auth, self.api)
+        job = self.controller.configure()       # a failure closes its own empty job
+        try:
+            plan = job_list_attribute_plan(job, stdout, stderr)
+            C._validated_plan(plan, validate_attribute_list_size, stdout, stderr)
+        except C.CalibrationError as exc:       # PlanRefused is one
+            raise self._refuse("plan_refused", str(exc)) from None
+        try:
+            created = self._create(plan)        # exactly once; never a fallback
+        except C.ExecutionDisabled:
+            raise
+        except Exception as exc:
+            raise self._refuse("creation_failed", f"{type(exc).__name__}: {exc}") from None
+        try:
+            return self._bind(plan, job, created)
+        except (C.ExecutionDisabled, ContainmentRefused, JobFailure, ProvenanceRefused):
+            self._retain_child()
+            raise
+        except Exception as exc:
+            self._retain_child()
+            raise self._refuse("not_in_job", f"{type(exc).__name__}: {exc}") from None
+
+    def _bind(self, plan: AttributePlan, job: int, created: Any) -> ContainmentResult:
+        if not isinstance(created, C.Win32Handles):
+            raise self._refuse("assignment_failed", "no creation result")
+        problems = receipt_problems(created.receipt, job)
+        if problems:
+            raise self._refuse("assignment_failed", "; ".join(problems))
+        pid, process = created.pid, created.process
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise self._refuse("not_in_job", "the created PID is malformed")
+        if not C._valid_handle(process) or not C._valid_handle(created.thread):
+            raise self._refuse("not_in_job", "the created process or thread handle is invalid")
+        reported_pid, creation_time = self._read_identity(process)
+        if reported_pid != pid:
+            raise self._refuse("not_in_job", f"the process handle reports PID {reported_pid}, "
+                                             f"not the created {pid}")
+        _, again = self._read_identity(process)
+        if again != creation_time:
+            raise self._refuse("not_in_job", "the creation time changed between reads")
+        assertion = _assert_created_with_job_list(plan, job, pid, creation_time)
+        membership = self.controller.verify_membership(process, pid, creation_time, again,
+                                                       assertion)
+        return ContainmentResult(job, pid, creation_time, assertion, membership)
+
+    def _read_identity(self, process: Any) -> tuple[int, str]:
+        identity = self._identity(process)
+        if not isinstance(identity, tuple) or len(identity) != 2:
+            raise self._refuse("not_in_job", "the process identity is malformed")
+        pid, creation_time = identity
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 \
+                or not isinstance(creation_time, str) or not creation_time:
+            raise self._refuse("not_in_job", "the process identity is malformed")
+        return pid, creation_time
