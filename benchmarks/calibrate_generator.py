@@ -1261,6 +1261,11 @@ STARTF_USESTDHANDLES = 0x00000100
 HANDLE_FLAG_INHERIT = 0x00000001
 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
+PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
+#: The attributes of a planned creation, in the only accepted order.
+PLAN_ATTRIBUTES: tuple[int, ...] = (PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                    PROC_THREAD_ATTRIBUTE_JOB_LIST)
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL, TOKEN_IS_APP_CONTAINER = 25, 29
 TOKEN_CAPABILITIES, TOKEN_APP_CONTAINER_SID = 30, 31
@@ -1417,6 +1422,27 @@ TOKEN_BUFFER_LIMIT: int = 64 * 1024
 MIN_SID_BYTES: int = 8
 
 
+@dataclass(frozen=True)
+class CreationReceipt:
+    """What one CreateProcessW call actually ran with: the identifiers of
+    the attributes whose UpdateProcThreadAttribute call succeeded (in the
+    order applied), the handles given to the job-list attribute, and whether
+    CreateProcessW itself succeeded.  `planned` is True only when an
+    attribute plan was supplied; a creation without one is the legacy,
+    uncontained path.  A receipt is a record of native results, not proof
+    of job membership, and mints no assertion of it."""
+    applied_attributes: tuple[int, ...]
+    job_list_handles: tuple[int, ...]
+    create_process_ok: bool
+    planned: bool
+
+    @property
+    def job_list_applied(self) -> bool:
+        return (self.planned and self.create_process_ok
+                and PROC_THREAD_ATTRIBUTE_JOB_LIST in self.applied_attributes
+                and len(self.job_list_handles) == 1)
+
+
 @dataclass
 class Win32Handles:
     process: Any
@@ -1424,6 +1450,60 @@ class Win32Handles:
     pid: int
     tid: int
     cleanup_errors: list[str] = field(default_factory=list)
+    receipt: Optional[CreationReceipt] = None
+
+
+def _validated_plan(plan: Any, size_validator: Any, stdout: Any, stderr: Any
+                    ) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """The (attribute, handles) pairs of a supplied attribute plan, or a
+    refusal.  The plan is duck-typed (entries with .attribute and .handles,
+    and .count); it must be exactly SECURITY_CAPABILITIES, HANDLE_LIST and
+    JOB_LIST in that order, with the handle list exactly the authorized
+    stdout and stderr handles and a job list of one valid handle that is
+    not among them.  Nothing native is called here."""
+    if not callable(size_validator):
+        raise CalibrationError("an attribute plan needs its attribute-list size validator")
+    entries = getattr(plan, "entries", None)
+    if not isinstance(entries, (tuple, list)) or not entries:
+        raise CalibrationError("the attribute plan has no entries")
+    if getattr(plan, "count", None) != len(entries) or isinstance(
+            getattr(plan, "count", None), bool):
+        raise CalibrationError("the attribute plan's count is not derived from its entries")
+    parsed = []
+    for entry in entries:
+        attribute = getattr(entry, "attribute", None)
+        handles = getattr(entry, "handles", None)
+        if isinstance(attribute, bool) or not isinstance(attribute, int) \
+                or not isinstance(handles, tuple) \
+                or not all(_valid_handle(h) for h in handles):
+            raise CalibrationError("the attribute plan has a malformed entry")
+        parsed.append((attribute, handles))
+    attributes = tuple(a for a, _ in parsed)
+    if len(set(attributes)) != len(attributes):
+        raise CalibrationError("the attribute plan has a duplicate attribute")
+    unexpected = [a for a in attributes if a not in PLAN_ATTRIBUTES]
+    if unexpected:
+        raise CalibrationError("the attribute plan has an unexpected attribute: "
+                               + ", ".join(f"{a:#x}" for a in unexpected))
+    missing = [a for a in PLAN_ATTRIBUTES if a not in attributes]
+    if missing:
+        raise CalibrationError("the attribute plan lacks an attribute: "
+                               + ", ".join(f"{a:#x}" for a in missing))
+    if attributes != PLAN_ATTRIBUTES:
+        raise CalibrationError("the attribute plan is not in the accepted order")
+    by_attribute = dict(parsed)
+    if by_attribute[PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES] != ():
+        raise CalibrationError("the security-capabilities entry carries handles")
+    inherited = by_attribute[PROC_THREAD_ATTRIBUTE_HANDLE_LIST]
+    if inherited != (stdout, stderr):
+        raise CalibrationError("the handle list is not exactly the authorized stdout and "
+                               "stderr handles")
+    job = by_attribute[PROC_THREAD_ATTRIBUTE_JOB_LIST]
+    if len(job) != 1:
+        raise CalibrationError("the job list must hold exactly one handle")
+    if job[0] in inherited:
+        raise CalibrationError("the job handle must never be in the inherited handle list")
+    return tuple(parsed)
 
 
 def _default_loader(name: str) -> Any:
@@ -1563,19 +1643,41 @@ class CtypesWin32:
         return msvcrt.get_osfhandle(stream.fileno())
 
     def create_process(self, *, application: str, command_line: str, env: Mapping[str, str],
-                       cwd: str, stdout: Any, stderr: Any, sid: str) -> Win32Handles:
+                       cwd: str, stdout: Any, stderr: Any, sid: str,
+                       attribute_plan: Any = None, size_validator: Any = None) -> Win32Handles:
         """
         CreateProcessW, suspended, in the AppContainer `sid` with NO
         capabilities, inheriting exactly the stdout and stderr handles.  The
         cleanup functions are bound before anything is allocated and the
         cleanup never raises, so a created process is always returned (with
         any cleanup errors attached), never lost.
+
+        Without `attribute_plan` this is the legacy two-attribute creation
+        (SECURITY_CAPABILITIES, HANDLE_LIST), unchanged and uncontained.
+        With one - an injected plan of exactly SECURITY_CAPABILITIES,
+        HANDLE_LIST and JOB_LIST, and the injected `size_validator` for the
+        sizing call - the attribute count comes from the plan, the first
+        sizing result is validated, the list lives in a pointer-aligned
+        buffer, the second initialization must succeed, and every attribute
+        value stays alive until after DeleteProcThreadAttributeList.  A
+        supplied plan that fails anywhere refuses; it never falls back to
+        the legacy creation.  The returned handles carry a CreationReceipt
+        of the natively applied attributes; no membership is claimed.
         """
         t = _win32_types()
         c, w = t.ctypes, t.w
         handles = [self._handle_of(stdout), self._handle_of(stderr)]
         if not all(_valid_handle(h) for h in handles):
             raise Win32Error("get_osfhandle", "invalid output handle")
+        planned = attribute_plan is not None
+        if planned:
+            spec = _validated_plan(attribute_plan, size_validator, handles[0], handles[1])
+        elif size_validator is not None:
+            raise CalibrationError("a size validator without an attribute plan")
+        else:
+            spec = ((PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, ()),
+                    (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, tuple(handles)))
+        count = len(spec)
         command_buffer = c.create_unicode_buffer(command_line)
         environment = c.create_unicode_buffer(environment_block(env))
         convert = self._api("ConvertStringSidToSidW")
@@ -1591,6 +1693,9 @@ class CtypesWin32:
         attributes = None
         initialized = False
         inheritable: list[int] = []
+        values: list[Any] = []                      # every attribute value, kept alive
+        applied: list[int] = []                     # attributes whose update succeeded
+        job_handles: tuple[int, ...] = ()
         created: Optional[Win32Handles] = None
         cleanup_errors: list[str] = []
         try:
@@ -1599,20 +1704,32 @@ class CtypesWin32:
                     raise self._error("SetHandleInformation")
                 inheritable.append(handle)
             size = c.c_size_t(0)
-            initialize(None, 2, 0, c.byref(size))
-            if not size.value:
-                raise self._error("InitializeProcThreadAttributeList")
-            attributes = c.create_string_buffer(size.value)
-            if not initialize(c.addressof(attributes), 2, 0, c.byref(size)):
+            first = initialize(None, count, 0, c.byref(size))
+            if planned:
+                checked = size_validator(first, self._code(), size.value)
+                if checked != size.value or isinstance(checked, bool):
+                    raise CalibrationError("the size validator changed the attribute-list size")
+                slots = -(-size.value // c.sizeof(c.c_void_p))
+                attributes = (c.c_void_p * slots)()               # pointer-aligned
+            else:
+                if not size.value:
+                    raise self._error("InitializeProcThreadAttributeList")
+                attributes = c.create_string_buffer(size.value)
+            if not initialize(c.addressof(attributes), count, 0, c.byref(size)):
                 raise self._error("InitializeProcThreadAttributeList")
             initialized = True
-            capabilities = t.SECURITY_CAPABILITIES(psid.value, None, 0, 0)
-            inherited = (w.HANDLE * 2)(*handles)
-            for attribute, value in ((PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, capabilities),
-                                     (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited)):
+            for attribute, entry_handles in spec:                 # values live until return
+                if attribute == PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES:
+                    value = t.SECURITY_CAPABILITIES(psid.value, None, 0, 0)
+                else:
+                    value = (w.HANDLE * len(entry_handles))(*entry_handles)
+                values.append(value)
                 if not update(c.addressof(attributes), 0, attribute, c.addressof(value),
                               c.sizeof(value), None, None):
                     raise self._error("UpdateProcThreadAttribute")
+                applied.append(attribute)
+                if attribute == PROC_THREAD_ATTRIBUTE_JOB_LIST:
+                    job_handles = tuple(entry_handles)
             startup = t.STARTUPINFOEXW()
             startup.StartupInfo.cb = c.sizeof(startup)
             startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
@@ -1623,8 +1740,9 @@ class CtypesWin32:
                           CREATION_FLAGS, c.addressof(environment), cwd, c.byref(startup),
                           c.byref(info)):
                 raise self._error("CreateProcessW")
-            created = Win32Handles(info.hProcess, info.hThread, info.dwProcessId,
-                                   info.dwThreadId)
+            created = Win32Handles(
+                info.hProcess, info.hThread, info.dwProcessId, info.dwThreadId,
+                receipt=CreationReceipt(tuple(applied), job_handles, True, planned))
         finally:
             if initialized:
                 try:

@@ -10,6 +10,8 @@ the test.  Where a test opens the execution gate, it does so in memory only.
 
 from __future__ import annotations
 
+import dataclasses
+import gc
 import hashlib
 import importlib
 import importlib.abc
@@ -35,6 +37,7 @@ if str(_BENCH) not in sys.path:
 import calibrate_generator as C  # noqa: E402
 import metrics as M  # noqa: E402
 import run_benchmark as RB  # noqa: E402
+import win32_job as W  # noqa: E402  (the injected plan and validator of the planned path)
 
 HEAD = "a" * 40
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -1846,18 +1849,32 @@ def _create_fakes(state):
 
     def initialize(address, count, flags, size):
         if address is None:
-            size._obj.value = 64
-            return 0
+            state["sizing_count"] = count
+            size._obj.value = state.get("size", 64)
+            return state.get("first_result", 0)
         state["attribute_count"] = count
-        return 1
+        state["buffer_address"] = address
+        return state.get("second_ok", 1)
+
+    def reread():
+        return [c.string_at(value, size) for _, value, size in state.get("updates", [])]
 
     def update(address, flags, attribute, value, size, previous, returned):
+        position = len(state.setdefault("updates", []))
+        state["updates"].append((attribute, value, size))
+        state.setdefault("update_bytes", []).append(c.string_at(value, size))
+        if state.get("update_fail_at") == position:
+            return 0
         if attribute == C.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES:
             caps = t.SECURITY_CAPABILITIES.from_address(value)
             state["capabilities"] = (caps.AppContainerSid, caps.CapabilityCount,
                                      bool(caps.Capabilities))
+        elif attribute == C.PROC_THREAD_ATTRIBUTE_JOB_LIST:
+            state["job_list"] = list(
+                (t.w.HANDLE * (size // c.sizeof(t.w.HANDLE))).from_address(value))
         else:
-            state["inherited"] = list((t.w.HANDLE * 2).from_address(value))
+            state["inherited"] = list(
+                (t.w.HANDLE * (size // c.sizeof(t.w.HANDLE))).from_address(value))
         return state.get("update_ok", 1)
 
     def create(app, command, pa, ta, inherit_handles, flags, env, cwd, startup, info):
@@ -1866,6 +1883,8 @@ def _create_fakes(state):
         s = startup._obj
         state["startup"] = (s.StartupInfo.cb, s.StartupInfo.dwFlags, s.StartupInfo.hStdOutput,
                             s.StartupInfo.hStdError, bool(s.lpAttributeList))
+        state["list_address"] = s.lpAttributeList
+        state["bytes_at_create"] = reread()
         if "during_create" in state:
             state["during_create"]()
         if not state.get("create_ok", 1):
@@ -1876,6 +1895,8 @@ def _create_fakes(state):
 
     def delete(address):
         state["deleted"] = True
+        state["bytes_at_delete"] = reread()
+        state["delete_address"] = address
         if state.get("delete_raises"):
             raise OSError("access violation")
 
@@ -2773,3 +2794,350 @@ class TestCalibrationStateEvidence:
         C.run_series(1, tmp_path, deps)
         complete = _read(_journal(tmp_path, "complete", 1))
         assert complete["liveness"] == C.ALIVE_AT_LAST_CHECK and complete["handles_retained"]
+
+
+# ---------------------------------------------------------------------------
+# Planned (JOB_LIST) creation plumbing over fake DLLs (J-41; no native call)
+# ---------------------------------------------------------------------------
+
+SC_ATTR = C.PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
+HL_ATTR = C.PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+JL_ATTR = C.PROC_THREAD_ATTRIBUTE_JOB_LIST
+JOB_HANDLE = 0x500
+CREATE_API = {"ConvertStringSidToSidW", "SetHandleInformation",
+              "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute",
+              "DeleteProcThreadAttributeList", "CreateProcessW", "LocalFree",
+              "ConvertSidToStringSidW", "CloseHandle", "FreeSid", "CoTaskMemFree"}
+
+
+def _plan(entries=None, count=None):
+    """A duck-typed plan, built without the job backend."""
+    if entries is None:
+        entries = [(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE,))]
+    return SimpleNamespace(
+        entries=tuple(SimpleNamespace(attribute=a, name="entry", handles=h) for a, h in entries),
+        count=len(entries) if count is None else count)
+
+
+def _planned_setup(monkeypatch, tmp_path, **extra):
+    command = _probe_command(tmp_path)
+    state = {"env_len": len(C.environment_block(command.env)) + 1, "last_error": 122, **extra}
+    win32, log = _fake_ctypes(monkeypatch, _create_fakes(state), state)
+    return command, state, win32, log
+
+
+def _create_planned(win32, command, plan, validator=W.validate_attribute_list_size):
+    return win32.create_process(application=command.argv[0], command_line=command.command_line,
+                                env=command.env, cwd=command.cwd, stdout=11, stderr=12,
+                                sid=SID, attribute_plan=plan, size_validator=validator)
+
+
+def _nothing_native(state, log):
+    assert log == [] and state["loaded"] == []
+
+
+def _unwound(state, *, initialized):
+    assert state["inherit"][-2:] == [(11, 0), (12, 0)]       # inheritance restored
+    assert state["freed"]                                       # the SID was freed
+    assert bool(state.get("deleted")) is initialized            # list deleted iff initialized
+
+
+class TestPlannedCreation:
+    def test_no_plan_is_the_unchanged_legacy_creation(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        handles = win32.create_process(application=command.argv[0],
+                                       command_line=command.command_line, env=command.env,
+                                       cwd=command.cwd, stdout=11, stderr=12, sid=SID)
+        assert state["sizing_count"] == state["attribute_count"] == 2
+        assert [u[0] for u in state["updates"]] == [SC_ATTR, HL_ATTR]
+        assert state["inherited"] == [11, 12] and "job_list" not in state
+        assert handles.receipt == C.CreationReceipt((SC_ATTR, HL_ATTR), (), True, False)
+
+    def test_three_attribute_plan_with_derived_count(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        plan = W.job_list_attribute_plan(JOB_HANDLE, 11, 12)
+        handles = _create_planned(win32, command, plan)
+        assert plan.count == state["sizing_count"] == state["attribute_count"] == 3
+        assert handles.pid == 4242 and handles.cleanup_errors == []
+        assert log.count("InitializeProcThreadAttributeList") == 2
+        assert log.count("UpdateProcThreadAttribute") == 3 and log.count("CreateProcessW") == 1
+        smaller = _plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE,))])
+        assert smaller.count == 3                                # derived, not written down
+
+    def test_identifiers_and_order(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        handles = _create_planned(win32, command, _plan())
+        assert [u[0] for u in state["updates"]] == [0x00020009, 0x00020002, 0x0002000D]
+        assert handles.receipt.applied_attributes == (0x00020009, 0x00020002, 0x0002000D)
+        assert C.PLAN_ATTRIBUTES == handles.receipt.applied_attributes
+
+    def test_job_list_is_a_handle_array(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        _create_planned(win32, command, _plan())
+        t = C._win32_types()
+        job_update = [u for u in state["updates"] if u[0] == JL_ATTR][0]
+        assert job_update[2] == t.ctypes.sizeof(t.w.HANDLE) and state["job_list"] == [JOB_HANDLE]
+
+    def test_security_capabilities_structure(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        _create_planned(win32, command, _plan())
+        t = C._win32_types()
+        sc_update = [u for u in state["updates"] if u[0] == SC_ATTR][0]
+        assert sc_update[2] == t.ctypes.sizeof(t.SECURITY_CAPABILITIES)
+        assert state["capabilities"] == (0x5001, 0, False)         # the SID, zero capabilities
+
+    def test_handle_list_is_only_the_authorized_standard_handles(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        _create_planned(win32, command, _plan())
+        assert state["inherited"] == [11, 12] and JOB_HANDLE not in state["inherited"]
+        assert state["inherit"] == [(11, 1), (12, 1), (11, 0), (12, 0)]   # only stdio inherits
+
+    def test_pointer_aligned_buffer(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path, size=65)
+        t = C._win32_types()
+
+        def refuse(*args, **kwargs):
+            raise LiveAccessAttempt("an unaligned character buffer")
+
+        monkeypatch.setattr(t.ctypes, "create_string_buffer", refuse)
+        _create_planned(win32, command, _plan())                    # never uses a char buffer
+        assert state["buffer_address"] % t.ctypes.alignment(t.ctypes.c_void_p) == 0
+        assert state["list_address"] == state["buffer_address"] == state["delete_address"]
+        command2, state2, win32_2, _ = _planned_setup(monkeypatch, tmp_path)
+        with pytest.raises(LiveAccessAttempt):                      # the legacy path does
+            win32_2.create_process(application=command2.argv[0],
+                                   command_line=command2.command_line, env=command2.env,
+                                   cwd=command2.cwd, stdout=11, stderr=12, sid=SID)
+
+    def test_works_with_the_job_backend_plan_and_validator(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        handles = _create_planned(win32, command, W.job_list_attribute_plan(JOB_HANDLE, 11, 12))
+        assert handles.receipt.job_list_handles == (JOB_HANDLE,)
+        assert handles.receipt.job_list_applied is True
+
+    # -- sizing ------------------------------------------------------------
+
+    @pytest.mark.parametrize("extra, message", [
+        ({"first_result": 1}, "not FALSE"),
+        ({"last_error": 87}, "ERROR_INSUFFICIENT_BUFFER"),
+        ({"last_error": 0}, "ERROR_INSUFFICIENT_BUFFER"),
+        ({"size": 0}, "implausible attribute-list size"),
+        ({"size": 4097}, "implausible attribute-list size"),
+    ])
+    def test_sizing_refusals(self, monkeypatch, tmp_path, extra, message):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path, **extra)
+        with pytest.raises(W.PlanRefused, match=message):
+            _create_planned(win32, command, _plan())
+        assert log.count("InitializeProcThreadAttributeList") == 1
+        assert "UpdateProcThreadAttribute" not in log and "CreateProcessW" not in log
+        _unwound(state, initialized=False)
+
+    def test_sizing_accepts_the_documented_contract(self, monkeypatch, tmp_path):
+        for size in (1, 64, 4096):
+            command, state, win32, _ = _planned_setup(monkeypatch, tmp_path, size=size)
+            assert _create_planned(win32, command, _plan()).pid == 4242
+
+    def test_a_validator_is_required_and_must_not_change_the_size(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        with pytest.raises(C.CalibrationError, match="needs its attribute-list size validator"):
+            _create_planned(win32, command, _plan(), validator=None)
+        _nothing_native(state, log)
+        with pytest.raises(C.CalibrationError, match="without an attribute plan"):
+            win32.create_process(application=command.argv[0], command_line=command.command_line,
+                                 env=command.env, cwd=command.cwd, stdout=11, stderr=12,
+                                 sid=SID, size_validator=W.validate_attribute_list_size)
+        _nothing_native(state, log)
+        with pytest.raises(C.CalibrationError, match="changed the attribute-list size"):
+            _create_planned(win32, command, _plan(), validator=lambda f, e, s: s + 8)
+        _unwound(state, initialized=False)
+
+    def test_second_initialization_failure(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path, second_ok=0)
+        with pytest.raises(C.Win32Error, match="InitializeProcThreadAttributeList"):
+            _create_planned(win32, command, _plan())
+        assert log.count("InitializeProcThreadAttributeList") == 2
+        assert "UpdateProcThreadAttribute" not in log and "CreateProcessW" not in log
+        _unwound(state, initialized=False)                          # never initialized: no delete
+
+    # -- updates and creation ---------------------------------------------------
+
+    @pytest.mark.parametrize("position", [0, 1, 2])
+    def test_update_failure_at_each_position(self, monkeypatch, tmp_path, position):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path,
+                                                    update_fail_at=position)
+        with pytest.raises(C.Win32Error, match="UpdateProcThreadAttribute"):
+            _create_planned(win32, command, _plan())
+        assert len(state["updates"]) == position + 1                # stopped at the failure
+        assert "CreateProcessW" not in log                          # no fallback creation
+        _unwound(state, initialized=True)
+
+    def test_create_process_failure(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path, create_ok=0)
+        with pytest.raises(C.Win32Error, match="CreateProcessW"):
+            _create_planned(win32, command, _plan())
+        assert log.count("CreateProcessW") == 1                     # attempted once, never retried
+        assert log.count("UpdateProcThreadAttribute") == 3
+        _unwound(state, initialized=True)
+
+    def test_attribute_values_live_until_cleanup(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path,
+                                                  during_create=gc.collect)
+        _create_planned(win32, command, _plan())
+        assert len(state["update_bytes"]) == 3
+        assert state["bytes_at_create"] == state["update_bytes"]    # intact at CreateProcessW
+        assert state["bytes_at_delete"] == state["update_bytes"]    # and at the list's deletion
+
+    # -- the receipt ---------------------------------------------------------
+
+    def test_receipt_is_immutable(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        receipt = _create_planned(win32, command, _plan()).receipt
+        assert isinstance(receipt, C.CreationReceipt)
+        assert isinstance(receipt.applied_attributes, tuple)
+        assert isinstance(receipt.job_list_handles, tuple)
+        for name, value in (("planned", False), ("applied_attributes", ()),
+                            ("create_process_ok", False)):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(receipt, name, value)
+
+    def test_receipt_distinguishes_planned_from_legacy(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        planned = _create_planned(win32, command, _plan()).receipt
+        assert planned == C.CreationReceipt(C.PLAN_ATTRIBUTES, (JOB_HANDLE,), True, True)
+        assert planned.job_list_applied is True
+        command2, state2, win32_2, _ = _planned_setup(monkeypatch, tmp_path)
+        legacy = win32_2.create_process(application=command2.argv[0],
+                                        command_line=command2.command_line, env=command2.env,
+                                        cwd=command2.cwd, stdout=11, stderr=12, sid=SID).receipt
+        assert legacy.planned is False and legacy.job_list_applied is False
+        assert legacy.job_list_handles == () and JL_ATTR not in legacy.applied_attributes
+
+    def test_receipt_records_native_results_not_the_request(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        original = C.CreationReceipt
+        applied_when_built = []
+
+        def spy(applied, jobs, ok, planned):
+            applied_when_built.append((tuple(u[0] for u in state["updates"]), applied))
+            return original(applied, jobs, ok, planned)
+
+        monkeypatch.setattr(C, "CreationReceipt", spy)
+        _create_planned(win32, command, _plan())
+        assert applied_when_built == [(C.PLAN_ATTRIBUTES, C.PLAN_ATTRIBUTES)]
+
+    def test_receipt_claims_no_membership(self):
+        fields = {f.name for f in dataclasses.fields(C.CreationReceipt)}
+        assert fields == {"applied_attributes", "job_list_handles", "create_process_ok",
+                          "planned"}
+        assert "membership" not in inspect.getsource(C.CreationReceipt).split('"""')[2]
+
+    # -- invalid plans ------------------------------------------------------------
+
+    @pytest.mark.parametrize("plan, message", [
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (HL_ATTR, (11, 12))]), "duplicate"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12))]), "lacks an attribute: 0x2000d"),
+        (_plan([(HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE,))]), "lacks an attribute: 0x20009"),
+        (_plan([(SC_ATTR, ()), (JL_ATTR, (JOB_HANDLE,))]), "lacks an attribute: 0x20002"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE,)),
+                (0x00020007, ())]), "unexpected attribute: 0x20007"),
+        (_plan([(JL_ATTR, (JOB_HANDLE,)), (SC_ATTR, ()), (HL_ATTR, (11, 12))]),
+         "not in the accepted order"),
+        (_plan(count=5), "count is not derived"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE,))], count=True),
+         "count is not derived"),
+        (_plan([(True, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE,))]), "malformed entry"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, [11, 12]), (JL_ATTR, (JOB_HANDLE,))]),
+         "malformed entry"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (0, 12)), (JL_ATTR, (JOB_HANDLE,))]), "malformed entry"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (-1,))]), "malformed entry"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (True,))]), "malformed entry"),
+        (_plan([(SC_ATTR, (5,)), (HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE,))]),
+         "carries handles"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11,)), (JL_ATTR, (JOB_HANDLE,))]),
+         "not exactly the authorized"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (12, 11)), (JL_ATTR, (JOB_HANDLE,))]),
+         "not exactly the authorized"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12, 13)), (JL_ATTR, (JOB_HANDLE,))]),
+         "not exactly the authorized"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 13)), (JL_ATTR, (JOB_HANDLE,))]),
+         "not exactly the authorized"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (JOB_HANDLE, 0x600))]),
+         "exactly one handle"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, ())]), "exactly one handle"),
+        (_plan([(SC_ATTR, ()), (HL_ATTR, (11, 12)), (JL_ATTR, (11,))]),
+         "never be in the inherited handle list"),
+        (_plan([]), "no entries"),
+        (object(), "no entries"),
+        (SimpleNamespace(entries="abc", count=3), "no entries"),
+    ])
+    def test_invalid_plans_refuse_before_any_native_call(self, monkeypatch, tmp_path, plan,
+                                                         message):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        with pytest.raises(C.CalibrationError, match=message):
+            _create_planned(win32, command, plan)
+        _nothing_native(state, log)
+
+    # -- cleanup, fallbacks, isolation --------------------------------------------------
+
+    @pytest.mark.parametrize("fault, expected", [
+        ("reset_fails", "could not reset inheritance"),
+        ("delete_raises", "DeleteProcThreadAttributeList"),
+        ("local_free_fails", "LocalFree of the AppContainer SID failed"),
+    ])
+    def test_cleanup_failure_never_loses_the_planned_process(self, monkeypatch, tmp_path, fault,
+                                                             expected):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path, **{fault: True})
+        handles = _create_planned(win32, command, _plan())
+        assert (handles.process, handles.thread, handles.pid) == (101, 102, 4242)
+        assert any(expected in e for e in handles.cleanup_errors)
+        assert handles.receipt.job_list_applied is True            # the receipt is untouched
+
+    def test_no_after_creation_assignment_or_legacy_fallback(self, monkeypatch, tmp_path):
+        for extra in ({"update_fail_at": 2}, {"create_ok": 0}, {"second_ok": 0},
+                      {"first_result": 1}):
+            command, state, win32, log = _planned_setup(monkeypatch, tmp_path, **extra)
+            with pytest.raises(C.CalibrationError):
+                _create_planned(win32, command, _plan())
+            assert set(log) <= CREATE_API                           # nothing else is reachable
+            assert log.count("CreateProcessW") <= 1                 # no second, legacy attempt
+        code = (_BENCH / "calibrate_generator.py").read_text(encoding="utf-8")
+        assert "AssignProcess" not in code and "JobObject" not in code
+
+    def test_only_the_injected_fake_dlls_are_loaded(self, monkeypatch, tmp_path):
+        command, state, win32, _ = _planned_setup(monkeypatch, tmp_path)
+        _create_planned(win32, command, _plan())
+        assert state["loaded"] == ["advapi32", "kernel32"]
+
+    def test_closed_gate_stops_a_planned_creation(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(C, "PROBE_ENABLED", False)
+        with pytest.raises(C.ExecutionDisabled):
+            _create_planned(win32, command, _plan())
+        _nothing_native(state, log)
+
+    def test_the_production_path_passes_no_plan(self, monkeypatch, tmp_path):
+        open_probe_gate(monkeypatch)
+        win32 = FakeWin32()
+        api = C.Win32AppContainerApi(C.authorize_probe("probe-01", HEAD), win32=win32)
+        command = _probe_command(tmp_path)
+        api.create_suspended(command, SID, (), 1, 2)
+        assert "attribute_plan" not in win32.created and "size_validator" not in win32.created
+        for function in (C.Win32AppContainerApi.create_suspended, C.AppContainerLauncher.__call__,
+                         C.Win32AppContainerApi.resume):
+            source = inspect.getsource(function)
+            assert "attribute_plan" not in source and "size_validator" not in source
+        defaults = inspect.signature(C.CtypesWin32.create_process).parameters
+        assert defaults["attribute_plan"].default is None
+        assert defaults["size_validator"].default is None
+
+    def test_no_integration_or_gate_activation(self):
+        code = (_BENCH / "calibrate_generator.py").read_text(encoding="utf-8")
+        for word in ("win32_job", "CreationAssertion", "JobController", "evidence_store",
+                     "JOB_LIST_CREATION_INTEGRATED"):
+            assert word not in code, word
+        assert W.JOB_LIST_CREATION_INTEGRATED is False
+        assert (C.EXECUTION_ENABLED, C.APPROVED_CALIBRATIONS, C.PROBE_ENABLED,
+                C.APPROVED_PROBES, C.AUTHORIZED_APPCONTAINER_SID,
+                C.AUTHORIZED_PROFILE_PREFLIGHT_SHA256) == (False, frozenset(), False,
+                                                          frozenset(), None, None)
+        assert C.APPCONTAINER_CAPABILITIES == () and not (C.CREATION_FLAGS & 0x01000000)
