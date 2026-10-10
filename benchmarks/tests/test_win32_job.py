@@ -1546,6 +1546,114 @@ class TestContainmentAdapter:
         assert raised.value.key == "retention_failed" and raised.value.__cause__ is original
         assert kernel32.closed == [] and kernel32.terminated == []
 
+    def test_creator_failure_records_unverified_diagnostics(self, monkeypatch):
+        original = RuntimeError("secret detail")
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=FakeCreation(raises=original))
+        assert adapter.retained_reason is None and adapter.retained_evidence is None
+        with pytest.raises(W.ContainmentRefused, match="creation_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "creation_failed"
+        assert adapter.retained_reason == "creator_failed_outcome_unknown"
+        evidence = adapter.retained_evidence
+        assert evidence["stage"] == "creator" and evidence["cause_type"] == "RuntimeError"
+        assert evidence["failure_action_key"] == "creation_failed"
+        assert evidence["ownership_before"] == "owned_empty"
+        assert evidence["ownership_after"] == "retained_unverified"
+        assert (evidence["child_existence"], evidence["child_identity"],
+                evidence["membership"]) == ("unknown", "unverified", "unverified")
+        assert evidence["recovery_authorized"] is False
+        assert "secret detail" not in repr(dict(evidence))
+        assert str(PID) not in repr(dict(evidence))
+        assert evidence["failure_action_key"] in P.FAILURE_ACTIONS
+        with pytest.raises(TypeError):
+            evidence["stage"] = "x"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(3)])
+    def test_creator_interrupt_records_diagnostics_and_propagates(self, monkeypatch,
+                                                                  interrupt):
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=FakeCreation(raises=interrupt))
+        with pytest.raises(type(interrupt)) as raised:
+            prepare(adapter)
+        assert raised.value is interrupt
+        assert adapter.retained_reason == "creator_failed_outcome_unknown"
+        assert adapter.retained_evidence["cause_type"] == type(interrupt).__name__
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_bind_failure_records_diagnostics_without_proof(self, monkeypatch):
+        adapter, kernel32, _ = make_adapter(monkeypatch, creation=FakeCreation(receipt=None))
+        with pytest.raises(W.ContainmentRefused, match="assignment_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "assignment_failed"
+        assert adapter.retained_reason == "bind_failed_child_may_exist"
+        evidence = adapter.retained_evidence
+        assert evidence["stage"] == "bind" and evidence["failure_action_key"] is None
+        assert evidence["ownership_after"] == "retained_unverified"
+        assert (evidence["child_existence"], evidence["child_identity"],
+                evidence["membership"]) == ("unknown", "unverified", "unverified")
+        assert adapter.controller.membership is None
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_retention_failure_records_diagnostics_and_keeps_key(self, monkeypatch):
+        class StubbornController(W.JobController):
+            @property
+            def ownership(self):
+                return self.__dict__.get("_o", "none")
+
+            @ownership.setter
+            def ownership(self, value):
+                if value != "retained_unverified":
+                    self.__dict__["_o"] = value
+
+        monkeypatch.setattr(W, "JobController", StubbornController)
+        original = RuntimeError("creator failed")
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=FakeCreation(raises=original))
+        with pytest.raises(W.ContainmentRefused, match="retention_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "retention_failed" and raised.value.__cause__ is original
+        assert adapter.retained_reason == "retention_unconfirmed"
+        assert adapter.retained_evidence["failure_action_key"] == "retention_failed"
+        assert adapter.retained_evidence["ownership_after"] == "owned_empty"
+        assert adapter.retained_evidence["recovery_authorized"] is False
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_diagnostic_failure_never_masks_the_refusal(self, monkeypatch):
+        adapter, _, _ = make_adapter(monkeypatch,
+                                     creation=FakeCreation(raises=RuntimeError("x")))
+
+        def broken(*args):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(W, "MappingProxyType", broken)
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        assert adapter.retained_reason == "creator_failed_outcome_unknown"
+        assert adapter.retained_evidence is None
+        assert adapter.controller.ownership == "retained_unverified"
+
+    def test_pre_creator_and_success_paths_record_no_diagnostics(self, monkeypatch):
+        adapter, _, creation = make_adapter(monkeypatch)
+        with pytest.raises(W.ContainmentRefused, match="plan_refused"):
+            adapter.prepare(JOB, STDERR_HANDLE)
+        assert creation.plans == []
+        assert adapter.retained_reason is None and adapter.retained_evidence is None
+        adapter, _, _ = make_adapter(monkeypatch)
+        prepare(adapter)
+        assert adapter.retained_reason is None and adapter.retained_evidence is None
+
+    def test_diagnostics_are_additive_only(self):
+        for name in ("assign", "close", "terminate", "recover", "retry"):
+            assert not hasattr(W.ContainmentAdapter, name)
+        assert not any(hasattr(W, n) for n in ("CreationOutcome", "HandleCustody",
+                                               "DefiniteNoChild"))
+        assert W.OWNERSHIP_STATES == ("none", "owned_empty", "owned_with_child",
+                                      "child_exited", "retained_unverified",
+                                      "retained_close_failed", "closed")
+
     @pytest.mark.parametrize("pid, process", [(0, PROCESS), (True, PROCESS), ("1", PROCESS),
                                               (PID, 0), (PID, None), (PID, -1)])
     def test_malformed_process_identity_refuses(self, monkeypatch, pid, process):

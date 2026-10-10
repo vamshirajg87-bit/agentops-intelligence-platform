@@ -1742,6 +1742,12 @@ FAILURE_ACTIONS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
                                          "unchanged", STATE_UNKNOWN),
     "interrupted_cleanup": _action("cleanup_incomplete", "recovery_inspection", "unchanged",
                                    STATE_UNKNOWN),
+    # Classification only: none of these authorizes termination, discard, retry or recovery.
+    "creation_failed": _action("unknown_liveness", "recovery_inspection", "unchanged",
+                               STATE_UNKNOWN),
+    "creation_no_child": _action("prelaunch_refusal", "none", None, "not_applicable"),
+    "retention_failed": _action("unknown_liveness", "recovery_inspection", "unchanged",
+                                STATE_UNKNOWN),
 })
 
 

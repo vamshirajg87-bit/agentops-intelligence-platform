@@ -1336,7 +1336,7 @@ class TestAssignmentPolicy:
             entry = P.FAILURE_ACTIONS[key]
             assert (entry["action_class"], entry["containment"],
                     entry["execution_history"]) == (action, containment, history), key
-        assert len(P.FAILURE_ACTIONS) == 19
+        assert len(P.FAILURE_ACTIONS) == 22
         state = _lc(assigned(), "parent_lost")
         assert state.execution_history == P.NEVER_EXECUTED and state.liveness == P.STATE_UNKNOWN
 
@@ -1570,6 +1570,23 @@ class TestFailureActions:
             P.FAILURE_ACTIONS["parent_crash"]["containment"] = "none"
         for action in P.FAILURE_ACTIONS.values():
             assert action["ownership"] == "retained" and action["series_blocked"] is True
+
+    def test_creation_outcome_keys_classify_without_authorizing_action(self):
+        for key in ("creation_failed", "creation_no_child", "retention_failed"):
+            entry = P.FAILURE_ACTIONS[key]
+            assert entry["series_blocked"] is True and entry["ownership"] == "retained"
+            assert entry["containment"] in ("recovery_inspection", "none")
+            assert entry["containment"] not in ("discard", "bounded_termination")
+            assert entry["action_class"] not in ("termination_requested", "possible_execution",
+                                                 "discard_before_resume")
+        for key in ("creation_failed", "retention_failed"):
+            entry = P.FAILURE_ACTIONS[key]
+            assert (entry["action_class"], entry["liveness"], entry["execution_history"]) == (
+                "unknown_liveness", P.STATE_UNKNOWN, "unchanged")
+        no_child = P.FAILURE_ACTIONS["creation_no_child"]
+        assert (no_child["action_class"], no_child["containment"]) == ("prelaunch_refusal",
+                                                                       "none")
+        assert P.TERMINATION_POLICY == "conditionally_accepted_design_only"
 
     def test_containment_rules(self):
         after = P.FAILURE_ACTIONS["evidence_failure_after_resume"]

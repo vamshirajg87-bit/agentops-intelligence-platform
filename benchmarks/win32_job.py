@@ -852,17 +852,47 @@ class ContainmentAdapter:
         self._create, self._identity = create, process_identity
         self.controller: Optional[JobController] = None
         self.errors: list[str] = []
+        #: Display-only diagnostics of an uncertain outcome; never consulted
+        #: by any decision, and never a claim that a child exists or is known.
+        self.retained_reason: Optional[str] = None
+        self.retained_evidence: Optional[Mapping[str, Any]] = None
 
     def _refuse(self, key: str, message: str) -> ContainmentRefused:
         self.errors.append(f"{key}: {message}")
         return ContainmentRefused(key, message)
 
-    def _retain_child(self, cause: Optional[BaseException] = None) -> None:
+    def _note_retention(self, stage: str, reason: str, failure_key: Optional[str],
+                        cause: Optional[BaseException], before: Any) -> None:
+        """Record display-only diagnostics.  Every fact about the child is
+        'unknown' or 'unverified': nothing here asserts that a process
+        exists or what its identity or membership is.  Never raises."""
+        self.retained_reason = reason
+        try:
+            self.retained_evidence = MappingProxyType({
+                "stage": stage,
+                "failure_action_key": failure_key,
+                "cause_type": None if cause is None else type(cause).__name__,
+                "ownership_before": before,
+                "ownership_after": getattr(self.controller, "ownership", None),
+                "child_existence": "unknown",
+                "child_identity": "unverified",
+                "membership": "unverified",
+                "recovery_authorized": False,
+            })
+        except Exception:
+            self.retained_evidence = None
+
+    def _retain_child(self, cause: Optional[BaseException] = None,
+                      stage: str = "creator") -> None:
         """A child may exist and is not verified: the job handle is retained
         (closing it would terminate the child) and nothing is retried.  A
         retention that cannot be confirmed is refused explicitly, never
         assumed safe."""
         controller = self.controller
+        try:
+            before = controller.ownership if controller is not None else None
+        except Exception:
+            before = None
         try:
             if controller is not None and controller.ownership in (
                     "owned_empty", "owned_with_child"):
@@ -872,8 +902,15 @@ class ContainmentAdapter:
         except Exception:
             retained = False
         if not retained:
+            self._note_retention(stage, "retention_unconfirmed", "retention_failed", cause,
+                                 before)
             raise self._refuse("retention_failed", "the job could not be confirmed retained "
                                                    "after an uncertain creation outcome") from cause
+        if stage == "creator":
+            self._note_retention(stage, "creator_failed_outcome_unknown", "creation_failed",
+                                 cause, before)
+        else:
+            self._note_retention(stage, "bind_failed_child_may_exist", None, cause, before)
 
     def prepare(self, stdout: Any, stderr: Any) -> ContainmentResult:
         C._require_any_authorization(self.auth)
@@ -900,7 +937,7 @@ class ContainmentAdapter:
         try:
             return self._bind(plan, job, created)
         except BaseException as exc:
-            self._retain_child(exc)
+            self._retain_child(exc, "bind")
             if isinstance(exc, Exception) and not isinstance(exc, (
                     C.ExecutionDisabled, ContainmentRefused, JobFailure, ProvenanceRefused)):
                 raise self._refuse("not_in_job", f"{type(exc).__name__}: {exc}") from None
