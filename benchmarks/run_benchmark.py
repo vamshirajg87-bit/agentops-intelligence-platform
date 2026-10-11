@@ -601,6 +601,116 @@ SELECT json_build_object(
 """
 
 
+#: A gap between two consecutive ingests longer than this is counted as a stall.
+STALL_GAP_MS: float = 100.0
+#: The most Kafka partitions the optional gap diagnostic reports.
+MAX_GAP_PARTITIONS: int = 16
+
+
+def run_gap_sql(run_id: str) -> str:
+    """
+    One optional read-only statement (B3J-84): for one run, the gaps between
+    consecutive ingests, overall and per second, and what each Kafka partition
+    delivered.  ingested_at is NOW(), the start of the span's transaction, and
+    the storage consumer handles one span at a time, so the gap between two
+    consecutive ingests is that consumer's whole cycle for the span (previous
+    commit, offset commit, poll, parse, BEGIN, INSERT).  The first row has no
+    gap (NULL, never 0).  Rows are ordered by ingested_at, then id.  It runs
+    once, after the measured run, and never replaces run_metrics_sql.  The time
+    axis is the one of run_series_sql, bounded in SQL by MAX_TIMED_SERIES_SECONDS;
+    beyond it the per-second arrays are null.  At most MAX_GAP_PARTITIONS
+    partitions are returned.
+    """
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise BenchmarkError(f"bad run id {run_id!r}")
+    cap, stall, parts = MAX_TIMED_SERIES_SECONDS, STALL_GAP_MS, MAX_GAP_PARTITIONS
+    return f"""
+WITH roots AS (
+    SELECT trace_id FROM telemetry_spans
+    WHERE parent_span_id IS NULL AND attributes->>'agentops.workload.run_id' = '{run_id}'
+), spans AS (
+    SELECT id, end_time, ingested_at, kafka_partition, kafka_offset FROM telemetry_spans
+    WHERE trace_id IN (SELECT trace_id FROM roots)
+), base AS (
+    SELECT extract(epoch from date_trunc('second', min(end_time)))::bigint AS t0,
+           extract(epoch from date_trunc('second', max(ingested_at)))::bigint AS t1,
+           count(*) AS n
+    FROM spans
+), grid AS (
+    SELECT g AS off
+    FROM base, generate_series(0::bigint,
+         CASE WHEN t1 >= t0 AND t1 - t0 < {cap} THEN t1 - t0 ELSE -1 END) AS g
+), ordered AS (
+    SELECT s.id, s.kafka_partition, s.kafka_offset, s.ingested_at,
+           extract(epoch from date_trunc('second', s.ingested_at))::bigint - b.t0 AS off,
+           round((extract(epoch from (s.ingested_at
+                 - lag(s.ingested_at) OVER (ORDER BY s.ingested_at, s.id))) * 1000.0)::numeric,
+                 3)::float8 AS gap_ms
+    FROM spans s, base b
+), gaps AS (
+    SELECT * FROM ordered WHERE gap_ms IS NOT NULL
+), gap_all AS (
+    SELECT count(*) AS n,
+           round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap_ms)::numeric, 3)::float8 AS p50,
+           round(percentile_cont(0.9) WITHIN GROUP (ORDER BY gap_ms)::numeric, 3)::float8 AS p90,
+           round(percentile_cont(0.99) WITHIN GROUP (ORDER BY gap_ms)::numeric, 3)::float8 AS p99,
+           max(gap_ms) AS mx,
+           count(*) FILTER (WHERE gap_ms > {stall}) AS stalls
+    FROM gaps
+), gap_s AS (
+    SELECT off, count(*) AS c,
+           round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap_ms)::numeric, 3)::float8 AS med,
+           max(gap_ms) AS mx,
+           count(*) FILTER (WHERE gap_ms > {stall}) AS stalls
+    FROM gaps GROUP BY off
+), ing_s AS (
+    SELECT off, count(*) AS c FROM ordered GROUP BY off
+), part AS (
+    SELECT kafka_partition AS pid, count(*) AS n, min(kafka_offset) AS lo,
+           max(kafka_offset) AS hi, count(DISTINCT kafka_offset) AS d
+    FROM spans GROUP BY kafka_partition ORDER BY kafka_partition LIMIT {parts}
+), part_s AS (
+    SELECT kafka_partition AS pid, off, count(*) AS c FROM ordered GROUP BY kafka_partition, off
+), pcell AS (
+    SELECT p.pid, g.off, coalesce(ps.c, 0) AS c
+    FROM part p CROSS JOIN grid g LEFT JOIN part_s ps ON ps.pid = p.pid AND ps.off = g.off
+), pjson AS (
+    SELECT pid, json_agg(c ORDER BY off) AS arr FROM pcell GROUP BY pid
+)
+SELECT json_build_object(
+  'start_epoch_s', (SELECT t0 FROM base),
+  'end_epoch_s', (SELECT t1 FROM base),
+  'rows', (SELECT n FROM base),
+  'cap_seconds', {cap},
+  'stall_ms', {stall},
+  'partition_limit', {parts},
+  'first_row_offset', (SELECT off FROM ordered ORDER BY ingested_at, id LIMIT 1),
+  'gap_count', (SELECT n FROM gap_all),
+  'gap_p50_ms', (SELECT p50 FROM gap_all),
+  'gap_p90_ms', (SELECT p90 FROM gap_all),
+  'gap_p99_ms', (SELECT p99 FROM gap_all),
+  'gap_max_ms', (SELECT mx FROM gap_all),
+  'stall_gaps', (SELECT stalls FROM gap_all),
+  'ingested', (SELECT json_agg(coalesce(i.c, 0) ORDER BY grid.off)
+               FROM grid LEFT JOIN ing_s i ON i.off = grid.off),
+  'gap_offsets', (SELECT json_agg(grid.off ORDER BY grid.off)
+                  FROM grid JOIN gap_s ON gap_s.off = grid.off),
+  'gap_counts', (SELECT json_agg(gap_s.c ORDER BY grid.off)
+                 FROM grid JOIN gap_s ON gap_s.off = grid.off),
+  'gap_median_ms', (SELECT json_agg(gap_s.med ORDER BY grid.off)
+                    FROM grid JOIN gap_s ON gap_s.off = grid.off),
+  'gap_max_by_second_ms', (SELECT json_agg(gap_s.mx ORDER BY grid.off)
+                           FROM grid JOIN gap_s ON gap_s.off = grid.off),
+  'gap_stall_counts', (SELECT json_agg(gap_s.stalls ORDER BY grid.off)
+                       FROM grid JOIN gap_s ON gap_s.off = grid.off),
+  'partitions', (SELECT json_agg(json_build_object(
+                     'partition', p.pid, 'rows', p.n, 'min_offset', p.lo, 'max_offset', p.hi,
+                     'distinct_offsets', p.d, 'per_second', j.arr) ORDER BY p.pid)
+                 FROM part p LEFT JOIN pjson j ON j.pid = p.pid)
+)
+"""
+
+
 # ---------------------------------------------------------------------------
 # Result assembly
 # ---------------------------------------------------------------------------
@@ -820,6 +930,8 @@ class CellEvidence:
     detector_counts: Optional[Mapping[str, Mapping[str, int]]] = None
     #: Optional (B3J-68): the run_series_sql result, read once after the measured run.
     timed_series: Optional[Mapping[str, Any]] = None
+    #: Optional (B3J-84): the run_gap_sql result, read once after the measured run.
+    gap_series: Optional[Mapping[str, Any]] = None
     disk_free_bytes: Optional[int] = None
     projected_need_bytes: Optional[int] = None
     cleanup_verified: Optional[bool] = None
@@ -1104,6 +1216,285 @@ def _diag_timed_series(evidence: "CellEvidence", clock: Mapping[str, Any],
     else:
         for section, name, unit, source in leaves[3:]:
             found[(section, name)] = M.not_measured(unit, source, "no spans ingested").to_dict()
+    return found
+
+
+GAP_METHOD_NOTE: str = (
+    "gap between consecutive ingested_at values (database clock; the start of each span's "
+    "transaction), ordered by ingested_at then id; the storage consumer is serial, so a gap is "
+    "its whole cycle for a span; the first span has no gap; a gap is attributed to the second "
+    "of the later span")
+
+
+def _whole_number(value: Any, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BenchmarkError(f"{what} is not a whole number")
+    return value
+
+
+def _gap_number(value: Any, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) or value < 0:
+        raise BenchmarkError(f"{what} is not a finite non-negative number")
+    return float(value)
+
+
+def _gap_overall_checked(series: Any, db_rows: Any) -> dict[str, Any]:
+    """The overall gap statistics, or BenchmarkError naming what is wrong."""
+    if not isinstance(series, Mapping):
+        raise BenchmarkError("the ingest-gap query returned no object")
+    rows = series.get("rows")
+    if not rows:
+        raise BenchmarkError("the run has no spans")
+    rows = _whole_number(rows, "rows")
+    if db_rows is not None and rows != db_rows:
+        raise BenchmarkError(f"the ingest-gap query saw {rows} rows, the required query {db_rows}")
+    stall = series.get("stall_ms")
+    if _gap_number(stall, "stall_ms") != STALL_GAP_MS:
+        raise BenchmarkError("the stall threshold is not the documented one")
+    # The query echoes the bounds it was built with; a different one is another query.
+    if _whole_number(series.get("cap_seconds"), "cap_seconds") != MAX_TIMED_SERIES_SECONDS:
+        raise BenchmarkError("the query's window bound is not this version's")
+    if _whole_number(series.get("partition_limit"), "partition_limit") != MAX_GAP_PARTITIONS:
+        raise BenchmarkError("the query's partition limit is not this version's")
+    count = _whole_number(series.get("gap_count"), "gap_count")
+    if count != rows - 1:
+        raise BenchmarkError(f"{count} gaps for {rows} rows (the first row has none)")
+    if count == 0:
+        raise BenchmarkError("fewer than two rows: no gap exists")
+    values = [_gap_number(series.get(key), key) for key in
+              ("gap_p50_ms", "gap_p90_ms", "gap_p99_ms", "gap_max_ms")]
+    if any(low > high + 1e-6 for low, high in zip(values, values[1:])):
+        raise BenchmarkError("the gap percentiles are not ordered")
+    stalls = _whole_number(series.get("stall_gaps"), "stall_gaps")
+    if not 0 <= stalls <= count:
+        raise BenchmarkError("the stall count is outside 0..gap count")
+    # A stall is a gap strictly longer than the threshold, so the maximum decides.
+    if (values[3] > STALL_GAP_MS) != (stalls > 0):
+        raise BenchmarkError("the stall count does not match the maximum gap against "
+                             f"{STALL_GAP_MS} ms")
+    return {"rows": rows, "gaps": count, "p50": values[0], "p90": values[1], "p99": values[2],
+            "max": values[3], "stalls": stalls}
+
+
+def _gap_partitions_checked(series: Any, rows: int) -> list[dict[str, Any]]:
+    """What each partition delivered, or BenchmarkError.  Offsets are reported as
+    counts and bounds only; contiguity is never inferred from min and max."""
+    found = series.get("partitions")
+    if not isinstance(found, list) or not found:
+        raise BenchmarkError("no partition was reported")
+    if len(found) > MAX_GAP_PARTITIONS:
+        raise BenchmarkError(f"more than {MAX_GAP_PARTITIONS} partitions")
+    parts: list[dict[str, Any]] = []
+    previous = -1
+    for item in found:
+        if not isinstance(item, Mapping):
+            raise BenchmarkError("a partition entry is not an object")
+        pid = _whole_number(item.get("partition"), "partition")
+        count = _whole_number(item.get("rows"), "partition rows")
+        low = _whole_number(item.get("min_offset"), "min_offset")
+        high = _whole_number(item.get("max_offset"), "max_offset")
+        distinct = _whole_number(item.get("distinct_offsets"), "distinct_offsets")
+        if pid <= previous or count < 1 or low < 0 or high < low:
+            raise BenchmarkError("partition entries are not increasing, non-empty and ordered")
+        if not 1 <= distinct <= count or distinct > high - low + 1:
+            raise BenchmarkError("distinct offsets do not fit the partition's rows and bounds")
+        previous = pid
+        parts.append({"partition": pid, "rows": count, "min": low, "max": high,
+                      "distinct": distinct, "per_second": item.get("per_second")})
+    if sum(part["rows"] for part in parts) != rows:
+        raise BenchmarkError("the partitions do not add up to the rows")
+    return parts
+
+
+def _gap_seconds_checked(series: Mapping[str, Any], overall: Mapping[str, Any],
+                         parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The per-second gap statistics and per-partition counts on the series' time
+    axis, or BenchmarkError.  Every total is cross-checked; nothing is filled in."""
+    start = series.get("start_epoch_s")
+    end = series.get("end_epoch_s")
+    if start is None or end is None:
+        raise BenchmarkError("the run has no time window")
+    start, end = _whole_number(start, "start"), _whole_number(end, "end")
+    if end < start:
+        raise BenchmarkError("the last ingest is before the first span end")
+    seconds = end - start + 1
+    if seconds > MAX_TIMED_SERIES_SECONDS:
+        raise BenchmarkError(f"the window of {seconds} s exceeds the bound of "
+                             f"{MAX_TIMED_SERIES_SECONDS} s")
+    rows = overall["rows"]
+    ingested = series.get("ingested")
+    if not isinstance(ingested, list) or len(ingested) != seconds:
+        raise BenchmarkError("ingested does not hold one count per second of the window")
+    for item in ingested:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise BenchmarkError("ingested holds a value that is not a count")
+    if sum(ingested) != rows:
+        raise BenchmarkError(f"ingested counts {sum(ingested)} spans, not {rows}")
+    first = _whole_number(series.get("first_row_offset"), "first_row_offset")
+    if not 0 <= first < seconds or ingested[first] < 1:
+        raise BenchmarkError("the first ingested row is outside the window")
+    arrays = [series.get(key) for key in ("gap_offsets", "gap_counts", "gap_median_ms",
+                                          "gap_max_by_second_ms", "gap_stall_counts")]
+    if not all(isinstance(item, list) for item in arrays) or len({len(a) for a in arrays}) != 1:
+        raise BenchmarkError("the per-second gap arrays do not match")
+    offsets, counts, medians, maxima, stall_counts = arrays
+    previous = -1
+    for at, count, median, high, stalls in zip(offsets, counts, medians, maxima, stall_counts):
+        if isinstance(at, bool) or not isinstance(at, int) or not previous < at < seconds:
+            raise BenchmarkError("gap offsets are not increasing seconds of the window")
+        previous = at
+        expected = ingested[at] - (1 if at == first else 0)
+        if _whole_number(count, "gap count") != expected or expected < 1:
+            raise BenchmarkError("a second's gap count does not match its ingested rows")
+        median, high = _gap_number(median, "median"), _gap_number(high, "maximum")
+        if median > high + 1e-6 or high > overall["max"] + 1e-3:
+            raise BenchmarkError("a second's gap statistics are inconsistent")
+        stalls = _whole_number(stalls, "stall count")
+        if not 0 <= stalls <= expected:
+            raise BenchmarkError("a second's stall count is outside 0..its gaps")
+        if (high > STALL_GAP_MS) != (stalls > 0):
+            raise BenchmarkError("a second's stall count does not match its maximum gap "
+                                 f"against {STALL_GAP_MS} ms")
+    if sum(counts) != overall["gaps"] or sum(stall_counts) != overall["stalls"]:
+        raise BenchmarkError("the per-second gaps do not add up to the totals")
+    if abs(max(maxima) - overall["max"]) > 1e-3:
+        raise BenchmarkError("no second holds the overall maximum gap")
+    wanted = sum(1 for at, item in enumerate(ingested) if item - (1 if at == first else 0) > 0)
+    if len(offsets) != wanted:
+        raise BenchmarkError("gap values are missing for seconds with gaps")
+    columns = [0] * seconds
+    for part in parts:
+        per = part["per_second"]
+        if not isinstance(per, list) or len(per) != seconds:
+            raise BenchmarkError("a partition lacks one count per second")
+        for at, item in enumerate(per):
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise BenchmarkError("a partition holds a value that is not a count")
+            columns[at] += item
+        if sum(per) != part["rows"]:
+            raise BenchmarkError("a partition's seconds do not add up to its rows")
+    if columns != ingested:
+        raise BenchmarkError("the partitions do not add up to the ingested counts per second")
+    return {"start": start, "end": end, "seconds": seconds, "offsets": list(offsets),
+            "median": [float(v) for v in medians], "maximum": [float(v) for v in maxima],
+            "stalls": list(stall_counts)}
+
+
+def _diag_ingest_gaps(evidence: "CellEvidence", clock: Mapping[str, Any],
+                      clock_valid: Optional[bool]) -> dict[tuple[str, str], Any]:
+    """The gaps between consecutive ingests and the partitions' progress (B3J-84).
+    The overall gap statistics and the partition totals use only the database's
+    own timestamps and counts.  The per-second values sit on the host-aligned time
+    axis, so, like the timed series, they are reported only when the clock check
+    allows it.  Each part is checked on its own and, when it cannot be, is NOT_MEASURED
+    with the reason."""
+    overall_spec = (("latency", "ingest_gap_ms_p50", "ms", False),
+                    ("latency", "ingest_gap_ms_p90", "ms", False),
+                    ("latency", "ingest_gap_ms_p99", "ms", False),
+                    ("latency", "ingest_gap_ms_max", "ms", False),
+                    ("latency", "ingest_gap_stalls", "gaps", False))
+    partition_spec = (("throughput", "partition_rows", "spans", True),
+                      ("throughput", "partition_offset_min", "offset", True),
+                      ("throughput", "partition_offset_max", "offset", True),
+                      ("throughput", "partition_distinct_offsets", "offsets", True))
+    second_spec = (("latency", "ingest_gap_series_start_epoch_s", "s", False),
+                   ("latency", "ingest_gap_ms_median_by_second", "ms", False),
+                   ("latency", "ingest_gap_ms_max_by_second", "ms", False),
+                   ("latency", "ingest_gap_stalls_by_second", "gaps", False),
+                   ("latency", "ingest_gap_series_offsets_s", "s", False),
+                   ("throughput", "partition_ingested_per_second_series", "spans/s", True))
+    source = "telemetry_spans.ingested_at (database clock)"
+
+    def missing(spec: Any, reason: str) -> dict[tuple[str, str], Any]:
+        return {(sec, name): ({"all": M.not_measured(unit, source, reason).to_dict()} if tree
+                              else M.not_measured(unit, source, reason).to_dict())
+                for sec, name, unit, tree in spec}
+
+    found: dict[tuple[str, str], Any] = {}
+    series = evidence.gap_series
+    if series is None:
+        reason = "the optional ingest-gap query did not run or failed"
+        for spec in (overall_spec, partition_spec, second_spec):
+            found.update(missing(spec, reason))
+        return found
+    db_rows = evidence.database.get("rows") if isinstance(evidence.database, Mapping) else None
+    overall: Optional[dict[str, Any]] = None
+    parts: Optional[list[dict[str, Any]]] = None
+    try:
+        overall = _gap_overall_checked(series, db_rows)
+        window = None
+        method = GAP_METHOD_NOTE + f"; over {overall['gaps']} gaps"
+        for name, key in (("ingest_gap_ms_p50", "p50"), ("ingest_gap_ms_p90", "p90"),
+                          ("ingest_gap_ms_p99", "p99"), ("ingest_gap_ms_max", "max")):
+            found[("latency", name)] = M.Metric(
+                overall[key], "ms", "DERIVED", source,
+                ("percentile (linear) of the " if key != "max" else "maximum of the ")
+                + method, window, overall["gaps"]).to_dict()
+        found[("latency", "ingest_gap_stalls")] = M.Metric(
+            overall["stalls"], "gaps", "OBSERVATION", source,
+            f"gaps longer than {STALL_GAP_MS} ms; " + method, window,
+            overall["gaps"]).to_dict()
+    except BenchmarkError as exc:
+        found.update(missing(overall_spec, str(exc)))
+    if overall is not None:
+        try:
+            parts = _gap_partitions_checked(series, overall["rows"])
+            note = ("per Kafka partition, from kafka_partition and kafka_offset; offsets are "
+                    "counted, not assumed contiguous (compare rows and distinct offsets with "
+                    "max - min + 1)")
+            for name, key, unit in (("partition_rows", "rows", "spans"),
+                                    ("partition_offset_min", "min", "offset"),
+                                    ("partition_offset_max", "max", "offset"),
+                                    ("partition_distinct_offsets", "distinct", "offsets")):
+                found[("throughput", name)] = {
+                    f"p{part['partition']}": M.Metric(
+                        part[key], unit, "OBSERVATION", "telemetry_spans.kafka_offset", note,
+                        None, part["rows"]).to_dict() for part in parts}
+        except BenchmarkError as exc:
+            found.update(missing(partition_spec, str(exc)))
+    else:
+        found.update(missing(partition_spec, "the overall ingest-gap check failed"))
+    if overall is None or parts is None:
+        found.update(missing(second_spec, "a required ingest-gap check failed"))
+        return found
+    if clock_valid is not True:
+        found.update(missing(second_spec, "clock skew not measured" if clock_valid is None
+                             else "clock skew outside its limits: " + "; ".join(clock["reasons"])))
+        return found
+    try:
+        data = _gap_seconds_checked(series, overall, parts)
+    except BenchmarkError as exc:
+        found.update(missing(second_spec, str(exc)))
+        return found
+    window = {"start": _iso(data["start"]), "end": _iso(data["end"] + 1), "clock": "host"}
+    count = len(data["offsets"])
+    where = ("on the axis that starts at ingest_gap_series_start_epoch_s (the whole second of "
+             "the earliest span end, as timed_series_start_epoch_s); seconds without a gap are "
+             "absent, never 0; offsets in ingest_gap_series_offsets_s; ")
+    found[("latency", "ingest_gap_series_start_epoch_s")] = M.Metric(
+        data["start"], "s", "OBSERVATION", "telemetry_spans.end_time (host clock)",
+        "whole-second epoch of the earliest span end_time of the measured run", window,
+        1).to_dict()
+    found[("latency", "ingest_gap_ms_median_by_second")] = M.Metric(
+        data["median"], "ms", "DERIVED", source, "median gap " + where + GAP_METHOD_NOTE,
+        window, count).to_dict()
+    found[("latency", "ingest_gap_ms_max_by_second")] = M.Metric(
+        data["maximum"], "ms", "DERIVED", source, "maximum gap " + where + GAP_METHOD_NOTE,
+        window, count).to_dict()
+    found[("latency", "ingest_gap_stalls_by_second")] = M.Metric(
+        data["stalls"], "gaps", "OBSERVATION", source,
+        f"gaps longer than {STALL_GAP_MS} ms " + where + GAP_METHOD_NOTE, window,
+        count).to_dict()
+    found[("latency", "ingest_gap_series_offsets_s")] = M.Metric(
+        data["offsets"], "s", "OBSERVATION", source,
+        "seconds after the series start of each per-second gap value", window, count).to_dict()
+    found[("throughput", "partition_ingested_per_second_series")] = {
+        f"p{part['partition']}": M.Metric(
+            part["per_second"], "spans/s", "OBSERVATION", "telemetry_spans.ingested_at",
+            "rows ingested per whole second from this partition, one value per second of the "
+            "axis that starts at ingest_gap_series_start_epoch_s, zeros included",
+            window, data["seconds"]).to_dict() for part in parts}
     return found
 
 
@@ -1396,6 +1787,7 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
          lambda: _diag_persistence_max(persistence_ms, window_db, clock, clock_valid)),
         ("detector counts", lambda: _diag_detector_counts(evidence)),
         ("timed series", lambda: _diag_timed_series(evidence, clock, clock_valid)),
+        ("ingest gaps", lambda: _diag_ingest_gaps(evidence, clock, clock_valid)),
         ("cpu series", lambda: _diag_cpu(evidence))))
 
     # -- stop rules and verdict -------------------------------------------------
@@ -1645,6 +2037,11 @@ def execute_cell(
         except Exception as exc:
             evidence.limitations.append(
                 f"diagnostic timed series query not recorded: {type(exc).__name__}")
+        try:   # optional (B3J-84): also read once, after the run; never fails the cell
+            evidence.gap_series = json.loads(smoke.psql(run_gap_sql(cell.measured_run_id)))
+        except Exception as exc:
+            evidence.limitations.append(
+                f"diagnostic ingest gap query not recorded: {type(exc).__name__}")
         smoke.check_host_processes()
         if cell.refresh_and_detector:
             within_budget("the analytics refresh")

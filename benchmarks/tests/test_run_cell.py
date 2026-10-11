@@ -105,6 +105,32 @@ def timed_series_payload(seconds=22, rows=700, start=4999, **changes):
     return payload
 
 
+def gap_series_payload(seconds=22, rows=700, start=4999, **changes):
+    """What run_gap_sql returns for the same run as timed_series_payload: 35 rows a
+    second ingested in seconds 1-20, three partitions (12 + 12 + 11 a second), each gap
+    between 5 and 30 ms.  The first row (in second 1) has no gap."""
+    ingested = [35 if 1 <= i <= 20 else 0 for i in range(seconds)]
+    offsets = [i for i, c in enumerate(ingested) if c]
+    payload = {
+        "start_epoch_s": start, "end_epoch_s": start + seconds - 1, "rows": rows,
+        "cap_seconds": RB.MAX_TIMED_SERIES_SECONDS, "stall_ms": RB.STALL_GAP_MS,
+        "partition_limit": RB.MAX_GAP_PARTITIONS, "first_row_offset": 1,
+        "gap_count": rows - 1, "gap_p50_ms": 14.0, "gap_p90_ms": 20.0, "gap_p99_ms": 28.0,
+        "gap_max_ms": 30.0, "stall_gaps": 0, "ingested": ingested,
+        "gap_offsets": offsets, "gap_counts": [34] + [35] * (len(offsets) - 1),
+        "gap_median_ms": [14.0] * len(offsets), "gap_max_by_second_ms": [30.0] * len(offsets),
+        "gap_stall_counts": [0] * len(offsets),
+        "partitions": [
+            {"partition": 0, "rows": 240, "min_offset": 0, "max_offset": 239,
+             "distinct_offsets": 240, "per_second": [12 if 1 <= i <= 20 else 0 for i in range(seconds)]},
+            {"partition": 1, "rows": 240, "min_offset": 0, "max_offset": 239,
+             "distinct_offsets": 240, "per_second": [12 if 1 <= i <= 20 else 0 for i in range(seconds)]},
+            {"partition": 2, "rows": 220, "min_offset": 0, "max_offset": 219,
+             "distinct_offsets": 220, "per_second": [11 if 1 <= i <= 20 else 0 for i in range(seconds)]}]}
+    payload.update(changes)
+    return payload
+
+
 class FakeSmoke:
     """Records every call; `fail` names the step that raises."""
 
@@ -115,11 +141,12 @@ class FakeSmoke:
     def __init__(self, tmp: Path, *, fail: str = "", cleanup_ok: bool = True,
                  stats: str = "proj-kafka-1|5.0%|100MiB / 1GiB\nproj-pg-1|1.0%|50MiB / 1GiB",
                  lag=0, clock=(1000.0, 1000.001, 1000.002), late_starts=0, dlq=0,
-                 series=None):
+                 series=None, gap=None):
         self.calls: list[str] = []
         self.fail, self.cleanup_ok, self.stats, self.lag = fail, cleanup_ok, stats, lag
         self.clock_sample, self.late_starts, self.dlq = clock, late_starts, dlq
         self.series = series if series is not None else timed_series_payload()
+        self.gap = gap if gap is not None else gap_series_payload()
         self.RATE = self.SEED = self.CONCURRENCY = None
         self.T_DRAIN = self.SETTLE_SECONDS = None
         self.RUN = SimpleNamespace(temp=tmp, python=Path("python"),
@@ -210,6 +237,8 @@ class FakeSmoke:
     def psql(self, sql):
         self._step("psql")
         self.psql_sql.append(sql)
+        if "gap_ms" in sql:                                # the optional ingest-gap query
+            return json.dumps(self.gap)
         if "generate_series" in sql:                       # the optional per-second query
             return json.dumps(self.series)
         rows = 700
@@ -314,7 +343,7 @@ ORDER = ["check_repository", "check_ports", "record_docker_state", "create_works
          "start_postgres", "run_bootstrap", "build_refresh_image", "start_collector",
          "start_host_services", "check_baseline", "run_stage_warmup", "clock_probe",
          "compose_ps", "docker_stats", "run_stage_measured", "docker_stats", "psql",
-         "clock_probe", "psql", "check_host_processes", "refresh_run", "run_detector",
+         "clock_probe", "psql", "psql", "check_host_processes", "refresh_run", "run_detector",
          "check_normal_stack", "stop_host_processes", "remove_profile_resources", "cleanup"]
 
 
@@ -334,7 +363,7 @@ class TestSuccess:
         assert smoke.stage_ids == [cell.warmup_run_id, cell.measured_run_id]
         assert result["counts"]["canonical_records"] == 700        # not 700 + warm-up
         assert result["counts"]["raw_records"] == 100
-        assert len(smoke.psql_sql) == 2            # the required query and the optional series
+        assert len(smoke.psql_sql) == 3            # the required query and two optional ones
         for sql in smoke.psql_sql:
             assert cell.measured_run_id in sql
             assert cell.warmup_run_id not in sql
@@ -1804,7 +1833,19 @@ NEW_LEAVES = (("lag", "raw_series_records"), ("lag", "raw_series_times_s"),
               ("latency", "timed_persistence_ms_max_series"),
               ("latency", "timed_persistence_ms_series_offsets_s"),
               ("resources", "cpu_percent_max"), ("resources", "cpu_percent_series"),
-              ("resources", "cpu_percent_series_times_s"))
+              ("resources", "cpu_percent_series_times_s"),
+              # B3J-84
+              ("latency", "ingest_gap_ms_p50"), ("latency", "ingest_gap_ms_p90"),
+              ("latency", "ingest_gap_ms_p99"), ("latency", "ingest_gap_ms_max"),
+              ("latency", "ingest_gap_stalls"), ("latency", "ingest_gap_series_start_epoch_s"),
+              ("latency", "ingest_gap_ms_median_by_second"),
+              ("latency", "ingest_gap_ms_max_by_second"),
+              ("latency", "ingest_gap_stalls_by_second"),
+              ("latency", "ingest_gap_series_offsets_s"),
+              ("throughput", "partition_rows"), ("throughput", "partition_offset_min"),
+              ("throughput", "partition_offset_max"),
+              ("throughput", "partition_distinct_offsets"),
+              ("throughput", "partition_ingested_per_second_series"))
 RISING_LAG = [(float(10 * i), {"raw": i, "canonical": 10 * i + 1}) for i in range(8)]
 
 
@@ -2007,7 +2048,7 @@ class TestDiagnosticCapture:
         leaf = result["metrics"]["lag"]["sampler_started_epoch_s"]
         assert leaf["value"] == 5003.0                         # the injected wall clock
         assert result["metrics"]["lag"]["samples_taken"]["value"] >= 1
-        assert smoke.calls.count("psql") == 2
+        assert smoke.calls.count("psql") == 3
 
     def test_older_results_without_the_new_leaves_still_validate(self):
         M.validate_result(_without_new_leaves(_assembled(lag_samples=RISING_LAG)))
@@ -2024,7 +2065,10 @@ class TestDiagnosticCapture:
         assert loaded == json.loads(json.dumps(result))
         M.validate_result(loaded)
         plain = json.dumps(_baseline(monkeypatch, **evidence), sort_keys=True)
-        assert len(json.dumps(result, sort_keys=True)) - len(plain) < 6000
+        # B3J-59 allowed 6,000 bytes; B3J-68 and B3J-84 add 9 and 15 not-measured leaves
+        # (about 250 bytes each) when no evidence exists.  A full-length result is bounded
+        # separately in TestIngestGapLeaves.
+        assert len(json.dumps(result, sort_keys=True)) - len(plain) < 14000
 
     def test_no_new_leaf_is_inside_the_percentile_mappings(self):
         latency = _assembled()["metrics"]["latency"]
@@ -2445,12 +2489,12 @@ class TestTimedSeriesInTheCell:
     def test_one_post_run_query_after_the_measured_stage_and_clock_check(self, tmp_path):
         result, _, clean, smoke = _run(tmp_path)
         assert clean and result["verdict"] == "VALID"
-        assert smoke.calls == ORDER and smoke.calls.count("psql") == 2
+        assert smoke.calls == ORDER and smoke.calls.count("psql") == 3
         measured = smoke.calls.index("run_stage_measured")
         assert smoke.calls.index("psql") > measured
         assert smoke.calls[smoke.calls.index("psql") + 1] == "clock_probe"
         assert smoke.calls[smoke.calls.index("clock_probe", measured) + 1] == "psql"
-        first, second = smoke.psql_sql
+        first, second, _gap = smoke.psql_sql
         assert "distinct_spans" in first and "generate_series" not in first
         assert "generate_series" in second and "distinct_spans" not in second
         cell = _cell()
@@ -2793,3 +2837,501 @@ class TestSmallTenThirdRepetition:
         assert LADDER["defaults"]["drain_limit_seconds"] == 120
         assert dict(RB._SMALL10_FIRST) == {k: v for k, v in SMALL10_FIELDS.items()
                                            if k != "repetition"}
+
+
+# ---------------------------------------------------------------------------
+# B3J-84: gaps between consecutive ingests and per-partition progress (nothing is run)
+# ---------------------------------------------------------------------------
+
+GAP_LEAVES = (("latency", "ingest_gap_ms_p50"), ("latency", "ingest_gap_ms_p90"),
+              ("latency", "ingest_gap_ms_p99"), ("latency", "ingest_gap_ms_max"),
+              ("latency", "ingest_gap_stalls"),
+              ("latency", "ingest_gap_series_start_epoch_s"),
+              ("latency", "ingest_gap_ms_median_by_second"),
+              ("latency", "ingest_gap_ms_max_by_second"),
+              ("latency", "ingest_gap_stalls_by_second"),
+              ("latency", "ingest_gap_series_offsets_s"),
+              ("throughput", "partition_rows"), ("throughput", "partition_offset_min"),
+              ("throughput", "partition_offset_max"), ("throughput", "partition_distinct_offsets"),
+              ("throughput", "partition_ingested_per_second_series"))
+GAP_OVERALL = GAP_LEAVES[:5]
+GAP_SECONDS = GAP_LEAVES[5:10] + GAP_LEAVES[14:]
+GAP_PARTITIONS = GAP_LEAVES[10:14]
+
+
+def _gaps(**changes):
+    return _assembled(timed_series=timed_series_payload(),
+                      gap_series=gap_series_payload(**changes))["metrics"]
+
+
+def _is_not_measured(metrics, spec):
+    out = {}
+    for section, name in spec:
+        leaf = metrics[section][name]
+        if "kind" not in leaf:                      # a tree: one leaf per partition, or "all"
+            leaf = leaf["all"] if "all" in leaf else next(iter(leaf.values()))
+        out[name] = (leaf["kind"] == "NOT_MEASURED" and leaf["value"] is None, leaf["reason"])
+    return out
+
+
+class TestIngestGapQuery:
+    def test_the_sql_is_read_only_single_and_scoped_to_the_run(self):
+        import re
+        sql = RB.run_gap_sql("b-small-r0010-c32-m3")
+        words = set(re.findall(r"[a-z_]+", sql.lower()))
+        assert sql.lstrip().upper().startswith("WITH") and ";" not in sql and "--" not in sql
+        assert not words & {"insert", "update", "delete", "drop", "alter", "create", "truncate",
+                            "grant", "revoke", "copy", "vacuum", "set"}
+        assert sql.count("'b-small-r0010-c32-m3'") == 1
+        assert "agentops.workload.run_id' = 'b-small-r0010-c32-m3'" in sql
+        assert "parent_span_id IS NULL" in sql and "trace_id IN (SELECT trace_id FROM roots)" in sql
+        assert "w3" not in sql and sql == RB.run_gap_sql("b-small-r0010-c32-m3")
+
+    @pytest.mark.parametrize("run_id", ["", "x'; DROP TABLE telemetry_spans; --", "B-SMALL",
+                                        "b-small' OR '1'='1", "b-small\n-m2", None])
+    def test_a_bad_run_id_is_refused(self, run_id):
+        with pytest.raises((RB.BenchmarkError, TypeError)):
+            RB.run_gap_sql(run_id)
+
+    def test_the_order_is_deterministic_and_the_first_row_has_no_gap(self):
+        sql = RB.run_gap_sql("b-small-r0010-c32-m3")
+        assert "lag(s.ingested_at) OVER (ORDER BY s.ingested_at, s.id)" in sql
+        assert "ORDER BY ingested_at, id LIMIT 1" in sql        # which row is first
+        assert "coalesce(gap" not in sql.lower() and "gap_ms IS NOT NULL" in sql
+        assert "* 1000.0" in sql and "ingested_at - end_time" not in sql   # a gap, not persistence
+
+    def test_the_window_partitions_and_stall_are_bounded_in_sql(self):
+        sql = RB.run_gap_sql("b-small-r0010-c32-m3")
+        assert str(RB.MAX_TIMED_SERIES_SECONDS) in sql and RB.MAX_TIMED_SERIES_SECONDS == 1800
+        assert "CASE WHEN t1 >= t0 AND t1 - t0 <" in sql
+        assert f"LIMIT {RB.MAX_GAP_PARTITIONS}" in sql and RB.MAX_GAP_PARTITIONS == 16
+        assert f"gap_ms > {RB.STALL_GAP_MS}" in sql and RB.STALL_GAP_MS == 100.0
+
+    def test_the_existing_queries_are_untouched(self):
+        import hashlib
+        assert hashlib.sha256(RB.run_metrics_sql("b-small-r0010-c32-m3").encode()).hexdigest() == (
+            "900ec6a02e15d892a75c62f4f853173f7d72cc484ec5f8de16f727b3fec065ec")
+        assert hashlib.sha256(RB.run_series_sql("b-small-r0010-c32-m3").encode()).hexdigest() == (
+            "98d52bd80b409e2551804633d3571ea228a5380f015dfe3a4a767bbc1308885a")
+        assert "lag(" not in RB.run_series_sql("b-small-r0010-c32-m3")
+
+
+class TestIngestGapLeaves:
+    def test_overall_gap_statistics_are_recorded_with_their_counts(self):
+        latency = _gaps()["latency"]
+        for name, value in (("p50", 14.0), ("p90", 20.0), ("p99", 28.0), ("max", 30.0)):
+            leaf = latency[f"ingest_gap_ms_{name}"]
+            assert leaf["value"] == value and leaf["unit"] == "ms" and leaf["n"] == 699
+            assert leaf["kind"] == "DERIVED" and leaf["source"].endswith("(database clock)")
+            assert "first span has no gap" in leaf["method"]
+        stalls = latency["ingest_gap_stalls"]
+        assert stalls["value"] == 0 and stalls["kind"] == "OBSERVATION" and stalls["n"] == 699
+        assert "100.0 ms" in stalls["method"]
+
+    def test_per_second_values_are_sparse_aligned_and_never_zero_filled(self):
+        latency = _gaps()["latency"]
+        start = latency["ingest_gap_series_start_epoch_s"]
+        assert start["value"] == 4999 == timed_series_payload()["start_epoch_s"]
+        offsets = latency["ingest_gap_series_offsets_s"]["value"]
+        assert offsets == list(range(1, 21))
+        for name in ("ingest_gap_ms_median_by_second", "ingest_gap_ms_max_by_second",
+                     "ingest_gap_stalls_by_second"):
+            assert latency[name]["n"] == len(offsets) == len(latency[name]["value"])
+            assert latency[name]["window"]["clock"] == "host"
+        assert latency["ingest_gap_ms_median_by_second"]["value"][0] == 14.0
+        assert latency["ingest_gap_ms_max_by_second"]["value"] == [30.0] * 20
+        assert "never 0" in latency["ingest_gap_ms_median_by_second"]["method"]
+
+    def test_partitions_are_reported_by_counts_and_bounds(self):
+        throughput = _gaps()["throughput"]
+        assert sorted(throughput["partition_rows"]) == ["p0", "p1", "p2"]
+        assert [throughput["partition_rows"][p]["value"] for p in ("p0", "p1", "p2")] == [
+            240, 240, 220]
+        assert throughput["partition_offset_min"]["p2"]["value"] == 0
+        assert throughput["partition_offset_max"]["p2"]["value"] == 219
+        assert throughput["partition_distinct_offsets"]["p1"]["value"] == 240
+        per_second = throughput["partition_ingested_per_second_series"]
+        assert all(len(per_second[p]["value"]) == 22 for p in per_second)
+        assert [sum(per_second[p]["value"]) for p in ("p0", "p1", "p2")] == [240, 240, 220]
+        assert throughput["partition_rows"]["p0"]["n"] == 240
+
+    def test_offsets_are_never_assumed_contiguous(self):
+        parts = gap_series_payload()["partitions"]
+        parts[0] = {**parts[0], "distinct_offsets": 200, "max_offset": 299}   # holes are real
+        throughput = _gaps(partitions=parts)["throughput"]
+        assert throughput["partition_distinct_offsets"]["p0"]["value"] == 200
+        assert throughput["partition_offset_max"]["p0"]["value"] == 299
+        assert throughput["partition_rows"]["p0"]["value"] == 240
+        too_many = [dict(parts[0], distinct_offsets=241, max_offset=239)] + parts[1:]
+        broken = _gaps(partitions=too_many)["throughput"]["partition_rows"]
+        assert broken["all"]["kind"] == "NOT_MEASURED"        # more distinct offsets than fit
+
+    def test_stalls_are_counted_per_second_and_overall(self):
+        payload = gap_series_payload(
+            gap_p99_ms=250.0, gap_max_ms=900.0, stall_gaps=3,
+            gap_max_by_second_ms=[900.0, 150.0] + [30.0] * 18,
+            gap_stall_counts=[2, 1] + [0] * 18)
+        latency = _assembled(timed_series=timed_series_payload(),
+                             gap_series=payload)["metrics"]["latency"]
+        assert latency["ingest_gap_stalls"]["value"] == 3
+        assert latency["ingest_gap_stalls_by_second"]["value"][:2] == [2, 1]
+        assert latency["ingest_gap_ms_max"]["value"] == 900.0
+
+    def test_unavailable_diagnostics_are_not_measured_never_zero(self):
+        for result in (_assembled(), _assembled(timed_series=timed_series_payload())):
+            for section, name in GAP_LEAVES:
+                leaf = result["metrics"][section][name]
+                leaf = leaf["all"] if name.startswith("partition_") else leaf
+                assert leaf["kind"] == "NOT_MEASURED" and leaf["value"] is None, name
+                assert leaf["reason"] == "the optional ingest-gap query did not run or failed"
+
+    def test_an_invalid_or_missing_clock_keeps_only_the_database_clock_values(self):
+        for evidence, reason in (
+                (dict(clock_before=[], clock_after=[]), "clock skew not measured"),
+                (INVALID_CLOCK, "clock skew outside its limits")):
+            metrics = _assembled(timed_series=timed_series_payload(),
+                                 gap_series=gap_series_payload(), **evidence)["metrics"]
+            for name, (missing, why) in _is_not_measured(metrics, GAP_SECONDS).items():
+                assert missing and why.startswith(reason), (name, why)
+            for name, (missing, why) in _is_not_measured(metrics, GAP_OVERALL).items():
+                assert not missing, name                 # database timestamps only
+            for name, (missing, why) in _is_not_measured(metrics, GAP_PARTITIONS).items():
+                assert not missing, name
+            assert metrics["latency"]["ingest_gap_ms_p99"]["value"] == 28.0
+
+    def test_the_window_bound_loses_only_the_per_second_values(self):
+        cap = RB.MAX_TIMED_SERIES_SECONDS
+        payload = gap_series_payload(end_epoch_s=4999 + cap)            # cap + 1 seconds
+        metrics = _assembled(timed_series=timed_series_payload(),
+                             gap_series=payload)["metrics"]
+        for name, (missing, why) in _is_not_measured(metrics, GAP_SECONDS).items():
+            assert missing and "exceeds the bound of 1800 s" in why, (name, why)
+        assert not any(m for m, _ in _is_not_measured(metrics, GAP_OVERALL).values())
+        assert not any(m for m, _ in _is_not_measured(metrics, GAP_PARTITIONS).values())
+
+    def test_a_series_exactly_at_the_bound_is_accepted(self):
+        cap = RB.MAX_TIMED_SERIES_SECONDS
+        ingested = [700] + [0] * (cap - 1)
+        parts = [{"partition": 0, "rows": 700, "min_offset": 0, "max_offset": 699,
+                  "distinct_offsets": 700, "per_second": [700] + [0] * (cap - 1)}]
+        payload = gap_series_payload(
+            seconds=cap, ingested=ingested, first_row_offset=0, gap_offsets=[0],
+            gap_counts=[699], gap_median_ms=[1.0], gap_max_by_second_ms=[30.0],
+            gap_stall_counts=[0], partitions=parts)
+        metrics = _assembled(timed_series=timed_series_payload(),
+                             gap_series=payload)["metrics"]
+        assert len(metrics["throughput"]["partition_ingested_per_second_series"]["p0"]["value"]) == cap
+        assert not any(m for m, _ in _is_not_measured(metrics, GAP_SECONDS).values())
+
+    @pytest.mark.parametrize("changes, where, why", [
+        (dict(gap_count=700), "overall", "700 gaps for 700 rows"),                  # first row as 0
+        (dict(gap_count=698), "overall", "698 gaps for 700 rows"),
+        (dict(rows=699), "overall", "699 rows, the required query 700"),
+        (dict(rows=0), "overall", "no spans"),
+        (dict(stall_ms=50.0), "overall", "not the documented one"),
+        (dict(gap_p50_ms=float("nan")), "overall", "finite non-negative"),
+        (dict(gap_p50_ms=-1.0), "overall", "finite non-negative"),
+        (dict(gap_p90_ms=True), "overall", "finite non-negative"),
+        (dict(gap_p50_ms=25.0), "overall", "not ordered"),
+        (dict(stall_gaps=700), "overall", "outside 0..gap count"),
+        (dict(gap_max_ms=None), "overall", "finite non-negative"),
+        (dict(partitions=[]), "partitions", "no partition"),
+        (dict(partitions=None), "partitions", "no partition"),
+        (dict(partitions="x"), "partitions", "no partition"),
+        (dict(first_row_offset=21), "seconds", "first ingested row is outside"),
+        (dict(first_row_offset=5), "seconds", "does not match its ingested rows"),
+        (dict(ingested=[35] * 22), "seconds", "counts 770 spans"),
+        (dict(ingested=[35] * 21), "seconds", "one count per second"),
+        (dict(gap_offsets=[1, 1] + list(range(3, 21))), "seconds", "not increasing"),
+        (dict(gap_counts=[35] * 20), "seconds", "does not match its ingested rows"),
+        (dict(gap_median_ms=[40.0] * 20), "seconds", "gap statistics are inconsistent"),
+        (dict(gap_max_by_second_ms=[31.0] * 20), "seconds", "inconsistent"),
+        (dict(stall_gaps=2, gap_max_ms=900.0, gap_max_by_second_ms=[900.0] + [30.0] * 19,
+              gap_stall_counts=[1] + [0] * 19), "seconds", "do not add up to the totals"),
+        (dict(gap_max_by_second_ms=[29.0] * 20), "seconds", "overall maximum"),
+        (dict(gap_offsets=list(range(1, 20)), gap_counts=[34] + [35] * 18,
+              gap_median_ms=[14.0] * 19, gap_max_by_second_ms=[30.0] * 19,
+              gap_stall_counts=[0] * 19), "seconds", "do not add up"),
+        (dict(gap_median_ms=[14.0] * 19), "seconds", "arrays do not match"),
+    ])
+    def test_inconsistent_results_are_not_measured_and_change_nothing(self, changes, where, why):
+        baseline = _assembled()
+        result = _assembled(timed_series=timed_series_payload(),
+                            gap_series=gap_series_payload(**changes))
+        groups = {"overall": GAP_OVERALL, "partitions": GAP_PARTITIONS, "seconds": GAP_SECONDS}
+        reasons = _is_not_measured(result["metrics"], groups[where])
+        assert all(missing for missing, _ in reasons.values()), reasons
+        assert any(why in reason for _, reason in reasons.values()), (why, reasons)
+        assert result["verdict"] == baseline["verdict"] == "VALID"
+        assert result["integrity"] == baseline["integrity"]
+        assert result["stop"] == baseline["stop"] and result["claims"] == baseline["claims"]
+
+    def test_a_partition_that_does_not_add_up_is_caught_in_both_forms(self):
+        parts = gap_series_payload()["partitions"]
+        short = [dict(parts[0], rows=239, distinct_offsets=239, max_offset=238)] + parts[1:]
+        metrics = _gaps(partitions=short)
+        assert "do not add up to the rows" in _is_not_measured(metrics, GAP_PARTITIONS)[
+            "partition_rows"][1]
+        uneven = [dict(parts[0], per_second=[12] * 22)] + parts[1:]
+        reasons = _is_not_measured(_gaps(partitions=uneven), GAP_SECONDS)
+        assert all(missing for missing, _ in reasons.values())
+        assert any("add up" in why for _, why in reasons.values())
+        assert not _is_not_measured(_gaps(partitions=uneven), GAP_OVERALL)[
+            "ingest_gap_ms_p50"][0]
+
+    def test_a_single_row_has_no_gap(self):
+        payload = gap_series_payload(
+            rows=1, gap_count=0, ingested=[0, 1] + [0] * 20, first_row_offset=1, gap_offsets=[],
+            gap_counts=[], gap_median_ms=[], gap_max_by_second_ms=[], gap_stall_counts=[],
+            gap_p50_ms=None, gap_p90_ms=None, gap_p99_ms=None, gap_max_ms=None, stall_gaps=0,
+            partitions=[dict(gap_series_payload()["partitions"][0], rows=1, min_offset=5,
+                             max_offset=5, distinct_offsets=1, per_second=[0, 1] + [0] * 20)])
+        result = _assembled(timed_series=None, gap_series=payload,
+                            db_overrides={"rows": 1, "distinct_spans": 1, "roots": 100})
+        leaf = result["metrics"]["latency"]["ingest_gap_ms_p50"]
+        assert leaf["kind"] == "NOT_MEASURED" and "fewer than two rows" in leaf["reason"]
+
+    def test_nothing_required_changes_with_or_without_the_gap_data(self, monkeypatch):
+        evidence = dict(timed_series=timed_series_payload(), gap_series=gap_series_payload(),
+                        resource_samples=STATS)
+        with_gaps = _assembled(**evidence)
+        baseline = _baseline(monkeypatch, **evidence)
+        stripped = json.loads(json.dumps(with_gaps))
+        for section, name in NEW_LEAVES:
+            stripped["metrics"][section].pop(name, None)
+        assert stripped == baseline
+        assert with_gaps["verdict"] == baseline["verdict"] == "VALID"
+
+    def test_a_failing_builder_is_isolated(self, monkeypatch):
+        monkeypatch.setattr(RB, "_diag_ingest_gaps",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        result = _assembled(gap_series=gap_series_payload())
+        assert "diagnostic ingest gaps not recorded: RuntimeError" in result["limitations"]
+        assert "ingest_gap_ms_p50" not in result["metrics"]["latency"]
+        assert result["verdict"] == "VALID" and result["integrity"]["ok"] is True
+        M.validate_result(result)
+
+    def test_older_results_without_the_gap_leaves_still_validate(self):
+        result = _assembled(timed_series=timed_series_payload(), gap_series=gap_series_payload())
+        older = json.loads(json.dumps(result))
+        for section, name in GAP_LEAVES:
+            older["metrics"][section].pop(name, None)
+        M.validate_result(older)
+        assert "timed_ended_per_second_series" in older["metrics"]["throughput"]
+        M.validate_result(json.loads(json.dumps(result)))
+
+    def test_a_full_length_result_stays_small_enough(self, tmp_path):
+        """The densest result the diagnostics allow: every supported partition, the whole
+        supported window, every second populated in the gap series and the timed series.
+        Measured when it was written: 239,338 bytes compact (763,322 as the pretty-printed
+        file).  The limit is that plus about 15 percent; the floor shows the result is dense."""
+        cap, n = RB.MAX_TIMED_SERIES_SECONDS, RB.MAX_GAP_PARTITIONS
+        rows = cap * n
+        base = [round(10.0 + (i % 97) * 0.731, 3) for i in range(cap)]       # 3-decimal values
+        highs = [round(v + 10.0, 3) for v in base]
+        highs[0] = round(max(highs) + 1.0, 3)                                   # below 100 ms
+        parts = [{"partition": p, "rows": cap, "min_offset": 1000 * p,
+                  "max_offset": 1000 * p + cap - 1, "distinct_offsets": cap,
+                  "per_second": [1] * cap} for p in range(n)]
+        gap = gap_series_payload(
+            seconds=cap, rows=rows, ingested=[n] * cap, first_row_offset=0, gap_count=rows - 1,
+            gap_p50_ms=max(base), gap_p90_ms=max(base) + 1, gap_p99_ms=max(base) + 2,
+            gap_max_ms=max(highs), gap_offsets=list(range(cap)),
+            gap_counts=[n - 1] + [n] * (cap - 1), gap_median_ms=base, gap_max_by_second_ms=highs,
+            gap_stall_counts=[0] * cap, partitions=parts)
+        latency = [round(1000.0 + (i % 997) * 0.731, 3) for i in range(cap)]
+        series = timed_series_payload(
+            seconds=cap, rows=rows, ended=[n] * cap, ingested=[n] * cap,
+            latency_offsets=list(range(cap)), latency_mean_ms=latency,
+            latency_max_ms=[round(v + 100.123, 3) for v in latency])
+        result = _assembled(timed_series=series, gap_series=gap, resource_samples=STATS,
+                            lag_samples=RISING_LAG, db_overrides={
+                                "rows": rows, "distinct_spans": rows, "roots": 100})
+        for section, name in TIMED_LEAVES + GAP_LEAVES:       # every diagnostic is really there
+            leaf = result["metrics"][section][name]
+            leaf = next(iter(leaf.values())) if "kind" not in leaf else leaf
+            assert leaf["kind"] != "NOT_MEASURED", (section, name, leaf.get("reason"))
+        assert len(result["metrics"]["throughput"]["partition_ingested_per_second_series"]) == n
+        size = len(json.dumps(result, sort_keys=True))
+        assert 200_000 < size < 275_000, size
+        path = RB.write_result(result, tmp_path / "out")
+        assert path.stat().st_size < 880_000                  # the pretty-printed file
+        M.validate_result(json.loads(path.read_text(encoding="utf-8")))
+
+
+class TestStallAndEchoConsistency:
+    @staticmethod
+    def _consistent(maximum, stalls):
+        """An overall maximum and stall count that agree, with one second holding the maximum."""
+        return dict(gap_max_ms=maximum, gap_p99_ms=min(28.0, maximum), stall_gaps=stalls,
+                    gap_max_by_second_ms=[maximum] + [min(30.0, maximum)] * 19,
+                    gap_stall_counts=[stalls] + [0] * 19)
+
+    @pytest.mark.parametrize("maximum, stalls", [(30.0, 0), (99.999, 0), (100.0, 0),
+                                                 (100.001, 1), (900.0, 5)])
+    def test_the_strict_threshold_accepts_matching_maximum_and_stalls(self, maximum, stalls):
+        metrics = _gaps(**self._consistent(maximum, stalls))
+        for name, (missing, why) in _is_not_measured(metrics, GAP_OVERALL).items():
+            assert not missing, (name, why)
+        for name, (missing, why) in _is_not_measured(metrics, GAP_SECONDS).items():
+            assert not missing, (name, why)
+        assert metrics["latency"]["ingest_gap_stalls"]["value"] == stalls
+
+    @pytest.mark.parametrize("maximum, stalls", [(100.001, 0), (900.0, 0), (30.0, 1),
+                                                 (99.999, 1), (100.0, 1)])
+    def test_a_mismatch_between_the_maximum_and_the_stall_count_is_not_measured(
+            self, maximum, stalls):
+        baseline = _assembled()
+        result = _assembled(timed_series=timed_series_payload(),
+                            gap_series=gap_series_payload(**self._consistent(maximum, stalls)))
+        reasons = _is_not_measured(result["metrics"], GAP_OVERALL)
+        assert all(missing for missing, _ in reasons.values())
+        assert all("stall count does not match the maximum gap against 100.0 ms" in why
+                   for _, why in reasons.values()), reasons
+        assert result["verdict"] == baseline["verdict"] == "VALID"
+        assert result["integrity"] == baseline["integrity"]
+        assert result["stop"] == baseline["stop"] and result["claims"] == baseline["claims"]
+
+    @pytest.mark.parametrize("seconds_max, seconds_stalls", [
+        ([900.0, 150.0] + [30.0] * 18, [1, 0] + [0] * 18),      # 150 ms second without a stall
+        ([900.0, 30.0] + [30.0] * 18, [1, 1] + [0] * 18),       # a stall in a 30 ms second
+        ([900.0, 100.0] + [30.0] * 18, [1, 1] + [0] * 18),      # exactly 100 ms is no stall
+        ([900.0, 100.001] + [30.0] * 18, [1, 0] + [0] * 18),    # just over the threshold
+        ([900.0, 99.999] + [30.0] * 18, [1, 1] + [0] * 18)])    # just under the threshold
+    def test_a_second_whose_stalls_do_not_match_its_maximum_is_not_measured(
+            self, seconds_max, seconds_stalls):
+        overall_stalls = sum(seconds_stalls)
+        result = _assembled(timed_series=timed_series_payload(), gap_series=gap_series_payload(
+            gap_max_ms=900.0, gap_p99_ms=28.0, stall_gaps=overall_stalls,
+            gap_max_by_second_ms=seconds_max, gap_stall_counts=seconds_stalls))
+        reasons = _is_not_measured(result["metrics"], GAP_SECONDS)
+        assert all(missing for missing, _ in reasons.values()), reasons
+        assert all("a second's stall count does not match its maximum gap" in why
+                   for _, why in reasons.values()), reasons
+        assert not any(m for m, _ in _is_not_measured(result["metrics"], GAP_OVERALL).values())
+        assert result["verdict"] == "VALID"
+
+    @pytest.mark.parametrize("changes, why", [
+        (dict(cap_seconds=5), "window bound is not this version's"),
+        (dict(cap_seconds=RB.MAX_TIMED_SERIES_SECONDS + 1), "window bound is not this version's"),
+        (dict(cap_seconds="1800"), "cap_seconds is not a whole number"),
+        (dict(cap_seconds=None), "cap_seconds is not a whole number"),
+        (dict(cap_seconds=True), "cap_seconds is not a whole number"),
+        (dict(partition_limit=99), "partition limit is not this version's"),
+        (dict(partition_limit=RB.MAX_GAP_PARTITIONS - 1), "partition limit is not this version's"),
+        (dict(partition_limit=None), "partition_limit is not a whole number"),
+        (dict(partition_limit=16.0), "partition_limit is not a whole number")])
+    def test_a_mismatched_configuration_echo_makes_the_diagnostic_not_measured(self, changes, why):
+        baseline = _assembled()
+        result = _assembled(timed_series=timed_series_payload(),
+                            gap_series=gap_series_payload(**changes))
+        for group in (GAP_OVERALL, GAP_PARTITIONS, GAP_SECONDS):
+            assert all(missing for missing, _ in _is_not_measured(result["metrics"], group).values())
+        assert any(why in reason for _, reason in
+                   _is_not_measured(result["metrics"], GAP_OVERALL).values())
+        assert result["verdict"] == baseline["verdict"] == "VALID"
+        assert result["integrity"] == baseline["integrity"]
+
+    def test_a_payload_that_echoes_the_current_constants_is_accepted(self):
+        payload = gap_series_payload()
+        assert (payload["cap_seconds"], payload["partition_limit"]) == (
+            RB.MAX_TIMED_SERIES_SECONDS, RB.MAX_GAP_PARTITIONS) == (1800, 16)
+        assert not any(m for m, _ in _is_not_measured(_gaps(), GAP_OVERALL).values())
+
+
+class TestIngestGapInTheCell:
+    def test_one_more_post_run_query_after_the_series_and_clock_check(self, tmp_path):
+        result, _, clean, smoke = _run(tmp_path)
+        assert clean and result["verdict"] == "VALID"
+        assert smoke.calls == ORDER and smoke.calls.count("psql") == 3
+        measured = smoke.calls.index("run_stage_measured")
+        probe = smoke.calls.index("clock_probe", measured)
+        assert smoke.calls[probe + 1:probe + 3] == ["psql", "psql"]
+        assert smoke.calls.index("psql") > measured and smoke.calls.index("psql") < probe
+        required, series, gaps = smoke.psql_sql
+        cell = _cell()
+        assert required == RB.run_metrics_sql(cell.measured_run_id)
+        assert series == RB.run_series_sql(cell.measured_run_id)
+        assert gaps == RB.run_gap_sql(cell.measured_run_id)
+        assert cell.warmup_run_id not in gaps and cell.measured_run_id in gaps
+
+    def test_the_cell_records_the_gaps_next_to_the_required_metrics(self, tmp_path):
+        result = _run(tmp_path)[0]
+        latency = result["metrics"]["latency"]
+        assert latency["ingest_gap_ms_p99"]["value"] == 28.0
+        assert result["metrics"]["throughput"]["partition_rows"]["p0"]["value"] == 240
+        assert latency["persistence_ms"]["p95"]["kind"] == "DERIVED"          # untouched
+        assert result["metrics"]["throughput"]["persisted_per_second_series"]["n"] == 20
+
+    @pytest.mark.parametrize("how", ["raises", "not_json", "wrong_shape"])
+    def test_a_failure_of_only_the_gap_query_never_changes_the_verdict(
+            self, tmp_path, how):
+        (tmp_path / "good").mkdir()
+        (tmp_path / "bad").mkdir()
+        good = _run(tmp_path / "good")
+        smoke = FakeSmoke(tmp_path / "bad")
+        original = smoke.psql
+
+        def psql(sql):
+            if "gap_ms" not in sql:
+                return original(sql)
+            smoke._step("psql")
+            smoke.psql_sql.append(sql)
+            if how == "raises":
+                raise Boom("gap query failed")
+            return "not json {" if how == "not_json" else "[1, 2, 3]"
+
+        smoke.psql = psql
+        result, path, clean, _ = _run(tmp_path / "bad", smoke=smoke)
+        assert clean and result["verdict"] == good[0]["verdict"] == "VALID"
+        for key in ("integrity", "stop", "claims", "counts", "clock"):
+            assert result[key] == good[0][key], key
+        assert good[0]["metrics"]["throughput"]["timed_ended_per_second_series"][
+            "kind"] == "OBSERVATION"
+        assert result["metrics"]["throughput"]["timed_ended_per_second_series"] == good[0][
+            "metrics"]["throughput"]["timed_ended_per_second_series"]       # the series survives
+        leaf = result["metrics"]["latency"]["ingest_gap_ms_p50"]
+        assert leaf["kind"] == "NOT_MEASURED"
+        if how != "wrong_shape":
+            assert any(t.startswith("diagnostic ingest gap query not recorded")
+                       for t in result["limitations"])
+        assert result["metrics"]["latency"]["persistence_ms"] == good[0]["metrics"]["latency"][
+            "persistence_ms"]
+        M.validate_result(json.loads(path.read_text(encoding="utf-8")))
+
+    def test_a_failing_series_query_leaves_the_gap_query_alone(self, tmp_path):
+        smoke = FakeSmoke(tmp_path)
+        original = smoke.psql
+
+        def psql(sql):
+            if "gap_ms" not in sql and "generate_series" in sql:
+                smoke._step("psql")
+                smoke.psql_sql.append(sql)
+                raise Boom("series query failed")
+            return original(sql)
+
+        smoke.psql = psql
+        result, _, clean, _ = _run(tmp_path, smoke=smoke)
+        assert clean and result["verdict"] == "VALID"
+        assert result["metrics"]["latency"]["ingest_gap_ms_p99"]["value"] == 28.0
+        assert result["metrics"]["throughput"]["timed_ended_per_second_series"][
+            "kind"] == "NOT_MEASURED"
+
+    def test_the_required_query_failing_still_fails_the_cell_before_any_optional_query(
+            self, tmp_path):
+        result, _, clean, smoke = _run(tmp_path, smoke=FakeSmoke(tmp_path, fail="psql"))
+        assert result["verdict"] != "VALID" and smoke.calls.count("psql") == 1
+
+
+class TestB3J84DidNotChangeSafetyOrTheAllowlist:
+    def test_gates_thresholds_ladder_and_the_seven_cell_allowlist_are_unchanged(self):
+        import hashlib
+        assert RB.LIVE_ENABLED is True and RB.MAX_WARMUP_REQUESTS == 10000
+        assert len(RB.APPROVED_LIVE_CELLS) == 7 and sorted(RB.APPROVED_LIVE_CELLS) == SEVEN_CELLS
+        assert "bm-small-r0010-c32-rep4" not in RB.APPROVED_LIVE_CELLS
+        assert hashlib.sha256((Path(_BENCH) / "ladder.json").read_bytes()).hexdigest() == (
+            "571138bb0c10e15547345aca5f15422742ffb03d998e88127c2d7aadc8b2c71f")
+        assert LADDER["stop_limits"]["lag_growth_samples"] == 6
+        assert LADDER["stop_limits"]["late_start_fraction"] == 0.05
+        assert LADDER["defaults"]["sample_interval_seconds"] == 10
+        assert LADDER["defaults"]["cell_budget_seconds"] == 3600
