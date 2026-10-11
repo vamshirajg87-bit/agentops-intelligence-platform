@@ -91,6 +91,20 @@ class Boom(RuntimeError):
     pass
 
 
+def timed_series_payload(seconds=22, rows=700, start=4999, **changes):
+    """What run_series_sql returns for a run of `rows` spans: 35 a second ended in
+    seconds 0-19 and ingested one second later (offsets 1-20), 40 ms each."""
+    ended = [35 if 0 <= i < 20 else 0 for i in range(seconds)]
+    ingested = [35 if 1 <= i <= 20 else 0 for i in range(seconds)]
+    offsets = [i for i, c in enumerate(ingested) if c]
+    payload = {"start_epoch_s": start, "end_epoch_s": start + seconds - 1, "rows": rows,
+               "cap_seconds": RB.MAX_TIMED_SERIES_SECONDS, "ended": ended, "ingested": ingested,
+               "latency_offsets": offsets, "latency_mean_ms": [40.0] * len(offsets),
+               "latency_max_ms": [45.5] * len(offsets)}
+    payload.update(changes)
+    return payload
+
+
 class FakeSmoke:
     """Records every call; `fail` names the step that raises."""
 
@@ -100,10 +114,12 @@ class FakeSmoke:
 
     def __init__(self, tmp: Path, *, fail: str = "", cleanup_ok: bool = True,
                  stats: str = "proj-kafka-1|5.0%|100MiB / 1GiB\nproj-pg-1|1.0%|50MiB / 1GiB",
-                 lag=0, clock=(1000.0, 1000.001, 1000.002), late_starts=0, dlq=0):
+                 lag=0, clock=(1000.0, 1000.001, 1000.002), late_starts=0, dlq=0,
+                 series=None):
         self.calls: list[str] = []
         self.fail, self.cleanup_ok, self.stats, self.lag = fail, cleanup_ok, stats, lag
         self.clock_sample, self.late_starts, self.dlq = clock, late_starts, dlq
+        self.series = series if series is not None else timed_series_payload()
         self.RATE = self.SEED = self.CONCURRENCY = None
         self.T_DRAIN = self.SETTLE_SECONDS = None
         self.RUN = SimpleNamespace(temp=tmp, python=Path("python"),
@@ -194,6 +210,8 @@ class FakeSmoke:
     def psql(self, sql):
         self._step("psql")
         self.psql_sql.append(sql)
+        if "generate_series" in sql:                       # the optional per-second query
+            return json.dumps(self.series)
         rows = 700
         return json.dumps({
             "rows": rows, "distinct_spans": rows, "roots": 100,
@@ -296,7 +314,7 @@ ORDER = ["check_repository", "check_ports", "record_docker_state", "create_works
          "start_postgres", "run_bootstrap", "build_refresh_image", "start_collector",
          "start_host_services", "check_baseline", "run_stage_warmup", "clock_probe",
          "compose_ps", "docker_stats", "run_stage_measured", "docker_stats", "psql",
-         "clock_probe", "check_host_processes", "refresh_run", "run_detector",
+         "clock_probe", "psql", "check_host_processes", "refresh_run", "run_detector",
          "check_normal_stack", "stop_host_processes", "remove_profile_resources", "cleanup"]
 
 
@@ -316,9 +334,10 @@ class TestSuccess:
         assert smoke.stage_ids == [cell.warmup_run_id, cell.measured_run_id]
         assert result["counts"]["canonical_records"] == 700        # not 700 + warm-up
         assert result["counts"]["raw_records"] == 100
-        assert len(smoke.psql_sql) == 1
-        assert cell.measured_run_id in smoke.psql_sql[0]
-        assert cell.warmup_run_id not in smoke.psql_sql[0]
+        assert len(smoke.psql_sql) == 2            # the required query and the optional series
+        for sql in smoke.psql_sql:
+            assert cell.measured_run_id in sql
+            assert cell.warmup_run_id not in sql
 
     def test_timing_kinds(self, tmp_path):
         analytics = _run(tmp_path)[0]["metrics"]["analytics"]
@@ -1774,7 +1793,16 @@ NEW_LEAVES = (("lag", "raw_series_records"), ("lag", "raw_series_times_s"),
               ("lag", "canonical_series_records"), ("lag", "canonical_series_times_s"),
               ("lag", "samples_taken"), ("lag", "sampler_started_epoch_s"),
               ("throughput", "persisted_per_second_series"),
-              ("latency", "persistence_ms_max"), ("analytics", "detector_counts"))
+              ("latency", "persistence_ms_max"), ("analytics", "detector_counts"),
+              # B3J-68
+              ("throughput", "timed_series_start_epoch_s"),
+              ("throughput", "timed_ended_per_second_series"),
+              ("throughput", "timed_ingested_per_second_series"),
+              ("latency", "timed_persistence_ms_mean_series"),
+              ("latency", "timed_persistence_ms_max_series"),
+              ("latency", "timed_persistence_ms_series_offsets_s"),
+              ("resources", "cpu_percent_max"), ("resources", "cpu_percent_series"),
+              ("resources", "cpu_percent_series_times_s"))
 RISING_LAG = [(float(10 * i), {"raw": i, "canonical": 10 * i + 1}) for i in range(8)]
 
 
@@ -1973,11 +2001,11 @@ class TestDiagnosticCapture:
 
     def test_the_cell_records_the_sampler_start_and_keeps_its_call_order(self, tmp_path):
         result, _, clean, smoke = _run(tmp_path)
-        assert clean and smoke.calls == ORDER                  # no new harness call or query
+        assert clean and smoke.calls == ORDER                  # the one post-run query of B3J-68
         leaf = result["metrics"]["lag"]["sampler_started_epoch_s"]
         assert leaf["value"] == 5003.0                         # the injected wall clock
         assert result["metrics"]["lag"]["samples_taken"]["value"] >= 1
-        assert smoke.calls.count("psql") == 1
+        assert smoke.calls.count("psql") == 2
 
     def test_older_results_without_the_new_leaves_still_validate(self):
         M.validate_result(_without_new_leaves(_assembled(lag_samples=RISING_LAG)))
@@ -2210,3 +2238,356 @@ class TestSmallTenSecondRepetition:
         assert LADDER["defaults"]["cell_budget_seconds"] == 3600
         assert LADDER["defaults"]["drain_limit_seconds"] == 120
         assert LADDER["stop_limits"]["late_start_fraction"] == 0.05
+
+
+# ---------------------------------------------------------------------------
+# B3J-68: time-aligned series and retained CPU samples (nothing is run)
+# ---------------------------------------------------------------------------
+
+TIMED_LEAVES = (("throughput", "timed_series_start_epoch_s"),
+                ("throughput", "timed_ended_per_second_series"),
+                ("throughput", "timed_ingested_per_second_series"),
+                ("latency", "timed_persistence_ms_mean_series"),
+                ("latency", "timed_persistence_ms_max_series"),
+                ("latency", "timed_persistence_ms_series_offsets_s"))
+CPU_LEAVES = (("resources", "cpu_percent_max"), ("resources", "cpu_percent_series"),
+              ("resources", "cpu_percent_series_times_s"))
+STATS = [(0.0, [{"name": "kafka", "cpu_percent": 5.0, "memory_used_bytes": 100,
+                 "memory_limit_bytes": 1000},
+                {"name": "pg", "cpu_percent": 0.0, "memory_used_bytes": 50,
+                 "memory_limit_bytes": 1000}]),
+         (14.2, [{"name": "kafka", "cpu_percent": 180.5, "memory_used_bytes": 110,
+                  "memory_limit_bytes": 1000},
+                 {"name": "pg", "cpu_percent": 12.25, "memory_used_bytes": 55,
+                  "memory_limit_bytes": 1000}])]
+INVALID_CLOCK = dict(clock_before=[M.ClockSample(1000.0, 1000.0, 1000.05)],
+                     clock_after=[M.ClockSample(1001.0, 1001.0, 1001.05)])
+
+
+def _timed(**changes):
+    return _assembled(timed_series=timed_series_payload(**changes))["metrics"]
+
+
+class TestTimedSeries:
+    def test_the_sql_is_read_only_bounded_and_scoped_to_the_run(self):
+        import re
+        sql = RB.run_series_sql("b-small-r0010-c32-m2")
+        words = set(re.findall(r"[a-z_]+", sql.lower()))
+        assert sql.lstrip().upper().startswith("WITH") and ";" not in sql
+        assert not words & {"insert", "update", "delete", "drop", "alter", "create", "truncate",
+                            "grant", "revoke", "copy", "vacuum", "set"}
+        assert sql.count("'b-small-r0010-c32-m2'") == 1
+        assert "agentops.workload.run_id' = 'b-small-r0010-c32-m2'" in sql
+        assert "parent_span_id IS NULL" in sql and "trace_id IN (SELECT trace_id FROM roots)" in sql
+        assert str(RB.MAX_TIMED_SERIES_SECONDS) in sql and RB.MAX_TIMED_SERIES_SECONDS == 1800
+        assert "CASE WHEN t1 >= t0 AND t1 - t0 <" in sql        # bounded in SQL, never truncated
+        assert sql == RB.run_series_sql("b-small-r0010-c32-m2")      # deterministic
+        assert "w2" not in sql
+
+    @pytest.mark.parametrize("run_id", ["", "x'; DROP TABLE telemetry_spans; --", "B-SMALL",
+                                        "b-small' OR '1'='1", "b-small\n-m2", None])
+    def test_a_bad_run_id_is_refused(self, run_id):
+        with pytest.raises((RB.BenchmarkError, TypeError)):
+            RB.run_series_sql(run_id)
+
+    def test_persistence_uses_the_same_expression_and_clocks_as_the_required_query(self):
+        expression = "extract(epoch from (ingested_at - end_time)) * 1000.0"
+        assert expression in RB.run_metrics_sql("b-small-r0010-c32-m2")
+        assert expression in RB.run_series_sql("b-small-r0010-c32-m2")
+        leaf = _timed()["latency"]["timed_persistence_ms_max_series"]
+        assert leaf["source"] == "ingested_at (database clock) - end_time (host clock)"
+        assert leaf["kind"] == "DERIVED" and leaf["unit"] == "ms"
+
+    def test_the_required_query_is_untouched(self):
+        import hashlib
+        text = RB.run_metrics_sql("b-small-r0010-c32-m2")
+        assert hashlib.sha256(text.encode()).hexdigest() == (
+            "4d4154095e38f1f58e7ca4018e92379d8b5082ff0d027b37d42c064b4af3a936")
+        assert "generate_series" not in text and "per_second" in text
+
+    def test_the_axis_is_explicit_deterministic_and_aligned(self):
+        first, second = _timed(), _timed()
+        assert first["throughput"] == second["throughput"] and first["latency"] == second["latency"]
+        start = first["throughput"]["timed_series_start_epoch_s"]
+        assert start["value"] == 4999 and start["unit"] == "s" and start["kind"] == "OBSERVATION"
+        assert start["window"] == {"start": RB._iso(4999), "end": RB._iso(5021), "clock": "host"}
+        ended = first["throughput"]["timed_ended_per_second_series"]
+        ingested = first["throughput"]["timed_ingested_per_second_series"]
+        assert len(ended["value"]) == len(ingested["value"]) == ended["n"] == 22
+        assert sum(ended["value"]) == sum(ingested["value"]) == 700
+        assert "epoch" in start["method"] and "index i" in start["method"]
+        offsets = first["latency"]["timed_persistence_ms_series_offsets_s"]["value"]
+        assert offsets == list(range(1, 21))
+        assert all(ingested["value"][i] > 0 for i in offsets)
+        for name in ("timed_persistence_ms_mean_series", "timed_persistence_ms_max_series"):
+            assert first["latency"][name]["n"] == len(offsets) == len(first["latency"][name]["value"])
+        assert first["latency"]["timed_persistence_ms_mean_series"]["value"][0] == 40.0
+        assert first["latency"]["timed_persistence_ms_max_series"]["value"][0] == 45.5
+        assert ingested["source"].endswith("(database clock)")
+        assert ended["source"].endswith("(host clock)")
+
+    def test_zero_seconds_are_observed_zeros_and_latency_has_no_value_for_them(self):
+        metrics = _timed()
+        ended = metrics["throughput"]["timed_ended_per_second_series"]["value"]
+        ingested = metrics["throughput"]["timed_ingested_per_second_series"]["value"]
+        assert ended[:2] == [35, 35] and ended[20:] == [0, 0] and ingested[0] == 0
+        assert ingested[21] == 0 and ingested.count(0) == 2
+        latency = metrics["latency"]["timed_persistence_ms_mean_series"]["value"]
+        assert len(latency) == 20 and 0 not in latency            # 2 empty seconds, no value
+
+    def test_a_series_that_is_all_zeros_but_one_second_validates(self):
+        payload = timed_series_payload(
+            seconds=3, rows=7, start=100, ended=[7, 0, 0], ingested=[0, 0, 7],
+            latency_offsets=[2], latency_mean_ms=[2000.0], latency_max_ms=[2000.0])
+        metrics = _assembled(timed_series=payload, db_overrides={"rows": 7, "distinct_spans": 7,
+                                                                  "roots": 100})["metrics"]
+        assert metrics["throughput"]["timed_ingested_per_second_series"]["value"] == [0, 0, 7]
+
+    def test_missing_measurements_are_not_measured_never_zero(self):
+        for result in (_assembled(), _assembled(timed_series=None)):
+            for section, name in TIMED_LEAVES:
+                leaf = result["metrics"][section][name]
+                assert leaf["kind"] == "NOT_MEASURED" and leaf["value"] is None, name
+                assert leaf["reason"] == "the optional per-second query did not run or failed"
+        no_clock = _assembled(timed_series=timed_series_payload(), clock_before=[],
+                              clock_after=[])["metrics"]
+        invalid = _assembled(timed_series=timed_series_payload(), **INVALID_CLOCK)["metrics"]
+        for metrics, reason in ((no_clock, "clock skew not measured"),
+                                (invalid, "clock skew outside its limits")):
+            for section, name in TIMED_LEAVES:
+                leaf = metrics[section][name]
+                assert leaf["kind"] == "NOT_MEASURED" and leaf["value"] is None
+                assert leaf["reason"].startswith(reason), (name, leaf["reason"])
+
+    def test_a_run_with_no_spans_is_not_measured(self):
+        empty = {"start_epoch_s": None, "end_epoch_s": None, "rows": 0, "cap_seconds": 1800,
+                 "ended": None, "ingested": None, "latency_offsets": None,
+                 "latency_mean_ms": None, "latency_max_ms": None}
+        leaf = _assembled(timed_series=empty)["metrics"]["throughput"][
+            "timed_ended_per_second_series"]
+        assert leaf["kind"] == "NOT_MEASURED" and "no spans" in leaf["reason"]
+
+    def test_the_series_length_bound_is_enforced(self):
+        cap = RB.MAX_TIMED_SERIES_SECONDS
+        at_cap = timed_series_payload(
+            seconds=cap, ended=[0] * (cap - 1) + [700],
+            ingested=[700] + [0] * (cap - 1), latency_offsets=[0],
+            latency_mean_ms=[1.0], latency_max_ms=[1.0])
+        metrics = _assembled(timed_series=at_cap)["metrics"]
+        assert len(metrics["throughput"]["timed_ended_per_second_series"]["value"]) == cap
+        over = timed_series_payload(
+            seconds=cap + 1, ended=[0] * cap + [700], ingested=[700] + [0] * cap,
+            latency_offsets=[0], latency_mean_ms=[1.0], latency_max_ms=[1.0])
+        leaf = _assembled(timed_series=over)["metrics"]["throughput"][
+            "timed_ended_per_second_series"]
+        assert leaf["kind"] == "NOT_MEASURED" and "exceeds the bound of 1800 s" in leaf["reason"]
+
+    @pytest.mark.parametrize("changes, why", [
+        (dict(ended=[35] * 21), "one count per second"),
+        (dict(ingested=[1.5] + [0] * 21), "not a count"),
+        (dict(ingested=[True] + [0] * 21), "not a count"),
+        (dict(ended=[-35] + [35] * 19 + [0, 0]), "not a count"),
+        (dict(ended=[36] + [35] * 19 + [0, 0]), "counts 701 spans, not 700"),
+        (dict(rows=699), "699 rows, the required query 700"),
+        (dict(latency_offsets=[2, 1] + list(range(3, 21)) ), "latency offsets are not increasing"),
+        (dict(latency_offsets=list(range(1, 20)) + [22]), "latency offsets are not increasing"),
+        (dict(latency_mean_ms=[40.0] * 19), "latency arrays do not match"),
+        (dict(latency_mean_ms=[float("nan")] + [40.0] * 19), "not a finite number"),
+        (dict(latency_mean_ms=[50.0] * 20), "mean latency exceeds its maximum"),
+        (dict(latency_offsets=list(range(0, 20))), "no ingested span"),
+        (dict(latency_offsets=list(range(1, 20)), latency_mean_ms=[40.0] * 19,
+              latency_max_ms=[45.0] * 19), "missing for seconds"),
+        (dict(end_epoch_s=4990), "before the first span end"),
+        (dict(start_epoch_s="4999"), "not a whole number"),
+    ])
+    def test_an_inconsistent_series_is_not_measured_and_changes_nothing(self, changes, why):
+        baseline = _assembled()
+        result = _assembled(timed_series=timed_series_payload(**changes))
+        leaf = result["metrics"]["throughput"]["timed_ended_per_second_series"]
+        assert leaf["kind"] == "NOT_MEASURED" and why in leaf["reason"], leaf["reason"]
+        assert result["verdict"] == baseline["verdict"] == "VALID"
+        assert result["integrity"] == baseline["integrity"]
+        assert result["stop"] == baseline["stop"] and result["claims"] == baseline["claims"]
+
+    def test_the_required_metrics_are_identical_with_and_without_the_series(self, monkeypatch):
+        evidence = dict(timed_series=timed_series_payload(), resource_samples=STATS)
+        with_series = _assembled(**evidence)
+        baseline = _baseline(monkeypatch, **evidence)
+        stripped = json.loads(json.dumps(with_series))
+        for section, name in NEW_LEAVES + TIMED_LEAVES + CPU_LEAVES:
+            stripped["metrics"][section].pop(name, None)
+        assert stripped == baseline
+        assert with_series["verdict"] == baseline["verdict"] == "VALID"
+
+    def test_the_builder_failing_is_isolated(self, monkeypatch):
+        monkeypatch.setattr(RB, "_diag_timed_series",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        result = _assembled(timed_series=timed_series_payload())
+        assert "diagnostic timed series not recorded: RuntimeError" in result["limitations"]
+        assert "timed_ended_per_second_series" not in result["metrics"]["throughput"]
+        assert result["verdict"] == "VALID" and result["integrity"]["ok"] is True
+        M.validate_result(result)
+
+    def test_older_results_without_any_new_leaf_still_validate(self):
+        result = _assembled(timed_series=timed_series_payload(), resource_samples=STATS)
+        older = json.loads(json.dumps(result))
+        for section, name in NEW_LEAVES + TIMED_LEAVES + CPU_LEAVES:
+            older["metrics"][section].pop(name, None)
+        M.validate_result(older)
+        assert older["metrics"]["resources"] == {
+            "memory_peak_bytes": result["metrics"]["resources"]["memory_peak_bytes"]}
+
+
+class TestTimedSeriesInTheCell:
+    def test_one_post_run_query_after_the_measured_stage_and_clock_check(self, tmp_path):
+        result, _, clean, smoke = _run(tmp_path)
+        assert clean and result["verdict"] == "VALID"
+        assert smoke.calls == ORDER and smoke.calls.count("psql") == 2
+        measured = smoke.calls.index("run_stage_measured")
+        assert smoke.calls.index("psql") > measured
+        assert smoke.calls[smoke.calls.index("psql") + 1] == "clock_probe"
+        assert smoke.calls[smoke.calls.index("clock_probe", measured) + 1] == "psql"
+        first, second = smoke.psql_sql
+        assert "distinct_spans" in first and "generate_series" not in first
+        assert "generate_series" in second and "distinct_spans" not in second
+        cell = _cell()
+        assert cell.measured_run_id in second and cell.warmup_run_id not in second
+        assert first == RB.run_metrics_sql(cell.measured_run_id)
+        assert second == RB.run_series_sql(cell.measured_run_id)
+
+    def test_the_cell_records_the_series_next_to_the_required_metrics(self, tmp_path):
+        result = _run(tmp_path)[0]
+        series = result["metrics"]["throughput"]["timed_ended_per_second_series"]
+        assert series["kind"] == "OBSERVATION" and sum(series["value"]) == 700
+        assert result["metrics"]["throughput"]["persisted_per_second_series"]["n"] == 20
+        for section, name in TIMED_LEAVES + CPU_LEAVES:
+            assert name in result["metrics"][section]
+
+    @pytest.mark.parametrize("how", ["raises", "not_json", "wrong_shape"])
+    def test_an_optional_query_failure_never_changes_the_verdict(self, tmp_path, monkeypatch, how):
+        (tmp_path / "good").mkdir()
+        (tmp_path / "bad").mkdir()
+        good = _run(tmp_path / "good")
+        smoke = FakeSmoke(tmp_path / "bad")
+        original = smoke.psql
+
+        def psql(sql):
+            if "generate_series" not in sql:
+                return original(sql)
+            smoke._step("psql")
+            smoke.psql_sql.append(sql)
+            if how == "raises":
+                raise Boom("series query failed")
+            return "not json {" if how == "not_json" else "[1, 2, 3]"
+
+        smoke.psql = psql
+        result, path, clean, _ = _run(tmp_path / "bad", smoke=smoke)
+        assert clean and result["verdict"] == good[0]["verdict"] == "VALID"
+        for key in ("integrity", "stop", "claims", "counts", "clock"):
+            assert result[key] == good[0][key], key
+        if how == "wrong_shape":
+            leaf = result["metrics"]["throughput"]["timed_ended_per_second_series"]
+            assert leaf["kind"] == "NOT_MEASURED"
+        else:
+            assert any(t.startswith("diagnostic timed series query not recorded")
+                       for t in result["limitations"])
+            assert result["metrics"]["throughput"]["timed_ended_per_second_series"][
+                "kind"] == "NOT_MEASURED"
+        assert result["metrics"]["latency"]["persistence_ms"] == good[0]["metrics"]["latency"][
+            "persistence_ms"]
+        M.validate_result(json.loads(path.read_text(encoding="utf-8")))
+
+    def test_a_failure_of_the_required_query_still_fails_the_cell_as_before(self, tmp_path):
+        result, _, clean, smoke = _run(tmp_path, smoke=FakeSmoke(tmp_path, fail="psql"))
+        assert result["verdict"] != "VALID"
+        assert smoke.calls.count("psql") == 1          # the optional query never ran
+
+
+class TestRetainedCpu:
+    def test_cpu_is_kept_per_container_from_the_existing_samples(self):
+        resources = _assembled(resource_samples=STATS)["metrics"]["resources"]
+        assert resources["cpu_percent_max"]["kafka"]["value"] == 180.5
+        assert resources["cpu_percent_max"]["pg"]["value"] == 12.25
+        assert resources["cpu_percent_series"]["kafka"]["value"] == [5.0, 180.5]
+        assert resources["cpu_percent_series"]["pg"]["value"] == [0.0, 12.25]   # a real 0.0 stays
+        assert resources["cpu_percent_series_times_s"]["pg"]["value"] == [0.0, 14.2]
+        for name in ("cpu_percent_max", "cpu_percent_series"):
+            assert resources[name]["kafka"]["unit"] == "%" and resources[name]["kafka"]["n"] == 2
+            assert "host processes" in resources[name]["kafka"]["method"]
+        assert resources["memory_peak_bytes"]["kafka"]["value"] == 110      # unchanged
+
+    def test_no_samples_is_not_measured(self):
+        resources = _assembled()["metrics"]["resources"]
+        for name in ("cpu_percent_max", "cpu_percent_series", "cpu_percent_series_times_s"):
+            leaf = resources[name]["all"]
+            assert leaf["kind"] == "NOT_MEASURED" and leaf["reason"] == "no resource samples"
+
+    @pytest.mark.parametrize("bad", [None, "5.0%", "", True, False, float("nan"),
+                                     float("inf"), -1.0, [5.0], {"x": 1}])
+    def test_a_malformed_value_is_skipped_never_zero(self, bad):
+        samples = [(0.0, [{"name": "kafka", "cpu_percent": 1.5, "memory_used_bytes": 1,
+                           "memory_limit_bytes": 10}]),
+                   (10.0, [{"name": "kafka", "cpu_percent": bad, "memory_used_bytes": 1,
+                            "memory_limit_bytes": 10}]),
+                   (20.0, [{"name": "kafka", "memory_used_bytes": 1,
+                            "memory_limit_bytes": 10}])]
+        resources = _assembled(resource_samples=samples)["metrics"]["resources"]
+        assert resources["cpu_percent_series"]["kafka"]["value"] == [1.5]
+        assert resources["cpu_percent_series_times_s"]["kafka"]["value"] == [0.0]
+        assert resources["cpu_percent_max"]["kafka"]["n"] == 1
+
+    def test_every_malformed_shape_is_skipped_by_the_builder(self):
+        evidence = SimpleNamespace(resource_samples=[
+            None, 5, (1.0,), ("late", []), (float("nan"), [{"name": "a", "cpu_percent": 1.0}]),
+            (1.0, None), (1.0, "rows"), (2.0, [None, 3, "row", {"cpu_percent": 4.0},
+                                                {"name": 7, "cpu_percent": 4.0},
+                                                {"name": "ok", "cpu_percent": 7.5}]),
+            (3.0, [{"name": "ok", "cpu_percent": 0}])])
+        added = RB._diag_cpu(evidence)
+        assert added[("resources", "cpu_percent_series")]["ok"]["value"] == [7.5, 0.0]
+        assert added[("resources", "cpu_percent_series_times_s")]["ok"]["value"] == [2.0, 3.0]
+        assert set(added[("resources", "cpu_percent_max")]) == {"ok"}
+        none = RB._diag_cpu(SimpleNamespace(resource_samples=[(1.0, [{"name": "a"}])]))
+        leaf = none[("resources", "cpu_percent_max")]["all"]
+        assert leaf["kind"] == "NOT_MEASURED" and "no sample held a usable cpu_percent" in leaf[
+            "reason"]
+
+    def test_no_new_sampling_and_the_same_sampler_interval(self, tmp_path):
+        result, _, clean, smoke = _run(tmp_path)
+        assert clean and smoke.calls.count("docker_stats") == 2     # as in ORDER, before B3J-68
+        assert smoke.calls == ORDER
+        assert LADDER["defaults"]["sample_interval_seconds"] == 10
+        resources = result["metrics"]["resources"]
+        assert resources["cpu_percent_max"]["proj-kafka-1"]["value"] == 5.0
+
+    def test_cpu_values_never_reach_the_stop_rules_or_the_verdict(self, monkeypatch):
+        seen = []
+        real = M.resource_stops
+
+        def spy(**kwargs):
+            seen.append(sorted(kwargs))
+            return real(**kwargs)
+
+        monkeypatch.setattr(M, "resource_stops", spy)
+        hot = [(at, [dict(row, cpu_percent=100000.0) for row in rows]) for at, rows in STATS]
+        quiet = [(at, [dict(row, cpu_percent=0.0) for row in rows]) for at, rows in STATS]
+        loud, calm = _assembled(resource_samples=hot), _assembled(resource_samples=quiet)
+        assert loud["verdict"] == calm["verdict"] == "VALID"
+        assert loud["stop"] == calm["stop"] and loud["integrity"] == calm["integrity"]
+        assert seen and all("cpu_percent" not in names for names in seen)
+        assert loud["metrics"]["resources"]["memory_peak_bytes"] == calm["metrics"]["resources"][
+            "memory_peak_bytes"]
+
+
+class TestB3J68DidNotChangeSafetyOrTheAllowlist:
+    def test_gates_thresholds_and_the_six_cell_allowlist_are_unchanged(self):
+        assert RB.LIVE_ENABLED is True and RB.MAX_WARMUP_REQUESTS == 10000
+        assert sorted(RB.APPROVED_LIVE_CELLS) == [
+            "bm-small-r0010-c32-rep1", "bm-small-r0010-c32-rep2", "bm-smoke-r0005-c32-rep2",
+            "bm-smoke-r0005-c32-rep3", "bm-smoke-r0005-c32-rep4", "bm-smoke-r0005-c32-rep5"]
+        assert len(RB.APPROVED_LIVE_CELLS) == 6
+        assert "bm-small-r0010-c32-rep3" not in RB.APPROVED_LIVE_CELLS
+        assert LADDER["stop_limits"]["lag_growth_samples"] == 6
+        assert LADDER["stop_limits"]["late_start_fraction"] == 0.05
+        assert LADDER["stop_limits"]["memory_fraction"] == 0.90
+        assert LADDER["defaults"]["cell_budget_seconds"] == 3600

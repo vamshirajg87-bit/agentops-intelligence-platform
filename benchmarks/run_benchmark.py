@@ -534,6 +534,71 @@ SELECT json_build_object(
 """
 
 
+#: The longest observation window, in whole seconds, the optional timed series
+#: will cover.  A longer window is reported as not measured, never truncated.
+MAX_TIMED_SERIES_SECONDS: int = 1800
+
+
+def run_series_sql(run_id: str) -> str:
+    """
+    One optional read-only statement (B3J-68): for one run, the spans ended and
+    the spans ingested in every whole second from the first span end to the
+    last ingest, including seconds with none, and the persistence latency of
+    the seconds that have rows.  It runs once, after the measured run, and
+    never replaces run_metrics_sql.  The window is bounded in SQL: beyond
+    MAX_TIMED_SERIES_SECONDS the grid is empty and every array is null.
+    """
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise BenchmarkError(f"bad run id {run_id!r}")
+    cap = MAX_TIMED_SERIES_SECONDS
+    return f"""
+WITH roots AS (
+    SELECT trace_id FROM telemetry_spans
+    WHERE parent_span_id IS NULL AND attributes->>'agentops.workload.run_id' = '{run_id}'
+), spans AS (
+    SELECT end_time, ingested_at FROM telemetry_spans
+    WHERE trace_id IN (SELECT trace_id FROM roots)
+), base AS (
+    SELECT extract(epoch from date_trunc('second', min(end_time)))::bigint AS t0,
+           extract(epoch from date_trunc('second', max(ingested_at)))::bigint AS t1,
+           count(*) AS n
+    FROM spans
+), grid AS (
+    SELECT g AS off
+    FROM base, generate_series(0::bigint,
+         CASE WHEN t1 >= t0 AND t1 - t0 < {cap} THEN t1 - t0 ELSE -1 END) AS g
+), ended_s AS (
+    SELECT extract(epoch from date_trunc('second', end_time))::bigint - t0 AS off,
+           count(*) AS c
+    FROM spans, base GROUP BY 1
+), ingested_s AS (
+    SELECT extract(epoch from date_trunc('second', ingested_at))::bigint - t0 AS off,
+           count(*) AS c,
+           round(avg(extract(epoch from (ingested_at - end_time)) * 1000.0)::numeric, 3)::float8
+               AS mean_ms,
+           round(max(extract(epoch from (ingested_at - end_time)) * 1000.0)::numeric, 3)::float8
+               AS max_ms
+    FROM spans, base GROUP BY 1
+)
+SELECT json_build_object(
+  'start_epoch_s', (SELECT t0 FROM base),
+  'end_epoch_s', (SELECT t1 FROM base),
+  'rows', (SELECT n FROM base),
+  'cap_seconds', {cap},
+  'ended', (SELECT json_agg(coalesce(e.c, 0) ORDER BY grid.off)
+            FROM grid LEFT JOIN ended_s e ON e.off = grid.off),
+  'ingested', (SELECT json_agg(coalesce(i.c, 0) ORDER BY grid.off)
+               FROM grid LEFT JOIN ingested_s i ON i.off = grid.off),
+  'latency_offsets', (SELECT json_agg(grid.off ORDER BY grid.off)
+                      FROM grid JOIN ingested_s i ON i.off = grid.off),
+  'latency_mean_ms', (SELECT json_agg(i.mean_ms ORDER BY grid.off)
+                      FROM grid JOIN ingested_s i ON i.off = grid.off),
+  'latency_max_ms', (SELECT json_agg(i.max_ms ORDER BY grid.off)
+                     FROM grid JOIN ingested_s i ON i.off = grid.off)
+)
+"""
+
+
 # ---------------------------------------------------------------------------
 # Result assembly
 # ---------------------------------------------------------------------------
@@ -751,6 +816,8 @@ class CellEvidence:
     #: the detector's per-group counts, both read from what the harness already has.
     sampler_started: Optional[float] = None
     detector_counts: Optional[Mapping[str, Mapping[str, int]]] = None
+    #: Optional (B3J-68): the run_series_sql result, read once after the measured run.
+    timed_series: Optional[Mapping[str, Any]] = None
     disk_free_bytes: Optional[int] = None
     projected_need_bytes: Optional[int] = None
     cleanup_verified: Optional[bool] = None
@@ -900,6 +967,192 @@ def _diag_detector_counts(evidence: "CellEvidence") -> dict[tuple[str, str], Any
             f"{field_name} as printed by the detector for the group", None, 1).to_dict()
             for field_name, value in sorted(counts.items())}
         for group, counts in sorted(evidence.detector_counts.items())}}
+
+
+TIMED_SERIES_AXIS_METHOD: str = (
+    "whole-second epoch (floor) of the earliest span end_time of the measured run; index i of "
+    "every timed series is the second start + i.  The window runs to the whole second of the "
+    "last ingested_at and is at most {cap} s.  A 0 is a second inside the window in which "
+    "nothing ended or was ingested; a second with no ingested span has no latency value and is "
+    "absent from the latency series (see timed_persistence_ms_series_offsets_s), never 0")
+CPU_SERIES_NOTE: str = (
+    "docker stats CPU of the container, as a percent of one core (it can exceed 100); it does not "
+    "measure the stream processor and the storage consumer, which run as host processes")
+
+
+def _timed_series_checked(series: Any, db_rows: Any) -> dict[str, Any]:
+    """The timed series, normalized, or BenchmarkError naming what is wrong.
+    Every array must agree with the counts the required query returned, and
+    nothing is repaired or filled in."""
+    if not isinstance(series, Mapping):
+        raise BenchmarkError("the per-second query returned no object")
+    start, end, rows = series.get("start_epoch_s"), series.get("end_epoch_s"), series.get("rows")
+    if start is None or end is None or not rows:
+        raise BenchmarkError("the run has no spans to place on a time axis")
+
+    def whole(value: Any, what: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise BenchmarkError(f"{what} is not a whole number")
+        return value
+
+    start, end, rows = whole(start, "start"), whole(end, "end"), whole(rows, "rows")
+    if end < start:
+        raise BenchmarkError("the last ingest is before the first span end")
+    seconds = end - start + 1
+    if seconds > MAX_TIMED_SERIES_SECONDS:
+        raise BenchmarkError(f"the window of {seconds} s exceeds the bound of "
+                             f"{MAX_TIMED_SERIES_SECONDS} s")
+    if db_rows is not None and rows != db_rows:
+        raise BenchmarkError(f"the per-second query saw {rows} rows, the required query {db_rows}")
+    out: dict[str, Any] = {"start": start, "end": end, "seconds": seconds, "rows": rows}
+    for name in ("ended", "ingested"):
+        counts = series.get(name)
+        if not isinstance(counts, list) or len(counts) != seconds:
+            raise BenchmarkError(f"{name} does not hold one count per second of the window")
+        for item in counts:
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise BenchmarkError(f"{name} holds a value that is not a count")
+        if sum(counts) != rows:
+            raise BenchmarkError(f"{name} counts {sum(counts)} spans, not {rows}")
+        out[name] = list(counts)
+    offsets, mean, peak = (series.get(k) for k in ("latency_offsets", "latency_mean_ms",
+                                                   "latency_max_ms"))
+    if not (isinstance(offsets, list) and isinstance(mean, list) and isinstance(peak, list)
+            and len(offsets) == len(mean) == len(peak)):
+        raise BenchmarkError("the latency arrays do not match")
+    previous = -1
+    for at, low, high in zip(offsets, mean, peak):
+        if isinstance(at, bool) or not isinstance(at, int) or not previous < at < seconds:
+            raise BenchmarkError("latency offsets are not increasing seconds of the window")
+        previous = at
+        if out["ingested"][at] == 0:
+            raise BenchmarkError("a latency value belongs to a second with no ingested span")
+        for value in (low, high):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(value):
+                raise BenchmarkError("a latency value is not a finite number")
+        if low > high + 1e-6:
+            raise BenchmarkError("a mean latency exceeds its maximum")
+    if len(offsets) != sum(1 for item in out["ingested"] if item):
+        raise BenchmarkError("latency values are missing for seconds with ingested spans")
+    out.update(offsets=list(offsets), mean=[float(v) for v in mean], peak=[float(v) for v in peak])
+    return out
+
+
+def _diag_timed_series(evidence: "CellEvidence", clock: Mapping[str, Any],
+                       clock_valid: Optional[bool]) -> dict[tuple[str, str], Any]:
+    """Per-second spans ended and ingested, and persistence latency, on one
+    explicit epoch-second axis (B3J-68).  The axis mixes the host clock (span
+    end) and the database clock (ingest), so, like the persistence
+    percentiles, it is reported only when the clock check allows it."""
+    leaves: tuple[tuple[str, str, str, str], ...] = (
+        ("throughput", "timed_series_start_epoch_s", "s", "telemetry_spans.end_time"),
+        ("throughput", "timed_ended_per_second_series", "spans/s", "telemetry_spans.end_time"),
+        ("throughput", "timed_ingested_per_second_series", "spans/s",
+         "telemetry_spans.ingested_at"),
+        ("latency", "timed_persistence_ms_mean_series", "ms", "ingested_at - end_time"),
+        ("latency", "timed_persistence_ms_max_series", "ms", "ingested_at - end_time"),
+        ("latency", "timed_persistence_ms_series_offsets_s", "s", "ingested_at"))
+
+    def missing(reason: str) -> dict[tuple[str, str], Any]:
+        return {(section, name): M.not_measured(unit, source, reason).to_dict()
+                for section, name, unit, source in leaves}
+
+    if evidence.timed_series is None:
+        return missing("the optional per-second query did not run or failed")
+    if clock_valid is not True:
+        return missing("clock skew not measured" if clock_valid is None
+                       else "clock skew outside its limits: " + "; ".join(clock["reasons"]))
+    db_rows = evidence.database.get("rows") if isinstance(evidence.database, Mapping) else None
+    try:
+        data = _timed_series_checked(evidence.timed_series, db_rows)
+    except BenchmarkError as exc:
+        return missing(str(exc))
+    window = {"start": _iso(data["start"]), "end": _iso(data["end"] + 1), "clock": "host"}
+    seconds = data["seconds"]
+
+    def leaf(value: Any, unit: str, kind: str, source: str, method: str, n: int) -> Any:
+        return M.Metric(value, unit, kind, source, method, window, n).to_dict()
+
+    latency_how = ("per whole second of ingested_at, over the spans ingested in it; valid only "
+                   "within the recorded clock skew; seconds without ingested spans are absent")
+    found: dict[tuple[str, str], Any] = {
+        ("throughput", "timed_series_start_epoch_s"): leaf(
+            data["start"], "s", "OBSERVATION", "telemetry_spans.end_time (host clock)",
+            TIMED_SERIES_AXIS_METHOD.format(cap=MAX_TIMED_SERIES_SECONDS), 1),
+        ("throughput", "timed_ended_per_second_series"): leaf(
+            data["ended"], "spans/s", "OBSERVATION", "telemetry_spans.end_time (host clock)",
+            "spans whose end_time falls in each whole second of the window, zeros included",
+            seconds),
+        ("throughput", "timed_ingested_per_second_series"): leaf(
+            data["ingested"], "spans/s", "OBSERVATION", "telemetry_spans.ingested_at (database clock)",
+            "spans whose ingested_at falls in each whole second of the window, zeros included",
+            seconds)}
+    if data["offsets"]:
+        count = len(data["offsets"])
+        found[("latency", "timed_persistence_ms_mean_series")] = leaf(
+            data["mean"], "ms", "DERIVED", "ingested_at (database clock) - end_time (host clock)",
+            "mean " + latency_how, count)
+        found[("latency", "timed_persistence_ms_max_series")] = leaf(
+            data["peak"], "ms", "DERIVED", "ingested_at (database clock) - end_time (host clock)",
+            "maximum " + latency_how, count)
+        found[("latency", "timed_persistence_ms_series_offsets_s")] = leaf(
+            data["offsets"], "s", "OBSERVATION", "telemetry_spans.ingested_at",
+            "seconds after the series start of each latency value", count)
+    else:
+        for section, name, unit, source in leaves[3:]:
+            found[(section, name)] = M.not_measured(unit, source, "no spans ingested").to_dict()
+    return found
+
+
+def _diag_cpu(evidence: "CellEvidence") -> dict[tuple[str, str], Any]:
+    """The CPU percent of each container from the resource samples the harness
+    already took (no new sampling).  A sample or a row that is missing or not a
+    plain non-negative number is skipped, never counted as 0."""
+    per_container: dict[str, list[tuple[float, float]]] = {}
+    taken = 0
+    for sample in evidence.resource_samples:
+        taken += 1
+        try:
+            at, rows = sample
+            at = float(at)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(at) or not isinstance(rows, (list, tuple)):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping) or not isinstance(row.get("name"), str):
+                continue
+            value = row.get("cpu_percent")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(value) or value < 0:
+                continue
+            per_container.setdefault(row["name"], []).append((at, float(value)))
+    names = ("cpu_percent_max", "cpu_percent_series", "cpu_percent_series_times_s")
+    if not per_container:
+        reason = "no resource samples" if not taken else "no sample held a usable cpu_percent"
+        return {("resources", name): {"all": M.not_measured(
+            "s" if name.endswith("_s") else "%", "docker stats", reason).to_dict()}
+            for name in names}
+    maxima: dict[str, Any] = {}
+    series: dict[str, Any] = {}
+    times: dict[str, Any] = {}
+    for name, pairs in sorted(per_container.items()):
+        values = [value for _, value in pairs]
+        maxima[name] = M.Metric(max(values), "%", "OBSERVATION", "docker stats",
+                                "maximum of samples; " + CPU_SERIES_NOTE, None,
+                                len(values)).to_dict()
+        series[name] = M.Metric(values, "%", "OBSERVATION", "docker stats",
+                                "periodic samples in order; a sample without a usable value is "
+                                "omitted, never 0; " + CPU_SERIES_NOTE, None,
+                                len(values)).to_dict()
+        times[name] = M.Metric([round(at, 3) for at, _ in pairs], "s", "OBSERVATION",
+                               "harness monotonic clock",
+                               "seconds since the samplers started, one per value of "
+                               "cpu_percent_series", None, len(pairs)).to_dict()
+    return {("resources", "cpu_percent_max"): maxima,
+            ("resources", "cpu_percent_series"): series,
+            ("resources", "cpu_percent_series_times_s"): times}
 
 
 def _check_diagnostic_tree(node: Any, path: str) -> None:
@@ -1139,7 +1392,9 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
         ("ingestion series", lambda: _diag_ingest_series(db, window_db)),
         ("persistence maximum",
          lambda: _diag_persistence_max(persistence_ms, window_db, clock, clock_valid)),
-        ("detector counts", lambda: _diag_detector_counts(evidence))))
+        ("detector counts", lambda: _diag_detector_counts(evidence)),
+        ("timed series", lambda: _diag_timed_series(evidence, clock, clock_valid)),
+        ("cpu series", lambda: _diag_cpu(evidence))))
 
     # -- stop rules and verdict -------------------------------------------------
     stop_reasons = list(evidence.stop_reasons)
@@ -1383,6 +1638,11 @@ def execute_cell(
         evidence.stage_tail_seconds = tail if tail >= 0 else None
         evidence.database = json.loads(smoke.psql(run_metrics_sql(cell.measured_run_id)))
         evidence.clock_after = _clock(smoke)
+        try:   # optional (B3J-68): read once, after the run; its failure never fails the cell
+            evidence.timed_series = json.loads(smoke.psql(run_series_sql(cell.measured_run_id)))
+        except Exception as exc:
+            evidence.limitations.append(
+                f"diagnostic timed series query not recorded: {type(exc).__name__}")
         smoke.check_host_processes()
         if cell.refresh_and_detector:
             within_budget("the analytics refresh")
