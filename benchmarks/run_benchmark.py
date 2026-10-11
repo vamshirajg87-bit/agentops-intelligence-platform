@@ -149,15 +149,18 @@ class Cell:
         }
 
 
-#: The only cells live execution may run (Phase 14.4B3H).  rep1 has run and
-#: is not here.  Every field must match, the repetition must be selected with
-#: --repetition, the warm-up given explicitly, and --authorize must name the
-#: cell.
+#: The only cells live execution may run (Phase 14.4B3H; rep4 and rep5 added
+#: in B3J-48d).  rep1 has run and is not here; rep2 and rep3 have run too, and
+#: their ledger records keep them from running again.  Every field must match,
+#: the repetition must be selected with --repetition, the warm-up given
+#: explicitly, and --authorize must name the cell.
 _SMOKE_REPEAT: Mapping[str, Any] = {"level": "SMOKE", "requests": 100, "rate": 5,
                                     "concurrency": 32, "warmup_requests": 25}
 APPROVED_LIVE_CELLS: Mapping[str, Mapping[str, Any]] = {
     "bm-smoke-r0005-c32-rep2": {**_SMOKE_REPEAT, "repetition": 2},
     "bm-smoke-r0005-c32-rep3": {**_SMOKE_REPEAT, "repetition": 3},
+    "bm-smoke-r0005-c32-rep4": {**_SMOKE_REPEAT, "repetition": 4},
+    "bm-smoke-r0005-c32-rep5": {**_SMOKE_REPEAT, "repetition": 5},
 }
 MAX_WARMUP_REQUESTS: int = 10000
 _SHA_RE = re.compile(r"[0-9a-f]{40}")

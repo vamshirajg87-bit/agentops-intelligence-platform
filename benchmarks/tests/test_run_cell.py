@@ -542,7 +542,7 @@ class TestLiveAuthorization:
     @pytest.mark.parametrize("authorize", [None, "", "bm-smoke-r0010-c32-rep2",
                                            "bm-small-r0005-c32-rep2",
                                            "bm-smoke-r0005-c32-rep1",
-                                           "bm-smoke-r0005-c32-rep4"])
+                                           "bm-smoke-r0005-c32-rep6"])
     def test_missing_or_wrong_authorization(self, authorize):
         with pytest.raises(RB.BenchmarkError, match="authorize"):
             _authorize(_approved_cells(), authorize=authorize)
@@ -662,7 +662,7 @@ class TestLiveCli:
         for name in ("run_smoke", "run_e2e"):
             monkeypatch.delitem(sys.modules, name, raising=False)
         for cell in (_approved_cells(warmup_requests=150)[0], _approved_cells(rates=[10])[0],
-                     _approved_cells(repetition=1)[0], _approved_cells(repetition=4)[0]):
+                     _approved_cells(repetition=1)[0], _approved_cells(repetition=6)[0]):
             with pytest.raises(RB.BenchmarkError, match="not an approved live cell"):
                 RB.run_cell(cell, LADDER, expect_head=HEAD, output_dir=tmp_path)
         assert "run_smoke" not in sys.modules and "run_e2e" not in sys.modules
@@ -968,8 +968,10 @@ class TestHistoricalCompatibility:
 class TestCorrectionsKeepSafety:
     def test_authorization_and_isolation_unchanged(self, tmp_path, monkeypatch, capsys):
         assert sorted(RB.APPROVED_LIVE_CELLS) == ["bm-smoke-r0005-c32-rep2",
-                                                 "bm-smoke-r0005-c32-rep3"]
-        assert [c["repetition"] for c in RB.APPROVED_LIVE_CELLS.values()] == [2, 3]
+                                                 "bm-smoke-r0005-c32-rep3",
+                                                 "bm-smoke-r0005-c32-rep4",
+                                                 "bm-smoke-r0005-c32-rep5"]
+        assert [c["repetition"] for c in RB.APPROVED_LIVE_CELLS.values()] == [2, 3, 4, 5]
         with pytest.raises(LiveAccessAttempt):
             subprocess.run(["docker", "ps"])
         monkeypatch.setattr(RB, "LIVE_ENABLED", False)
@@ -1177,8 +1179,8 @@ class TestLiveFlowWithLedger:
         assert self._main(tmp_path, 2)[0] == 0 and self._main(tmp_path, 3)[0] == 0
         assert open_gate["calls"] == ["bm-smoke-r0005-c32-rep2", "bm-smoke-r0005-c32-rep3"]
 
-    @pytest.mark.parametrize("n", [1, 4])
-    def test_rep1_and_rep4_refused(self, open_gate, tmp_path, n, capsys):
+    @pytest.mark.parametrize("n", [1, 6])
+    def test_rep1_and_rep6_refused(self, open_gate, tmp_path, n, capsys):
         import io
         assert RB.main(_rep_args(n, "--output-dir", str(tmp_path)), stdout=io.StringIO()) == 2
         assert open_gate["calls"] == [] and "nothing was started" in capsys.readouterr().err
@@ -1364,3 +1366,145 @@ class TestStartLagDiagnosticInResults:
             path = base / name
             if path.exists():
                 assert hashlib.sha256(path.read_bytes()).hexdigest().startswith(prefix)
+
+
+# ---------------------------------------------------------------------------
+# B3J-48d: SMOKE repetitions 4 and 5 are approved cells (nothing is run)
+# ---------------------------------------------------------------------------
+
+SMOKE_REPEAT_FIELDS = {"level": "SMOKE", "requests": 100, "rate": 5, "concurrency": 32,
+                       "warmup_requests": 25}
+
+
+class TestSmokeRepetitionsFourAndFive:
+    @pytest.mark.parametrize("n", [4, 5])
+    def test_recognised_as_approved_with_the_smoke_configuration(self, n):
+        cell = _approved_cells(repetition=n)[0]
+        bid = f"bm-smoke-r0005-c32-rep{n}"
+        assert cell.benchmark_id == bid and RB.is_approved_live_cell(cell)
+        assert dict(RB.APPROVED_LIVE_CELLS[bid]) == {**SMOKE_REPEAT_FIELDS, "repetition": n}
+        assert (cell.level, cell.requests, cell.rate, cell.concurrency, cell.repetition,
+                cell.warmup_requests) == ("SMOKE", 100, 5, 32, n, 25)
+        checked = _authorize(_approved_cells(repetition=n), authorize=bid, repetition=n)
+        assert checked == cell
+
+    def test_exactly_the_four_expected_cells_are_approved(self):
+        assert sorted(RB.APPROVED_LIVE_CELLS) == [f"bm-smoke-r0005-c32-rep{n}"
+                                                  for n in (2, 3, 4, 5)]
+        assert [c["repetition"] for _, c in sorted(RB.APPROVED_LIVE_CELLS.items())] == [2, 3, 4, 5]
+        for approved in RB.APPROVED_LIVE_CELLS.values():
+            assert {k: v for k, v in approved.items() if k != "repetition"} == SMOKE_REPEAT_FIELDS
+
+    def test_planned_ids_and_run_ids_are_distinct_across_all_repetitions(self):
+        cells = [_approved_cells(repetition=n)[0] for n in (2, 3, 4, 5)]
+        for attribute in ("benchmark_id", "warmup_run_id", "measured_run_id"):
+            values = [getattr(c, attribute) for c in cells]
+            assert len(set(values)) == 4, attribute
+        assert [(c.benchmark_id, c.warmup_run_id, c.measured_run_id) for c in cells[2:]] == [
+            ("bm-smoke-r0005-c32-rep4", "b-smoke-r0005-c32-w4", "b-smoke-r0005-c32-m4"),
+            ("bm-smoke-r0005-c32-rep5", "b-smoke-r0005-c32-w5", "b-smoke-r0005-c32-m5")]
+        for cell in cells:
+            assert RB.RUN_ID_RE.fullmatch(cell.warmup_run_id)
+            assert RB.RUN_ID_RE.fullmatch(cell.measured_run_id)
+
+    @pytest.mark.parametrize("n", [4, 5])
+    @pytest.mark.parametrize("overrides", [dict(rates=[10]), dict(concurrency=16),
+                                           dict(warmup_requests=30)])
+    def test_incorrect_parameters_are_refused(self, n, overrides):
+        with pytest.raises(RB.BenchmarkError):
+            _authorize(_approved_cells(repetition=n, **overrides),
+                       authorize=f"bm-smoke-r0005-c32-rep{n}", repetition=n)
+
+    @pytest.mark.parametrize("n", [4, 5])
+    def test_wrong_selection_or_warmup_is_refused(self, n):
+        bid = f"bm-smoke-r0005-c32-rep{n}"
+        for repetition in (None, 2, 3, 6, n + 1 if n == 4 else 4):
+            with pytest.raises(RB.BenchmarkError, match="repetition"):
+                _authorize(_approved_cells(repetition=n), authorize=bid, repetition=repetition)
+        for warmup in (None, 24, 26):
+            with pytest.raises(RB.BenchmarkError, match="warmup-requests 25"):
+                _authorize(_approved_cells(repetition=n), authorize=bid, repetition=n,
+                           warmup_requests=warmup)
+        with pytest.raises(RB.BenchmarkError, match="is not bm-smoke-r0005-c32-rep%d" % n):
+            _authorize(_approved_cells(repetition=9 - n), authorize=bid, repetition=n)
+
+    @pytest.mark.parametrize("authorize", ["bm-smoke-r0005-c32-rep6", "bm-smoke-r0005-c32-rep10",
+                                           "bm-smoke-r0005-c32-rep1",
+                                           "bm-small-r0010-c32-rep1", "bm-small-r0005-c32-rep4",
+                                           "bm-smoke-r0010-c32-rep4"])
+    def test_rep6_rep1_and_small_cells_stay_refused(self, authorize):
+        with pytest.raises(RB.BenchmarkError, match="authorize"):
+            _authorize(_approved_cells(repetition=4), authorize=authorize, repetition=4)
+        for cell in (_approved_cells(repetition=6)[0], _approved_cells(repetition=1)[0],
+                     RB.plan_cells(LADDER, "SMALL", rates=[10], repetition=1,
+                                   concurrency=32, warmup_requests=25)[0]):
+            assert not RB.is_approved_live_cell(cell), cell.benchmark_id
+
+    def test_cell_fields_must_match_the_approved_ones_exactly(self):
+        base = _approved_cells(repetition=4)[0]
+        for change in (dict(requests=101), dict(rate=10), dict(concurrency=31),
+                       dict(warmup_requests=26), dict(repetition=6), dict(level="SMALL")):
+            assert not RB.is_approved_live_cell(dataclasses.replace(base, **change)), change
+
+    @pytest.mark.parametrize("n", [4, 5])
+    def test_main_with_the_gate_closed_refuses_before_anything(self, n, monkeypatch, tmp_path,
+                                                               capsys):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", False)
+        out = tmp_path / "out"
+        code = RB.main(["--level", "SMOKE", "--rate", "5", "--repetition", str(n),
+                        "--concurrency", "32", "--warmup-requests", "25", "--live",
+                        "--authorize", f"bm-smoke-r0005-c32-rep{n}", "--expect-head", HEAD,
+                        "--output-dir", str(out)])
+        assert code == 2 and "not enabled" in capsys.readouterr().err
+        assert not out.exists()
+
+    @pytest.mark.parametrize("n", [4, 5])
+    def test_main_in_plan_mode_touches_nothing(self, n, tmp_path):
+        import io
+        out = io.StringIO()
+        target = tmp_path / "plan-only"
+        assert RB.main(["--level", "SMOKE", "--rate", "5", "--repetition", str(n),
+                        "--concurrency", "32", "--warmup-requests", "25",
+                        "--output-dir", str(target)], stdout=out) == 0
+        assert f"bm-smoke-r0005-c32-rep{n}" in out.getvalue() and "PLAN ONLY" in out.getvalue()
+        assert not target.exists()
+
+    @pytest.mark.parametrize("n", [4, 5])
+    def test_a_new_claim_leaves_existing_rep2_and_rep3_records_unchanged(self, n, tmp_path):
+        ledger = tmp_path / "ledger"
+        ledger.mkdir()
+        existing = {}
+        for old in (2, 3):
+            for suffix, body in ((".started", "started-%d\n"), (".done", "done-%d\n")):
+                path = ledger / f"bm-smoke-r0005-c32-rep{old}{suffix}"
+                path.write_text(body % old, encoding="utf-8", newline="")
+                existing[path] = path.read_bytes()
+        result = tmp_path / "bm-smoke-r0005-c32-rep2-20261008T190552.json"
+        result.write_text("{}", encoding="utf-8")
+        existing[result] = result.read_bytes()
+        cell, started = _claim(tmp_path, n=n)
+        assert started == ledger / f"bm-smoke-r0005-c32-rep{n}.started" and started.is_file()
+        for path, content in existing.items():
+            assert path.read_bytes() == content, path.name
+        assert sorted(p.name for p in ledger.iterdir()) == sorted(
+            [f"bm-smoke-r0005-c32-rep{k}{s}" for k in (2, 3) for s in (".started", ".done")]
+            + [f"bm-smoke-r0005-c32-rep{n}.started"])
+
+    @pytest.mark.parametrize("n", [2, 3])
+    def test_consumed_cells_stay_blocked_by_their_ledger_records(self, n, tmp_path):
+        cell, started = _claim(tmp_path, n=n)
+        (tmp_path / RB.OWNER_FILE).unlink()          # as after a released run
+        with pytest.raises(RB.BenchmarkError, match="was started before"):
+            _claim(tmp_path, n=n)
+        assert started.is_file()
+
+    def test_rep4_and_rep5_cannot_be_claimed_together(self, tmp_path):
+        _claim(tmp_path, n=4)
+        with pytest.raises(RB.BenchmarkError, match="owns this output directory"):
+            _claim(tmp_path, n=5)
+        assert not (tmp_path / "ledger" / "bm-smoke-r0005-c32-rep5.started").exists()
+
+    def test_the_gates_and_measurement_inputs_are_untouched(self):
+        assert RB.LIVE_ENABLED is True            # unchanged by this step
+        assert RB.MAX_WARMUP_REQUESTS == 10000
+        assert dict(RB._SMOKE_REPEAT) == {**SMOKE_REPEAT_FIELDS}
