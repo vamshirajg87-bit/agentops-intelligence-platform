@@ -235,8 +235,10 @@ class FakeE2E:
     def run_detector(self, label):
         self.smoke._step("run_detector")
         return ([{"signal_path": "trace_latency", "operation_name": "agentops.request",
-                  "duration_ms": "12.5"},
-                 {"signal_path": "tool_failure", "operation_name": "", "duration_ms": "3"}], {})
+                  "duration_ms": "12.5", "candidates": "1300", "emitted": "22",
+                  "inserted": "22", "duplicate": "0"},
+                 {"signal_path": "tool_failure", "operation_name": "", "duration_ms": "3",
+                  "candidates": "1300", "emitted": "0", "inserted": "0", "duplicate": "0"}], {})
 
     def remove_profile_resources(self):
         self.smoke.calls.append("remove_profile_resources")
@@ -1760,3 +1762,239 @@ class TestSmallTenFirstCell:
         assert dict(RB._SMALL10_FIRST) == {k: v for k, v in SMALL10_FIELDS.items()
                                            if k != "repetition"}
         assert RB.projected_need_bytes(_small()) > RB.projected_need_bytes(_cell())
+
+
+# ---------------------------------------------------------------------------
+# B3J-59: optional diagnostics preserved in the result (nothing is run)
+# ---------------------------------------------------------------------------
+
+NEW_LEAVES = (("lag", "raw_series_records"), ("lag", "raw_series_times_s"),
+              ("lag", "canonical_series_records"), ("lag", "canonical_series_times_s"),
+              ("lag", "samples_taken"), ("lag", "sampler_started_epoch_s"),
+              ("throughput", "persisted_per_second_series"),
+              ("latency", "persistence_ms_max"), ("analytics", "detector_counts"))
+RISING_LAG = [(float(10 * i), {"raw": i, "canonical": 10 * i + 1}) for i in range(8)]
+
+
+def _without_new_leaves(result):
+    stripped = json.loads(json.dumps(result))
+    for section, name in NEW_LEAVES:
+        stripped["metrics"][section].pop(name, None)
+    return stripped
+
+
+def _baseline(monkeypatch, **evidence):
+    """The same evidence assembled with the diagnostics switched off."""
+    monkeypatch.setattr(RB, "_add_diagnostics", lambda *args, **kwargs: None)
+    return _assembled(**evidence)
+
+
+class TestDiagnosticCapture:
+    def test_lag_series_and_times_are_preserved(self):
+        samples = [(0.0, {"raw": 0, "canonical": 0}), (10.02, {"raw": 3, "canonical": 120}),
+                   (20.0, {"raw": 2, "canonical": 277}), (30.0449, {"raw": 0, "canonical": 10})]
+        lag = _assembled(lag_samples=samples)["metrics"]["lag"]
+        assert lag["raw_series_records"]["value"] == [0, 3, 2, 0]
+        assert lag["canonical_series_records"]["value"] == [0, 120, 277, 10]
+        assert lag["raw_series_times_s"]["value"] == [0.0, 10.02, 20.0, 30.045]
+        assert lag["canonical_series_times_s"]["value"] == [0.0, 10.02, 20.0, 30.045]
+        for name in ("raw_series_records", "canonical_series_records", "raw_series_times_s",
+                     "canonical_series_times_s"):
+            assert lag[name]["kind"] == "OBSERVATION" and lag[name]["n"] == 4
+        assert lag["samples_taken"]["value"] == 4 and lag["samples_taken"]["kind"] == "OBSERVATION"
+        assert max(lag["canonical_series_records"]["value"]) == lag["canonical_max"]["value"] == 277
+        assert max(lag["raw_series_records"]["value"]) == lag["raw_max"]["value"] == 3
+
+    def test_failed_samples_are_omitted_and_never_zero(self):
+        samples = [(0.0, {"raw": 1, "canonical": 5}), (10.0, None),
+                   (20.0, {"raw": None, "canonical": 9}), (30.0, {"raw": 4, "canonical": None})]
+        lag = _assembled(lag_samples=samples)["metrics"]["lag"]
+        assert lag["raw_series_records"]["value"] == [1, 4]
+        assert lag["raw_series_times_s"]["value"] == [0.0, 30.0]
+        assert lag["canonical_series_records"]["value"] == [5, 9]
+        assert lag["canonical_series_times_s"]["value"] == [0.0, 20.0]
+        assert lag["samples_taken"]["value"] == 4                 # attempted, failed ones included
+        assert lag["raw_series_records"]["n"] == lag["raw_series_times_s"]["n"] == 2
+        assert 0 not in lag["canonical_series_records"]["value"]
+
+    def test_no_samples_or_only_failed_samples_are_not_measured(self):
+        lag = _assembled()["metrics"]["lag"]                      # no samples at all
+        for name in ("raw_series_records", "raw_series_times_s", "canonical_series_records",
+                     "canonical_series_times_s", "samples_taken"):
+            assert lag[name]["kind"] == "NOT_MEASURED" and lag[name]["value"] is None, name
+        assert "no lag samples" in lag["raw_series_records"]["reason"]
+        failed = _assembled(lag_samples=[(0.0, None), (10.0, None)])["metrics"]["lag"]
+        assert failed["raw_series_records"]["kind"] == "NOT_MEASURED"
+        assert failed["raw_series_records"]["reason"] == "every sample failed"
+        assert failed["samples_taken"]["value"] == 2
+
+    def test_sampler_start_is_optional(self):
+        assert "sampler_started_epoch_s" not in _assembled()["metrics"]["lag"]
+        leaf = _assembled(sampler_started=5000.5)["metrics"]["lag"]["sampler_started_epoch_s"]
+        assert leaf["value"] == 5000.5 and leaf["kind"] == "OBSERVATION" and leaf["n"] == 1
+        assert leaf["window"] == {"start": RB._iso(5000.5), "end": RB._iso(5000.5),
+                                  "clock": "host"}
+        assert "after this instant" in leaf["method"]
+
+    def test_ingestion_histogram_is_preserved_with_its_limits_stated(self):
+        counts = [41, 69, 71, 70, 68]
+        result = _assembled(db_overrides={"per_second": counts})
+        leaf = result["metrics"]["throughput"]["persisted_per_second_series"]
+        assert leaf["value"] == counts and leaf["n"] == 5 and leaf["kind"] == "OBSERVATION"
+        assert leaf["window"] == {"start": RB._iso(5000.0), "end": RB._iso(5020.0),
+                                  "clock": "database"}
+        for phrase in ("counts only", "seconds with no rows are omitted",
+                       "no bucket carries a timestamp", "gaps are not represented"):
+            assert phrase in leaf["method"], phrase
+        assert len(leaf["value"]) == len(counts)          # nothing was padded for missing seconds
+
+    @pytest.mark.parametrize("db_overrides", [{"per_second": []}, {"per_second": None}])
+    def test_missing_or_empty_histogram_is_not_measured(self, db_overrides):
+        leaf = _assembled(db_overrides=db_overrides)["metrics"]["throughput"][
+            "persisted_per_second_series"]
+        assert leaf["kind"] == "NOT_MEASURED" and leaf["value"] is None
+        assert "no per-second counts" in leaf["reason"]
+
+    def test_no_database_result_is_handled(self):
+        result = _assembled(database=None)
+        leaf = result["metrics"]["throughput"]["persisted_per_second_series"]
+        assert leaf["kind"] == "NOT_MEASURED" and leaf["reason"] == "no database result"
+        assert result["metrics"]["latency"]["persistence_ms_max"]["kind"] == "NOT_MEASURED"
+
+    def test_persistence_maximum_with_a_valid_clock(self):
+        values = [10.0, 20.0, 4120.7, 30.0]
+        leaf = _assembled(db_overrides={"persistence_ms": values})["metrics"]["latency"][
+            "persistence_ms_max"]
+        assert leaf["value"] == 4120.7 and leaf["kind"] == "DERIVED" and leaf["n"] == 4
+        assert leaf["window"]["clock"] == "database"
+
+    def test_persistence_maximum_is_not_reported_with_an_invalid_clock(self, tmp_path):
+        result = _run(tmp_path, smoke=FakeSmoke(tmp_path, clock=(1000.0, 1000.0, 1000.05)))[0]
+        assert result["clock"]["valid"] is False
+        leaf = result["metrics"]["latency"]["persistence_ms_max"]
+        assert leaf["kind"] == "NOT_MEASURED" and leaf["value"] is None
+        assert "clock skew outside its limits" in leaf["reason"]
+
+    def test_persistence_maximum_without_clock_samples_or_spans(self):
+        no_clock = _assembled(clock_before=[], clock_after=[])["metrics"]["latency"]
+        assert no_clock["persistence_ms_max"]["reason"] == "clock skew not measured"
+        empty = _assembled(db_overrides={"persistence_ms": []})["metrics"]["latency"]
+        assert empty["persistence_ms_max"]["kind"] == "NOT_MEASURED"
+        assert empty["persistence_ms_max"]["reason"] == "no spans read"
+
+    def test_detector_counts_by_signal_through_the_cell(self, tmp_path):
+        result, _, clean, smoke = _run(tmp_path)
+        counts = result["metrics"]["analytics"]["detector_counts"]
+        assert clean and sorted(counts) == sorted(result["metrics"]["analytics"]["detector_ms"])
+        trace = counts["trace_latency/agentops.request"]
+        assert {k: v["value"] for k, v in trace.items()} == {
+            "candidates": 1300, "emitted": 22, "inserted": 22, "duplicate": 0}
+        assert all(v["kind"] == "OBSERVATION" and v["n"] == 1 for v in trace.values())
+        assert counts["tool_failure/"]["emitted"]["value"] == 0
+
+    def test_only_the_four_counts_are_read_and_there_is_no_severity(self, tmp_path):
+        groups = [{"signal_path": "trace_latency", "operation_name": "x", "candidates": "10",
+                   "emitted": "2", "inserted": "2", "duplicate": "0", "duration_ms": "5",
+                   "severity": "WARNING", "severity_counts": "INFO=1"}]
+        assert RB.detector_counts_from_groups(groups) == {
+            "trace_latency/x": {"candidates": 10, "emitted": 2, "inserted": 2, "duplicate": 0}}
+        result = _run(tmp_path)[0]
+        assert "severity" not in json.dumps(result).lower()
+        import inspect
+        for function in (RB.detector_counts_from_groups, RB._diag_detector_counts,
+                         RB._add_diagnostics):
+            assert "severity" not in inspect.getsource(function).replace("No severity", "")
+
+    @pytest.mark.parametrize("groups", [None, 5, [], [{}], [{"signal_path": "a"}],
+                                        [{"signal_path": "a", "operation_name": "b",
+                                          "emitted": "x"}], ["not a mapping"]])
+    def test_detector_count_parsing_never_raises(self, groups):
+        assert RB.detector_counts_from_groups(groups) is None
+
+    def test_detector_counts_without_the_detector(self):
+        cell = dataclasses.replace(_cell(), refresh_and_detector=False)
+        leaf = _assembled(cell=cell)["metrics"]["analytics"]["detector_counts"]
+        assert leaf["kind"] == "NOT_MEASURED" and "not run at level" in leaf["reason"]
+        unread = _assembled()["metrics"]["analytics"]["detector_counts"]
+        assert unread["kind"] == "NOT_MEASURED" and unread["reason"] == "detector counts not read"
+
+    def test_diagnostic_failure_keeps_the_required_result(self, monkeypatch):
+        samples = [(float("nan"), {"raw": 1, "canonical": 2}), (10.0, {"raw": 1, "canonical": 3})]
+        broken = _assembled(lag_samples=samples, sampler_started=5000.5)
+        baseline = _baseline(monkeypatch, lag_samples=samples)
+        assert any(text.startswith("diagnostic lag series not recorded")
+                   for text in broken["limitations"])
+        assert "raw_series_records" not in broken["metrics"]["lag"]
+        assert "samples_taken" not in broken["metrics"]["lag"]          # atomic: all or none
+        assert "sampler_started_epoch_s" in broken["metrics"]["lag"]    # the others survive
+        stripped = _without_new_leaves(broken)
+        stripped["limitations"] = [t for t in stripped["limitations"]
+                                   if not t.startswith("diagnostic ")]
+        assert stripped == baseline
+        M.validate_result(broken)
+
+    @pytest.mark.parametrize("builder", ["_diag_lag_series", "_diag_sampler_start",
+                                         "_diag_ingest_series", "_diag_persistence_max",
+                                         "_diag_detector_counts"])
+    def test_any_failing_builder_is_isolated(self, monkeypatch, builder):
+        def boom(*args, **kwargs):
+            raise RuntimeError("builder failed")
+
+        monkeypatch.setattr(RB, builder, boom)
+        result = _assembled(lag_samples=RISING_LAG[:3], sampler_started=1.0)
+        assert sum(t.startswith("diagnostic ") and t.endswith("RuntimeError")
+                   for t in result["limitations"]) == 1
+        assert result["verdict"] == "VALID" and result["integrity"]["ok"] is True
+        assert result["metrics"]["latency"]["persistence_ms"]["p95"]["value"] == 40.0
+        M.validate_result(result)
+
+    def test_an_existing_metric_is_never_replaced(self):
+        metrics = {"lag": {"samples_taken": {"kept": True}}}
+        limitations = []
+        RB._add_diagnostics(metrics, limitations, (
+            ("lag series", lambda: {("lag", "samples_taken"): M.Metric(
+                3, "samples", "OBSERVATION", "harness", "x", None, 3).to_dict()}),))
+        assert metrics["lag"]["samples_taken"] == {"kept": True}
+        assert limitations == ["diagnostic lag series not recorded: BenchmarkError"]
+
+    def test_existing_results_are_unchanged_apart_from_the_new_leaves(self, monkeypatch):
+        evidence = dict(lag_samples=RISING_LAG, sampler_started=5000.5,
+                        db_overrides={"per_second": [30, 40, 50]})
+        with_diagnostics = _assembled(**evidence)
+        baseline = _baseline(monkeypatch, **evidence)
+        assert _without_new_leaves(with_diagnostics) == baseline
+        assert with_diagnostics["verdict"] == baseline["verdict"] == "STOPPED"   # lag grew
+        assert with_diagnostics["stop"] == baseline["stop"]
+        assert with_diagnostics["integrity"] == baseline["integrity"]
+        assert with_diagnostics["claims"] == baseline["claims"]
+        assert with_diagnostics["limitations"] == baseline["limitations"]
+
+    def test_the_cell_records_the_sampler_start_and_keeps_its_call_order(self, tmp_path):
+        result, _, clean, smoke = _run(tmp_path)
+        assert clean and smoke.calls == ORDER                  # no new harness call or query
+        leaf = result["metrics"]["lag"]["sampler_started_epoch_s"]
+        assert leaf["value"] == 5003.0                         # the injected wall clock
+        assert result["metrics"]["lag"]["samples_taken"]["value"] >= 1
+        assert smoke.calls.count("psql") == 1
+
+    def test_older_results_without_the_new_leaves_still_validate(self):
+        M.validate_result(_without_new_leaves(_assembled(lag_samples=RISING_LAG)))
+        older = _without_new_leaves(TestHistoricalCompatibility()._historical())
+        assert not any(name in older["metrics"][section] for section, name in NEW_LEAVES)
+        M.validate_result(older)                          # the pre-B3J-59 shape stays valid
+
+    def test_serialization_validation_and_size(self, tmp_path, monkeypatch):
+        evidence = dict(lag_samples=[(10.0 * i, {"raw": i, "canonical": 30 * i}) for i in range(12)],
+                        sampler_started=5000.5, db_overrides={"per_second": list(range(100, 200))})
+        result = _assembled(**evidence)
+        path = RB.write_result(result, tmp_path / "out")
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert loaded == json.loads(json.dumps(result))
+        M.validate_result(loaded)
+        plain = json.dumps(_baseline(monkeypatch, **evidence), sort_keys=True)
+        assert len(json.dumps(result, sort_keys=True)) - len(plain) < 6000
+
+    def test_no_new_leaf_is_inside_the_percentile_mappings(self):
+        latency = _assembled()["metrics"]["latency"]
+        assert sorted(latency["persistence_ms"]) == ["p50", "p95", "p99"]
+        assert sorted(latency["request_ms"]) == ["p50", "p95", "p99"]

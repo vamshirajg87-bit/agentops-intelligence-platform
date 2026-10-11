@@ -745,6 +745,10 @@ class CellEvidence:
     refresh_seconds: Optional[float] = None           # wall clock around the refresh
     refresh_dbt_seconds: Optional[float] = None       # dbt's own duration, when printed
     detector_ms: Optional[Mapping[str, float]] = None
+    #: Optional diagnostics (B3J-59): when the samplers started (wall clock) and
+    #: the detector's per-group counts, both read from what the harness already has.
+    sampler_started: Optional[float] = None
+    detector_counts: Optional[Mapping[str, Mapping[str, int]]] = None
     disk_free_bytes: Optional[int] = None
     projected_need_bytes: Optional[int] = None
     cleanup_verified: Optional[bool] = None
@@ -752,6 +756,180 @@ class CellEvidence:
     stop_reasons: Sequence[str] = ()
     failure: Optional[str] = None
     limitations: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Optional diagnostics (B3J-59): already-collected observations, preserved
+# ---------------------------------------------------------------------------
+
+#: What the detector prints per group, and the unit of each count.
+DETECTOR_COUNT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("candidates", "records"), ("emitted", "events"), ("inserted", "events"),
+    ("duplicate", "events"))
+INGEST_SERIES_METHOD: str = (
+    "rows per whole second of ingested_at (database clock), in time order.  The SQL "
+    "returns counts only: seconds with no rows are omitted and no bucket carries a "
+    "timestamp, so gaps are not represented (the window gives the first and last ingest)")
+
+
+def detector_counts_from_groups(groups: Any) -> Optional[dict[str, dict[str, int]]]:
+    """The detector's own per-group counts (candidates, emitted, inserted,
+    duplicate), keyed like detector_ms.  Only fields the harness already
+    parsed from the detector log are read.  Never raises: anything it cannot
+    read is left out, and None is returned when nothing could be read."""
+    try:
+        found: dict[str, dict[str, int]] = {}
+        for group in groups:
+            key = f"{group['signal_path']}/{group['operation_name']}"
+            counts: dict[str, int] = {}
+            for name, _unit in DETECTOR_COUNT_FIELDS:
+                text = group.get(name)
+                if text is None:
+                    continue
+                value = int(str(text).strip())
+                if value >= 0:
+                    counts[name] = value
+            if counts:
+                found[key] = counts
+        return found or None
+    except Exception:
+        return None
+
+
+def _diag_lag_series(evidence: "CellEvidence") -> dict[tuple[str, str], Any]:
+    """The raw and canonical lag samples with their elapsed times, and how
+    many samples were attempted.  A failed sample is omitted from the series
+    (never turned into 0); samples_taken minus a series' n counts them."""
+    samples = list(evidence.lag_samples)
+    added: dict[tuple[str, str], Any] = {}
+    if not samples:
+        reason = "no lag samples taken"
+        added[("lag", "samples_taken")] = M.not_measured(
+            "samples", "harness", reason).to_dict()
+    else:
+        reason = "every sample failed"
+        added[("lag", "samples_taken")] = M.Metric(
+            len(samples), "samples", "OBSERVATION", "harness",
+            "periodic lag samples attempted, successful or failed", None,
+            len(samples)).to_dict()
+    for group in ("raw", "canonical"):
+        pairs = [(float(at), value.get(group)) for at, value in samples
+                 if isinstance(value, Mapping) and value.get(group) is not None]
+        if pairs:
+            added[("lag", f"{group}_series_records")] = M.Metric(
+                [records for _, records in pairs], "records", "OBSERVATION",
+                "kafka-consumer-groups",
+                "periodic samples in order; a failed sample is omitted, never counted as 0",
+                None, len(pairs)).to_dict()
+            added[("lag", f"{group}_series_times_s")] = M.Metric(
+                [round(at, 3) for at, _ in pairs], "s", "OBSERVATION",
+                "harness monotonic clock",
+                f"seconds since the samplers started, one per value of "
+                f"{group}_series_records", None, len(pairs)).to_dict()
+        else:
+            for name, unit in ((f"{group}_series_records", "records"),
+                               (f"{group}_series_times_s", "s")):
+                added[("lag", name)] = M.not_measured(
+                    unit, "kafka-consumer-groups", reason).to_dict()
+    return added
+
+
+def _diag_sampler_start(evidence: "CellEvidence") -> dict[tuple[str, str], Any]:
+    """When the samplers started (wall clock), for approximate alignment of the
+    series times with the measured workload.  Omitted when not recorded."""
+    if evidence.sampler_started is None:
+        return {}
+    instant = _iso(evidence.sampler_started)
+    return {("lag", "sampler_started_epoch_s"): M.Metric(
+        float(evidence.sampler_started), "s", "OBSERVATION", "harness wall clock",
+        "wall-clock time (seconds since the Unix epoch) when the lag and resource samplers "
+        "started; the series times are seconds after this instant",
+        {"start": instant, "end": instant, "clock": "host"}, 1).to_dict()}
+
+
+def _diag_ingest_series(db: Optional[Mapping[str, Any]],
+                        window_db: Optional[Mapping[str, str]]) -> dict[tuple[str, str], Any]:
+    """The per-second persisted-span counts the database query already returned."""
+    series = db.get("per_second") if isinstance(db, Mapping) else None
+    name = ("throughput", "persisted_per_second_series")
+    if isinstance(series, list) and series:
+        return {name: M.Metric(list(series), "spans/s", "OBSERVATION",
+                               "telemetry_spans.ingested_at", INGEST_SERIES_METHOD,
+                               window_db, len(series)).to_dict()}
+    reason = ("no database result" if db is None else
+              "the database returned no per-second counts")
+    return {name: M.not_measured("spans/s", "telemetry_spans.ingested_at", reason).to_dict()}
+
+
+def _diag_persistence_max(persistence_ms: Sequence[float], window_db: Optional[Mapping[str, str]],
+                          clock: Mapping[str, Any], clock_valid: Optional[bool]
+                          ) -> dict[tuple[str, str], Any]:
+    """The maximum per-span persistence latency, reported only when the
+    clock check allows persistence latency at all (as the percentiles are)."""
+    name = ("latency", "persistence_ms_max")
+    if clock_valid is True:
+        if not persistence_ms:
+            return {name: M.not_measured("ms", "ingested_at - end_time",
+                                         "no spans read").to_dict()}
+        return {name: M.Metric(
+            max(persistence_ms), "ms", "DERIVED",
+            "ingested_at (database clock) - end_time (host clock)",
+            "maximum over every per-span value; valid only within the recorded clock skew",
+            window_db, len(persistence_ms)).to_dict()}
+    reason = ("clock skew not measured" if clock_valid is None
+              else "clock skew outside its limits: " + "; ".join(clock["reasons"]))
+    return {name: M.not_measured("ms", "ingested_at - end_time", reason).to_dict()}
+
+
+def _diag_detector_counts(evidence: "CellEvidence") -> dict[tuple[str, str], Any]:
+    """The detector's candidate / emitted / inserted / duplicate counts per
+    signal, as already parsed from its log.  No severity: it is not logged."""
+    name = ("analytics", "detector_counts")
+    if not evidence.cell.refresh_and_detector:
+        return {name: M.not_measured("records", "detector log",
+                                     f"not run at level {evidence.cell.level}").to_dict()}
+    if not evidence.detector_counts:
+        return {name: M.not_measured("records", "detector log",
+                                     "detector counts not read").to_dict()}
+    units = dict(DETECTOR_COUNT_FIELDS)
+    return {name: {
+        group: {field_name: M.Metric(
+            value, units[field_name], "OBSERVATION", "detector log",
+            f"{field_name} as printed by the detector for the group", None, 1).to_dict()
+            for field_name, value in sorted(counts.items())}
+        for group, counts in sorted(evidence.detector_counts.items())}}
+
+
+def _check_diagnostic_tree(node: Any, path: str) -> None:
+    """Raises unless node is a metric or a non-empty mapping of them."""
+    if isinstance(node, Mapping) and "kind" in node:
+        M.check_metric(node, path)
+        return
+    if not isinstance(node, Mapping) or not node:
+        raise BenchmarkError(f"{path}: not a metric tree")
+    for key, child in node.items():
+        _check_diagnostic_tree(child, f"{path}.{key}")
+
+
+def _add_diagnostics(metrics: dict[str, Any], limitations: list[str],
+                     builders: Sequence[tuple[str, Callable[[], dict[tuple[str, str], Any]]]]
+                     ) -> None:
+    """Adds each optional diagnostic to metrics.  Each one is built and
+    validated on its own; one that cannot be is left out and noted in the
+    limitations.  It never changes or replaces an existing metric, and the
+    required metrics and the result's own validation are not touched."""
+    for label, build in builders:
+        try:
+            added = build()
+            for (section, name), leaf in added.items():
+                if name in metrics[section]:
+                    raise BenchmarkError(f"metrics.{section}.{name} already exists")
+                _check_diagnostic_tree(leaf, f"metrics.{section}.{name}")
+        except Exception as exc:
+            limitations.append(f"diagnostic {label} not recorded: {type(exc).__name__}")
+            continue
+        for (section, name), leaf in added.items():
+            metrics[section][name] = leaf
 
 
 def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[str, Any]:
@@ -953,6 +1131,13 @@ def assemble_result(evidence: CellEvidence, stops: Mapping[str, Any]) -> dict[st
         "detector was run, not detector speed").to_dict()
     metrics["throughput"]["otlp_export_latency"] = M.not_measured(
         "ms", "exporter", "export calls are not timed in this version").to_dict()
+    _add_diagnostics(metrics, limitations, (
+        ("lag series", lambda: _diag_lag_series(evidence)),
+        ("sampler start", lambda: _diag_sampler_start(evidence)),
+        ("ingestion series", lambda: _diag_ingest_series(db, window_db)),
+        ("persistence maximum",
+         lambda: _diag_persistence_max(persistence_ms, window_db, clock, clock_valid)),
+        ("detector counts", lambda: _diag_detector_counts(evidence))))
 
     # -- stop rules and verdict -------------------------------------------------
     stop_reasons = list(evidence.stop_reasons)
@@ -1178,6 +1363,7 @@ def execute_cell(
              "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}", *ids],
             timeout=smoke.T_COMMAND, what="docker stats")), defaults["sample_interval_seconds"])
         samplers = [lag, resources]
+        evidence.sampler_started = wall()            # diagnostic only: aligns the series times
         for sampler in samplers:
             sampler.start()
         before = dict(offsets)
@@ -1214,6 +1400,7 @@ def execute_cell(
             evidence.detector_ms = {
                 f"{g['signal_path']}/{g['operation_name']}": float(g["duration_ms"])
                 for g in groups if g.get("duration_ms") is not None}
+            evidence.detector_counts = detector_counts_from_groups(groups)   # never raises
         smoke.check_normal_stack("after the cell")
     except _Stop as stop:
         evidence.stop_reasons = list(evidence.stop_reasons) + stop.reasons
