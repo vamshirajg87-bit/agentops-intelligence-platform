@@ -1453,6 +1453,101 @@ class Win32Handles:
     receipt: Optional[CreationReceipt] = None
 
 
+@dataclass(frozen=True)
+class CustodySnapshot:
+    """What a custody holder can be seen to hold right now.  Every field is
+    an observation about Python-side state, never a verification: an
+    observed handle value is not shown to name a live process, its PID or a
+    job.  `readable` is False when the structure could not be read;
+    `inconsistent` is True when a handle value is present although the
+    native call was never entered (the observation is then not trustworthy)."""
+    attached: bool
+    entered: bool
+    process_handle_observed: bool
+    thread_handle_observed: bool
+    readable: bool
+    inconsistent: bool
+
+
+#: The explicit result of an observation that could not be made at all.
+_UNREADABLE_SNAPSHOT = CustodySnapshot(False, False, False, False, False, False)
+
+
+class HandleCustody:
+    """
+    Owns, from before the native creation call, the structure into which the
+    operating system writes the new process's handles, so that the handles
+    stay reachable whatever happens after the call returns.  The creator
+    attaches the zeroed structure once and marks the entry once, immediately
+    before the call; nothing is stored after it.
+
+    Custody observes and preserves only.  It has no close, reset, detach,
+    finalizer, termination or recovery behaviour, and it is never reused.
+    """
+
+    __slots__ = ("_info", "_entered")
+
+    def __init__(self) -> None:
+        self._info: Any = None
+        self._entered = False
+
+    @property
+    def attached(self) -> bool:
+        return self._info is not None
+
+    @property
+    def entered(self) -> bool:
+        return self._entered
+
+    def attach(self, info: Any) -> None:
+        """Write-once: attach the zeroed PROCESS_INFORMATION structure."""
+        if self._info is not None:
+            raise CalibrationError("the handle custody already holds a structure")
+        t = _win32_types()
+        if not isinstance(info, t.PROCESS_INFORMATION):
+            raise CalibrationError("the handle custody takes only a PROCESS_INFORMATION")
+        if any(getattr(info, name) for name in
+               ("hProcess", "hThread", "dwProcessId", "dwThreadId")):
+            raise CalibrationError("the handle custody takes only a zeroed structure")
+        self._info = info
+
+    def mark_entered(self) -> None:
+        """Write-once: the creator is about to make the native call."""
+        if self._info is None:
+            raise CalibrationError("the handle custody has no structure attached")
+        if self._entered:
+            raise CalibrationError("the handle custody was already entered")
+        self._entered = True
+
+    def snapshot(self) -> CustodySnapshot:
+        """The current observations; never raises.  This is a purely
+        diagnostic read, so even an interruption while observing is absorbed
+        and reported as an unreadable snapshot (nothing observed, nothing
+        claimed); no creation, ownership or cleanup path does this."""
+        try:
+            info, entered = self._info, bool(self._entered)
+            attached = info is not None
+            try:
+                if info is None:
+                    return CustodySnapshot(False, entered, False, False, True, False)
+                process, thread = _valid_handle(info.hProcess), _valid_handle(info.hThread)
+                return CustodySnapshot(attached, entered, process, thread, True,
+                                       bool((process or thread) and not entered))
+            except BaseException:
+                return CustodySnapshot(attached, entered, False, False, False, False)
+        except BaseException:
+            return _UNREADABLE_SNAPSHOT
+
+    def raw_values(self) -> Optional[tuple[Any, Any, Any, Any]]:
+        """(process handle, thread handle, PID, TID) exactly as the structure
+        holds them, or None when nothing is attached.  Unverified: for a
+        later, separately authorized step only."""
+        info = self._info
+        if info is None:
+            return None
+        return info.hProcess, info.hThread, info.dwProcessId, info.dwThreadId
+
+
 def _validated_plan(plan: Any, size_validator: Any, stdout: Any, stderr: Any
                     ) -> tuple[tuple[int, tuple[int, ...]], ...]:
     """The (attribute, handles) pairs of a supplied attribute plan, or a
@@ -1644,7 +1739,8 @@ class CtypesWin32:
 
     def create_process(self, *, application: str, command_line: str, env: Mapping[str, str],
                        cwd: str, stdout: Any, stderr: Any, sid: str,
-                       attribute_plan: Any = None, size_validator: Any = None) -> Win32Handles:
+                       attribute_plan: Any = None, size_validator: Any = None,
+                       custody: Optional[HandleCustody] = None) -> Win32Handles:
         """
         CreateProcessW, suspended, in the AppContainer `sid` with NO
         capabilities, inheriting exactly the stdout and stderr handles.  The
@@ -1663,7 +1759,21 @@ class CtypesWin32:
         supplied plan that fails anywhere refuses; it never falls back to
         the legacy creation.  The returned handles carry a CreationReceipt
         of the natively applied attributes; no membership is claimed.
+
+        A supplied plan also requires an unused HandleCustody, which the
+        caller owns: the zeroed PROCESS_INFORMATION is attached to it, and
+        the entry marked, just before CreateProcessW, so the handles stay
+        reachable through it even if this function never returns.  The
+        legacy creation refuses a custody.  Both refusals precede any native
+        call.
         """
+        if attribute_plan is not None:
+            if not isinstance(custody, HandleCustody):
+                raise CalibrationError("an attribute plan needs its handle custody")
+            if custody.attached or custody.entered:
+                raise CalibrationError("the handle custody was already used")
+        elif custody is not None:
+            raise CalibrationError("a handle custody without an attribute plan")
         t = _win32_types()
         c, w = t.ctypes, t.w
         handles = [self._handle_of(stdout), self._handle_of(stderr)]
@@ -1736,6 +1846,9 @@ class CtypesWin32:
             startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError = handles
             startup.lpAttributeList = c.addressof(attributes)
             info = t.PROCESS_INFORMATION()
+            if custody is not None:
+                custody.attach(info)
+                custody.mark_entered()                  # immediately before the native call
             if not create(application, c.addressof(command_buffer), None, None, True,
                           CREATION_FLAGS, c.addressof(environment), cwd, c.byref(startup),
                           c.byref(info)):

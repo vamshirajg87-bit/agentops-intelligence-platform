@@ -44,6 +44,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import inspect
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -849,8 +850,16 @@ class ContainmentAdapter:
                  process_identity: Callable[[Any], Any]) -> None:
         self.auth = C._require_any_authorization(auth)
         self.api = api
+        try:
+            inspect.signature(create).bind(None, None)   # (plan, custody); never invoked
+        except (TypeError, ValueError):
+            raise C.CalibrationError("the creator must accept (plan, custody) as two "
+                                     "positional arguments") from None
         self._create, self._identity = create, process_identity
         self.controller: Optional[JobController] = None
+        #: The creation's handle custody, allocated before the creator runs
+        #: and kept for the adapter's lifetime; never closed or reset.
+        self.custody: Optional[C.HandleCustody] = None
         self.errors: list[str] = []
         #: Display-only diagnostics of an uncertain outcome; never consulted
         #: by any decision, and never a claim that a child exists or is known.
@@ -865,21 +874,33 @@ class ContainmentAdapter:
                         cause: Optional[BaseException], before: Any) -> None:
         """Record display-only diagnostics.  Every fact about the child is
         'unknown' or 'unverified': nothing here asserts that a process
-        exists or what its identity or membership is.  Never raises."""
+        exists or what its identity or membership is.  Never raises: it only
+        observes, so even an interruption inside it is absorbed here and
+        cannot replace the creator or binding failure being handled."""
         self.retained_reason = reason
         try:
+            try:
+                seen = self.custody.snapshot() if self.custody is not None else None
+            except BaseException:
+                seen = None
             self.retained_evidence = MappingProxyType({
                 "stage": stage,
                 "failure_action_key": failure_key,
                 "cause_type": None if cause is None else type(cause).__name__,
                 "ownership_before": before,
                 "ownership_after": getattr(self.controller, "ownership", None),
+                "custody_attached": bool(seen and seen.attached),
+                "custody_entered": bool(seen and seen.entered),
+                "process_handle_observed": bool(seen and seen.process_handle_observed),
+                "thread_handle_observed": bool(seen and seen.thread_handle_observed),
+                "custody_readable": bool(seen and seen.readable),
+                "custody_inconsistent": bool(seen and seen.inconsistent),
                 "child_existence": "unknown",
                 "child_identity": "unverified",
                 "membership": "unverified",
                 "recovery_authorized": False,
             })
-        except Exception:
+        except BaseException:
             self.retained_evidence = None
 
     def _retain_child(self, cause: Optional[BaseException] = None,
@@ -926,8 +947,9 @@ class ContainmentAdapter:
             C._validated_plan(plan, validate_attribute_list_size, stdout, stderr)
         except C.CalibrationError as exc:       # PlanRefused is one
             raise self._refuse("plan_refused", str(exc)) from None
+        self.custody = C.HandleCustody()        # before the creator, kept whatever happens
         try:
-            created = self._create(plan)        # exactly once; never a fallback
+            created = self._create(plan, self.custody)   # exactly once; never a fallback
         except BaseException as exc:
             # Entered the creator: an exception never proves that no child was created.
             self._retain_child(exc)

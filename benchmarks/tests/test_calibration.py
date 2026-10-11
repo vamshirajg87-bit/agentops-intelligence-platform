@@ -1891,6 +1891,8 @@ def _create_fakes(state):
             return 0
         i = info._obj
         i.hProcess, i.hThread, i.dwProcessId, i.dwThreadId = 101, 102, 4242, 77
+        if "after_create" in state:
+            state["after_create"]()
         return 1
 
     def delete(address):
@@ -2826,10 +2828,12 @@ def _planned_setup(monkeypatch, tmp_path, **extra):
     return command, state, win32, log
 
 
-def _create_planned(win32, command, plan, validator=W.validate_attribute_list_size):
+def _create_planned(win32, command, plan, validator=W.validate_attribute_list_size,
+                    custody=None):
     return win32.create_process(application=command.argv[0], command_line=command.command_line,
                                 env=command.env, cwd=command.cwd, stdout=11, stderr=12,
-                                sid=SID, attribute_plan=plan, size_validator=validator)
+                                sid=SID, attribute_plan=plan, size_validator=validator,
+                                custody=C.HandleCustody() if custody is None else custody)
 
 
 def _nothing_native(state, log):
@@ -3141,3 +3145,341 @@ class TestPlannedCreation:
                 C.AUTHORIZED_PROFILE_PREFLIGHT_SHA256) == (False, frozenset(), False,
                                                           frozenset(), None, None)
         assert C.APPCONTAINER_CAPABILITIES == () and not (C.CREATION_FLAGS & 0x01000000)
+
+
+# ---------------------------------------------------------------------------
+# Handle custody of the planned creation (B3J-47b; fakes only, no native call)
+# ---------------------------------------------------------------------------
+
+PROCESS_VALUES = (101, 102, 4242, 77)             # what the fake CreateProcessW writes
+
+
+class TestHandleCustody:
+    @pytest.fixture(autouse=True)
+    def no_real_dll(self, monkeypatch):
+        import ctypes
+
+        def refuse(*args, **kwargs):
+            raise LiveAccessAttempt("a real DLL load attempted")
+
+        monkeypatch.setattr(ctypes, "WinDLL", refuse)
+
+    # -- the holder itself ---------------------------------------------------
+
+    def test_a_new_custody_holds_nothing(self):
+        custody = C.HandleCustody()
+        assert custody.attached is False and custody.entered is False
+        assert custody.raw_values() is None
+        assert custody.snapshot() == C.CustodySnapshot(False, False, False, False, True, False)
+
+    def test_attachment_is_write_once(self):
+        t = C._win32_types()
+        custody = C.HandleCustody()
+        first = t.PROCESS_INFORMATION()
+        custody.attach(first)
+        with pytest.raises(C.CalibrationError, match="already holds"):
+            custody.attach(t.PROCESS_INFORMATION())
+        assert custody.raw_values() == (None, None, 0, 0) and custody._info is first
+
+    def test_entry_is_write_once_and_needs_a_structure(self):
+        t = C._win32_types()
+        custody = C.HandleCustody()
+        with pytest.raises(C.CalibrationError, match="no structure attached"):
+            custody.mark_entered()
+        custody.attach(t.PROCESS_INFORMATION())
+        custody.mark_entered()
+        assert custody.entered is True
+        with pytest.raises(C.CalibrationError, match="already entered"):
+            custody.mark_entered()
+        assert custody.entered is True
+
+    def test_only_a_zeroed_process_information_is_taken(self):
+        t = C._win32_types()
+        custody = C.HandleCustody()
+        for wrong in (object(), None, 5, t.FILETIME()):
+            with pytest.raises(C.CalibrationError, match="only a PROCESS_INFORMATION"):
+                custody.attach(wrong)
+        stale = t.PROCESS_INFORMATION()
+        stale.hProcess = 99
+        with pytest.raises(C.CalibrationError, match="only a zeroed structure"):
+            custody.attach(stale)
+        assert custody.attached is False
+
+    def test_no_close_reset_detach_or_finalizer_and_no_stray_state(self):
+        for name in ("close", "reset", "detach", "terminate", "recover", "release",
+                     "__del__"):
+            assert not hasattr(C.HandleCustody, name), name
+        custody = C.HandleCustody()
+        assert not hasattr(custody, "__dict__")
+        with pytest.raises(AttributeError):
+            custody.extra = 1
+        with pytest.raises(AttributeError):
+            custody.attached = True
+        with pytest.raises(AttributeError):
+            custody.entered = True
+
+    def test_observation_means_a_plausible_value_only(self):
+        t = C._win32_types()
+        custody = C.HandleCustody()
+        info = t.PROCESS_INFORMATION()
+        custody.attach(info)
+        custody.mark_entered()
+        for value in (0, -1, (1 << 32) - 1):
+            info.hProcess = info.hThread = value
+            snap = custody.snapshot()
+            assert not snap.process_handle_observed and not snap.thread_handle_observed
+        info.hProcess = 101
+        snap = custody.snapshot()
+        assert snap.process_handle_observed and not snap.thread_handle_observed
+        assert snap.readable and not snap.inconsistent
+        info.hThread = 102
+        assert custody.snapshot().thread_handle_observed
+
+    def test_a_handle_without_entry_is_flagged_inconsistent(self):
+        t = C._win32_types()
+        custody = C.HandleCustody()
+        info = t.PROCESS_INFORMATION()
+        custody.attach(info)
+        info.hProcess = 101
+        snap = custody.snapshot()
+        assert snap.process_handle_observed and snap.entered is False and snap.inconsistent
+
+    def test_an_unreadable_structure_is_reported_and_never_raises(self):
+        class Broken:
+            def __getattr__(self, name):
+                raise OSError("unreadable")
+
+        custody = C.HandleCustody()
+        custody._info = Broken()
+        snap = custody.snapshot()
+        assert snap == C.CustodySnapshot(True, False, False, False, False, False)
+
+    def test_snapshot_is_immutable(self):
+        snap = C.HandleCustody().snapshot()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            snap.readable = False
+
+    # -- observation must never raise, whatever interrupts it ----------------------
+
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt(), SystemExit(9), GeneratorExit(),
+                                         RuntimeError("unreadable")])
+    def test_a_failing_read_is_reported_unreadable_never_raised(self, failure):
+        class Unreadable:
+            def __getattr__(self, name):
+                raise failure
+
+        custody = C.HandleCustody()
+        custody._info = Unreadable()
+        custody._entered = True
+        snap = custody.snapshot()
+        assert snap == C.CustodySnapshot(True, True, False, False, False, False)
+        assert not snap.readable and not snap.process_handle_observed
+        assert not snap.thread_handle_observed and not snap.inconsistent
+
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt(), SystemExit(9)])
+    def test_a_failing_validity_check_is_reported_unreadable(self, monkeypatch, failure):
+        t = C._win32_types()
+        custody = C.HandleCustody()
+        info = t.PROCESS_INFORMATION()
+        custody.attach(info)
+        custody.mark_entered()
+        info.hProcess = 101
+
+        def broken(handle):
+            raise failure
+
+        monkeypatch.setattr(C, "_valid_handle", broken)
+        snap = custody.snapshot()
+        assert snap == C.CustodySnapshot(True, True, False, False, False, False)
+
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt(), SystemExit(9)])
+    def test_a_failure_building_the_snapshot_yields_the_unreadable_constant(
+            self, monkeypatch, failure):
+        custody = C.HandleCustody()
+
+        def broken(*args, **kwargs):
+            raise failure
+
+        monkeypatch.setattr(C, "CustodySnapshot", broken)
+        snap = custody.snapshot()
+        assert snap is C._UNREADABLE_SNAPSHOT
+        assert (snap.attached, snap.entered, snap.readable, snap.process_handle_observed,
+                snap.thread_handle_observed, snap.inconsistent) == (
+            False, False, False, False, False, False)
+
+    def test_the_unreadable_snapshot_claims_nothing_and_is_immutable(self):
+        snap = C._UNREADABLE_SNAPSHOT
+        assert isinstance(snap, C.CustodySnapshot) and snap.readable is False
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            snap.process_handle_observed = True
+
+    def test_observation_does_not_alter_the_custody(self):
+        t = C._win32_types()
+        custody = C.HandleCustody()
+        info = t.PROCESS_INFORMATION()
+        custody.attach(info)
+        custody.mark_entered()
+        info.hProcess, info.hThread = 101, 102
+        first = custody.snapshot()
+        assert custody.snapshot() == first
+        assert custody.raw_values() == (101, 102, 0, 0)
+        assert custody.attached and custody.entered
+
+    # -- the creator's contract (all refusals precede any native call) ----------
+
+    def test_a_planned_creation_needs_custody(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        for wrong in (None, object(), "custody"):
+            with pytest.raises(C.CalibrationError, match="needs its handle custody"):
+                win32.create_process(application=command.argv[0],
+                                     command_line=command.command_line, env=command.env,
+                                     cwd=command.cwd, stdout=11, stderr=12, sid=SID,
+                                     attribute_plan=_plan(),
+                                     size_validator=W.validate_attribute_list_size,
+                                     custody=wrong)
+        _nothing_native(state, log)
+
+    def test_the_legacy_creation_refuses_a_custody(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        custody = C.HandleCustody()
+        with pytest.raises(C.CalibrationError, match="without an attribute plan"):
+            win32.create_process(application=command.argv[0],
+                                 command_line=command.command_line, env=command.env,
+                                 cwd=command.cwd, stdout=11, stderr=12, sid=SID,
+                                 custody=custody)
+        _nothing_native(state, log)
+        assert custody.attached is False and custody.entered is False
+
+    def test_a_used_custody_is_refused_before_anything_native(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        custody = C.HandleCustody()
+        handles = _create_planned(win32, command, _plan(), custody=custody)
+        calls = log.count("CreateProcessW")
+        before = custody.raw_values()
+        with pytest.raises(C.CalibrationError, match="already used"):
+            _create_planned(win32, command, _plan(), custody=custody)
+        assert log.count("CreateProcessW") == calls == 1       # never a second creation
+        assert custody.raw_values() == before == PROCESS_VALUES
+        assert handles.process == 101
+
+    def test_an_entered_or_attached_custody_is_refused(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        attached = C.HandleCustody()
+        attached.attach(C._win32_types().PROCESS_INFORMATION())
+        with pytest.raises(C.CalibrationError, match="already used"):
+            _create_planned(win32, command, _plan(), custody=attached)
+        _nothing_native(state, log)
+
+    def test_the_signature_keeps_custody_optional_and_keyword_only(self):
+        parameter = inspect.signature(C.CtypesWin32.create_process).parameters["custody"]
+        assert parameter.default is None and parameter.kind is parameter.KEYWORD_ONLY
+
+    # -- success, and what custody holds ----------------------------------------
+
+    def test_success_is_unchanged_and_custody_holds_the_handles(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        custody = C.HandleCustody()
+        seen = {}
+        state["during_create"] = lambda: seen.update(
+            attached=custody.attached, entered=custody.entered,
+            updates=log.count("UpdateProcThreadAttribute"))
+        handles = _create_planned(win32, command, _plan(), custody=custody)
+        assert seen == {"attached": True, "entered": True, "updates": 3}
+        assert (handles.process, handles.thread, handles.pid, handles.tid) == PROCESS_VALUES
+        assert custody.raw_values() == PROCESS_VALUES
+        assert custody.snapshot() == C.CustodySnapshot(True, True, True, True, True, False)
+        assert handles.receipt == C.CreationReceipt(C.PLAN_ATTRIBUTES, (JOB_HANDLE,), True, True)
+        _unwound(state, initialized=True)
+        assert "CloseHandle" not in log
+
+    @pytest.mark.parametrize("position", [0, 1, 2])
+    def test_an_update_failure_never_attaches_or_enters(self, monkeypatch, tmp_path, position):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path,
+                                                    update_fail_at=position)
+        custody = C.HandleCustody()
+        with pytest.raises(C.Win32Error, match="UpdateProcThreadAttribute"):
+            _create_planned(win32, command, _plan(), custody=custody)
+        assert custody.snapshot() == C.CustodySnapshot(False, False, False, False, True, False)
+        assert "CreateProcessW" not in log
+
+    def test_a_refused_plan_never_attaches_or_enters(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        custody = C.HandleCustody()
+        with pytest.raises(C.CalibrationError):
+            _create_planned(win32, command, _plan(count=7), custody=custody)
+        _nothing_native(state, log)
+        assert custody.attached is False and custody.entered is False
+
+    def test_a_false_return_leaves_the_call_entered_and_no_handle(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path, create_ok=0)
+        custody = C.HandleCustody()
+        with pytest.raises(C.Win32Error, match="CreateProcessW"):
+            _create_planned(win32, command, _plan(), custody=custody)
+        assert custody.snapshot() == C.CustodySnapshot(True, True, False, False, True, False)
+        assert log.count("CreateProcessW") == 1
+        _unwound(state, initialized=True)
+
+    # -- interruptions after the native call --------------------------------------
+
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt(), SystemExit(3), GeneratorExit(),
+                                         RuntimeError("after the call")])
+    def test_interruption_after_the_call_keeps_identity_and_the_handles(
+            self, monkeypatch, tmp_path, failure):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        state["after_create"] = lambda: (_ for _ in ()).throw(failure)
+        custody = C.HandleCustody()
+        with pytest.raises(type(failure)) as raised:
+            _create_planned(win32, command, _plan(), custody=custody)
+        assert raised.value is failure                         # never wrapped or replaced
+        assert custody.raw_values() == PROCESS_VALUES
+        assert custody.snapshot() == C.CustodySnapshot(True, True, True, True, True, False)
+        _unwound(state, initialized=True)                       # the unwinding still ran
+        assert "CloseHandle" not in log                         # nothing was closed
+
+    @pytest.mark.parametrize("target", ["Win32Handles", "CreationReceipt"])
+    def test_a_failure_building_the_result_keeps_the_handles(self, monkeypatch, tmp_path,
+                                                             target):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        failure = KeyboardInterrupt()
+
+        def broken(*args, **kwargs):
+            raise failure
+
+        monkeypatch.setattr(C, target, broken)
+        custody = C.HandleCustody()
+        with pytest.raises(KeyboardInterrupt) as raised:
+            _create_planned(win32, command, _plan(), custody=custody)
+        assert raised.value is failure
+        assert custody.raw_values() == PROCESS_VALUES
+        assert custody.snapshot().process_handle_observed
+        _unwound(state, initialized=True)
+        assert "CloseHandle" not in log
+
+    def test_handles_stay_reachable_and_open_after_the_custody_is_dropped_elsewhere(
+            self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        state["after_create"] = lambda: (_ for _ in ()).throw(RuntimeError("x"))
+        custody = C.HandleCustody()
+        with pytest.raises(RuntimeError):
+            _create_planned(win32, command, _plan(), custody=custody)
+        gc.collect()
+        assert custody.raw_values() == PROCESS_VALUES and "CloseHandle" not in log
+
+    # -- the legacy creation is unchanged -------------------------------------------
+
+    def test_the_legacy_creation_is_unchanged(self, monkeypatch, tmp_path):
+        command, state, win32, log = _planned_setup(monkeypatch, tmp_path)
+        handles = win32.create_process(application=command.argv[0],
+                                       command_line=command.command_line, env=command.env,
+                                       cwd=command.cwd, stdout=11, stderr=12, sid=SID)
+        assert (handles.process, handles.thread, handles.pid, handles.tid) == PROCESS_VALUES
+        assert handles.receipt == C.CreationReceipt((SC_ATTR, HL_ATTR), (), True, False)
+
+    def test_the_source_guards_still_hold(self):
+        code = (_BENCH / "calibrate_generator.py").read_text(encoding="utf-8")
+        for word in ("win32_job", "CreationAssertion", "JobController", "evidence_store",
+                     "JOB_LIST_CREATION_INTEGRATED", "ContainmentAdapter"):
+            assert word not in code, word
+        body = code.split('"""', 2)[2]
+        for word in ("__del__", "atexit", "weakref"):
+            assert word not in body, word

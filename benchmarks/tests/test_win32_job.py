@@ -1295,7 +1295,7 @@ class FakeCreation:
         self.plans, self.identity_calls = [], []
         self.identity = identity if identity is not None else (lambda p: (PID, CREATED))
 
-    def create(self, plan):
+    def create(self, plan, custody=None):
         self.plans.append(plan)
         if self.raises:
             raise self.raises
@@ -1437,7 +1437,7 @@ class TestContainmentAdapter:
     @pytest.mark.parametrize("created", [None, object(), "handles"])
     def test_missing_or_foreign_creation_result_refuses(self, monkeypatch, created):
         creation = FakeCreation(receipt=None)
-        creation.create = lambda plan: created
+        creation.create = lambda plan, custody=None: created
         adapter, _, _ = make_adapter(monkeypatch, creation=creation)
         with pytest.raises(W.ContainmentRefused, match="no creation result"):
             prepare(adapter)
@@ -1467,7 +1467,7 @@ class TestContainmentAdapter:
         class SideEffectCreation(FakeCreation):
             child_created = False
 
-            def create(self, plan):
+            def create(self, plan, custody=None):
                 self.plans.append(plan)
                 self.child_created = True                 # a suspended child now exists
                 raise RuntimeError("failed after the child was created")
@@ -1653,6 +1653,313 @@ class TestContainmentAdapter:
         assert W.OWNERSHIP_STATES == ("none", "owned_empty", "owned_with_child",
                                       "child_exited", "retained_unverified",
                                       "retained_close_failed", "closed")
+
+    # -- handle custody (B3J-47b) -----------------------------------------------
+
+    @staticmethod
+    def _populating(*, enter=True, write=True, then=None, result=None, break_it=False):
+        """A creator that writes the handles through the custody it is given,
+        as the real one would, then raises `then` or returns `result`."""
+        class Populating(FakeCreation):
+            def create(self, plan, custody):
+                self.plans.append(plan)
+                self.custody = custody
+                info = C._win32_types().PROCESS_INFORMATION()
+                custody.attach(info)
+                if enter:
+                    custody.mark_entered()
+                if write:
+                    info.hProcess, info.hThread = 101, 102
+                    info.dwProcessId, info.dwThreadId = 4242, 77
+                if break_it:
+                    class Broken:
+                        def __getattr__(self, name):
+                            raise OSError("unreadable")
+                    custody._info = Broken()
+                if then is not None:
+                    raise then
+                return result
+        return Populating()
+
+    def test_custody_is_allocated_first_and_passed_to_the_creator(self, monkeypatch):
+        adapter, _, creation = make_adapter(monkeypatch)
+        assert adapter.custody is None
+        seen = {}
+        original = creation.create
+
+        def spy(plan, custody):
+            seen.update(is_adapters=custody is adapter.custody, type=type(custody),
+                        attached=custody.attached, entered=custody.entered)
+            return original(plan, custody)
+
+        adapter._create = spy
+        prepare(adapter)
+        assert seen == {"is_adapters": True, "type": C.HandleCustody,
+                        "attached": False, "entered": False}
+
+    def test_the_creator_must_accept_two_positional_arguments(self, monkeypatch):
+        api, _ = make_api(monkeypatch)
+        called = []
+        for bad in (lambda plan: called.append(plan), lambda: called.append(0),
+                    lambda plan, custody, extra: called.append(plan),
+                    lambda *, plan, custody: called.append(plan)):
+            with pytest.raises(C.CalibrationError, match="two positional"):
+                W.ContainmentAdapter(api.auth, api, create=bad,
+                                     process_identity=lambda p: None)
+        for good in (lambda plan, custody: None, lambda *args: None,
+                     lambda plan, custody=None: None):
+            W.ContainmentAdapter(api.auth, api, create=good, process_identity=lambda p: None)
+        assert called == []                               # never invoked by the check
+
+    def test_authorization_is_checked_before_the_creator_signature(self):
+        with pytest.raises(C.ExecutionDisabled):
+            W.ContainmentAdapter(None, object(), create=lambda p: None,
+                                 process_identity=lambda p: None)
+
+    def test_populated_custody_is_observed_not_trusted(self, monkeypatch):
+        creation = self._populating(then=RuntimeError("secret detail"))
+        adapter, kernel32, _ = make_adapter(monkeypatch, creation=creation)
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        evidence = adapter.retained_evidence
+        assert evidence["custody_attached"] is True and evidence["custody_entered"] is True
+        assert evidence["process_handle_observed"] is True
+        assert evidence["thread_handle_observed"] is True
+        assert evidence["custody_readable"] is True and evidence["custody_inconsistent"] is False
+        assert (evidence["child_existence"], evidence["child_identity"],
+                evidence["membership"]) == ("unknown", "unverified", "unverified")
+        assert evidence["recovery_authorized"] is False
+        text = repr(dict(evidence))
+        for forbidden in ("101", "102", "4242", "77", "secret detail"):
+            assert forbidden not in text
+        assert adapter.custody is creation.custody
+        assert adapter.custody.raw_values() == (101, 102, 4242, 77)    # still reachable
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_unpopulated_custody_is_not_a_no_child_claim(self, monkeypatch):
+        creation = self._populating(enter=False, write=False, then=RuntimeError("x"))
+        adapter, kernel32, _ = make_adapter(monkeypatch, creation=creation)
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        evidence = adapter.retained_evidence
+        assert evidence["custody_attached"] is True and evidence["custody_entered"] is False
+        assert evidence["process_handle_observed"] is False
+        assert evidence["child_existence"] == "unknown"
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_a_creator_that_never_touches_custody_is_still_retained(self, monkeypatch):
+        adapter, _, _ = make_adapter(monkeypatch,
+                                     creation=FakeCreation(raises=RuntimeError("x")))
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        evidence = adapter.retained_evidence
+        assert (evidence["custody_attached"], evidence["custody_entered"],
+                evidence["process_handle_observed"], evidence["thread_handle_observed"],
+                evidence["custody_readable"]) == (False, False, False, False, True)
+
+    def test_a_handle_without_entry_is_reported_inconsistent(self, monkeypatch):
+        creation = self._populating(enter=False, then=RuntimeError("x"))
+        adapter, _, _ = make_adapter(monkeypatch, creation=creation)
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        evidence = adapter.retained_evidence
+        assert evidence["custody_inconsistent"] is True
+        assert evidence["custody_entered"] is False and evidence["child_existence"] == "unknown"
+
+    def test_an_unreadable_custody_is_reported_and_changes_nothing(self, monkeypatch):
+        creation = self._populating(break_it=True, then=RuntimeError("x"))
+        adapter, kernel32, _ = make_adapter(monkeypatch, creation=creation)
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        evidence = adapter.retained_evidence
+        assert evidence["custody_readable"] is False
+        assert evidence["process_handle_observed"] is False
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_a_snapshot_that_raises_never_masks_the_refusal(self, monkeypatch):
+        adapter, _, _ = make_adapter(monkeypatch,
+                                     creation=FakeCreation(raises=RuntimeError("x")))
+
+        def broken():
+            raise RuntimeError("boom")
+
+        original = C.HandleCustody.snapshot
+        monkeypatch.setattr(C.HandleCustody, "snapshot", lambda self: broken())
+        with pytest.raises(W.ContainmentRefused, match="creation_failed"):
+            prepare(adapter)
+        monkeypatch.setattr(C.HandleCustody, "snapshot", original)
+        assert adapter.retained_evidence["custody_readable"] is False
+        assert adapter.controller.ownership == "retained_unverified"
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(3), GeneratorExit()])
+    def test_interruption_keeps_identity_and_custody(self, monkeypatch, interrupt):
+        creation = self._populating(then=interrupt)
+        adapter, kernel32, _ = make_adapter(monkeypatch, creation=creation)
+        with pytest.raises(type(interrupt)) as raised:
+            prepare(adapter)
+        assert raised.value is interrupt
+        assert adapter.retained_evidence["process_handle_observed"] is True
+        assert adapter.custody.raw_values() == (101, 102, 4242, 77)
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_bind_failure_retains_custody(self, monkeypatch):
+        creation = self._populating(result=C.Win32Handles(PROCESS, THREAD, PID, 77,
+                                                          receipt=None))
+        adapter, kernel32, _ = make_adapter(monkeypatch, creation=creation)
+        with pytest.raises(W.ContainmentRefused, match="assignment_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "assignment_failed"
+        evidence = adapter.retained_evidence
+        assert evidence["stage"] == "bind" and evidence["process_handle_observed"] is True
+        assert evidence["child_existence"] == "unknown" and evidence["membership"] == "unverified"
+        assert adapter.custody.raw_values() == (101, 102, 4242, 77)
+        assert adapter.controller.membership is None
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_retention_failure_still_records_custody(self, monkeypatch):
+        class StubbornController(W.JobController):
+            @property
+            def ownership(self):
+                return self.__dict__.get("_o", "none")
+
+            @ownership.setter
+            def ownership(self, value):
+                if value != "retained_unverified":
+                    self.__dict__["_o"] = value
+
+        monkeypatch.setattr(W, "JobController", StubbornController)
+        original = RuntimeError("creator failed")
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=self._populating(then=original))
+        with pytest.raises(W.ContainmentRefused, match="retention_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "retention_failed" and raised.value.__cause__ is original
+        assert adapter.retained_evidence["process_handle_observed"] is True
+        assert adapter.retained_evidence["recovery_authorized"] is False
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    # -- custody observation must never replace the failure being handled ---------
+
+    @pytest.mark.parametrize("observation_failure", [KeyboardInterrupt(), SystemExit(9)])
+    @pytest.mark.parametrize("original", [RuntimeError("creator failed"), KeyboardInterrupt(),
+                                          SystemExit(3)])
+    def test_failing_custody_observation_never_masks_a_creator_failure(
+            self, monkeypatch, original, observation_failure):
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=FakeCreation(raises=original))
+
+        def broken(self):
+            raise observation_failure
+
+        monkeypatch.setattr(C.HandleCustody, "snapshot", broken)
+        if isinstance(original, Exception):
+            with pytest.raises(W.ContainmentRefused, match="creation_failed") as raised:
+                prepare(adapter)
+            assert raised.value.key == "creation_failed"
+        else:
+            with pytest.raises(type(original)) as raised:
+                prepare(adapter)
+            assert raised.value is original                  # the same object, unwrapped
+        assert adapter.controller.ownership == "retained_unverified"
+        assert adapter.retained_reason == "creator_failed_outcome_unknown"
+        evidence = adapter.retained_evidence
+        assert evidence["custody_readable"] is False and evidence["failure_action_key"] == "creation_failed"
+        assert evidence["process_handle_observed"] is False
+        assert (evidence["child_existence"], evidence["child_identity"],
+                evidence["membership"]) == ("unknown", "unverified", "unverified")
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    @pytest.mark.parametrize("observation_failure", [KeyboardInterrupt(), SystemExit(9)])
+    def test_failing_custody_observation_never_masks_a_binding_failure(
+            self, monkeypatch, observation_failure):
+        adapter, kernel32, _ = make_adapter(monkeypatch, creation=FakeCreation(receipt=None))
+
+        def broken(self):
+            raise observation_failure
+
+        monkeypatch.setattr(C.HandleCustody, "snapshot", broken)
+        with pytest.raises(W.ContainmentRefused, match="assignment_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "assignment_failed"
+        assert adapter.retained_reason == "bind_failed_child_may_exist"
+        assert adapter.retained_evidence["stage"] == "bind"
+        assert adapter.retained_evidence["custody_readable"] is False
+        assert adapter.controller.ownership == "retained_unverified"
+        assert adapter.controller.membership is None
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    @pytest.mark.parametrize("observation_failure", [KeyboardInterrupt(), SystemExit(9)])
+    def test_failing_evidence_construction_never_masks_the_original(
+            self, monkeypatch, observation_failure):
+        original = KeyboardInterrupt()
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=FakeCreation(raises=original))
+
+        def broken(*args):
+            raise observation_failure
+
+        monkeypatch.setattr(W, "MappingProxyType", broken)
+        with pytest.raises(KeyboardInterrupt) as raised:
+            prepare(adapter)
+        assert raised.value is original
+        assert adapter.retained_reason == "creator_failed_outcome_unknown"
+        assert adapter.retained_evidence is None
+        assert adapter.controller.ownership == "retained_unverified"
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    @pytest.mark.parametrize("observation_failure", [KeyboardInterrupt(), SystemExit(9)])
+    def test_failing_observation_never_masks_a_retention_failure(self, monkeypatch,
+                                                                 observation_failure):
+        class StubbornController(W.JobController):
+            @property
+            def ownership(self):
+                return self.__dict__.get("_o", "none")
+
+            @ownership.setter
+            def ownership(self, value):
+                if value != "retained_unverified":
+                    self.__dict__["_o"] = value
+
+        monkeypatch.setattr(W, "JobController", StubbornController)
+
+        def broken(self):
+            raise observation_failure
+
+        monkeypatch.setattr(C.HandleCustody, "snapshot", broken)
+        original = RuntimeError("creator failed")
+        adapter, kernel32, _ = make_adapter(monkeypatch,
+                                            creation=FakeCreation(raises=original))
+        with pytest.raises(W.ContainmentRefused, match="retention_failed") as raised:
+            prepare(adapter)
+        assert raised.value.key == "retention_failed" and raised.value.__cause__ is original
+        assert adapter.retained_reason == "retention_unconfirmed"
+        assert adapter.retained_evidence["custody_readable"] is False
+        assert kernel32.closed == [] and kernel32.terminated == []
+
+    def test_only_the_observation_paths_absorb_base_exceptions(self):
+        code = SOURCE.split('"""', 2)[2]
+        assert code.count("except BaseException:") == 2           # snapshot read + evidence
+        start = code.index("def _note_retention")
+        end = code.index("def _retain_child")
+        assert code[start:end].count("except BaseException:") == 2
+        for marker in ("def prepare", "def _bind", "def close", "def terminate"):
+            body = code[code.index(marker):]
+            assert "except BaseException:" not in body.split("\n    def ")[0], marker
+
+    def test_custody_is_never_closed_reset_or_read_raw_by_the_adapter(self):
+        code = SOURCE.split('"""', 2)[2]
+        for word in ("raw_values", "custody.close", "custody.reset", "custody._info",
+                     "mark_entered", ".attach("):
+            assert word not in code, word
+        assert not any(hasattr(W.ContainmentAdapter, n) for n in ("close", "reset", "recover"))
+
+    def test_gates_stay_closed_with_custody(self):
+        assert W.JOB_LIST_CREATION_INTEGRATED is False
+        assert P.TERMINATION_POLICY == "conditionally_accepted_design_only"
 
     @pytest.mark.parametrize("pid, process", [(0, PROCESS), (True, PROCESS), ("1", PROCESS),
                                               (PID, 0), (PID, None), (PID, -1)])
