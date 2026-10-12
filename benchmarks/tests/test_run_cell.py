@@ -3971,3 +3971,360 @@ class TestAtomicClaim:
             RB._exclusive_json(target, {"a": 2})
         assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
         assert [p.name for p in target.parent.iterdir()] == ["x.started"]
+
+
+# ---------------------------------------------------------------------------
+# B3J-106: the real Git-state reader and the canonical output directory
+# ---------------------------------------------------------------------------
+#
+# The autouse fail_closed fixture makes subprocess.run refuse everything.  The Git tests
+# below put the REAL subprocess.run back, for read-only git commands against a temporary
+# repository only (RB.REPO is pointed at it); nothing here touches the AgentOps repository.
+
+import shutil  # noqa: E402
+
+# subprocess.run is replaced by autouse fixtures only inside tests; at import time it is real.
+REAL_SUBPROCESS_RUN = subprocess.run
+REAL_POPEN = subprocess.Popen          # subprocess.run calls Popen
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+def _git_in(repo, *args):
+    result = REAL_SUBPROCESS_RUN(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+         "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", *args],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+    assert result.returncode == 0, (args, result.stderr)
+    return result.stdout.strip()
+
+
+@pytest.fixture
+def temp_repo(tmp_path, monkeypatch):
+    """A temporary repository with one commit on branch `work`; the real subprocess.run is
+    restored and RB.REPO points at it.  Returns (repo, head)."""
+    monkeypatch.setattr(subprocess, "Popen", REAL_POPEN)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_in(repo, "init", "-q", "-b", "work")
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8", newline="\n")
+    _git_in(repo, "add", "-A")
+    _git_in(repo, "commit", "-q", "-m", "base")
+    monkeypatch.setattr(subprocess, "run", REAL_SUBPROCESS_RUN)
+    monkeypatch.setattr(RB, "REPO", repo)
+    return repo, _git_in(repo, "rev-parse", "HEAD")
+
+
+def _damage(repo, kind):
+    if kind == "dirty tracked file":
+        (repo / "tracked.txt").write_text("changed\n", encoding="utf-8", newline="\n")
+    elif kind == "staged change":
+        (repo / "staged.txt").write_text("x\n", encoding="utf-8", newline="\n")
+        _git_in(repo, "add", "staged.txt")
+    elif kind == "untracked file":
+        (repo / "stray.txt").write_text("x\n", encoding="utf-8", newline="\n")
+    elif kind == "detached head":
+        _git_in(repo, "checkout", "-q", "--detach")
+    elif kind == "staged deletion":
+        _git_in(repo, "rm", "-q", "tracked.txt")
+    else:
+        raise AssertionError(kind)
+
+
+DAMAGE = ["dirty tracked file", "staged change", "untracked file", "detached head",
+          "staged deletion"]
+
+
+@needs_git
+class TestRealGitStateReader:
+    def test_a_clean_repository_is_read_correctly(self, temp_repo):
+        repo, head = temp_repo
+        state = RB.read_git_state()
+        assert state == {"head": head, "branch": "work", "status": [], "staged": []}
+        assert RB.read_git_state(repo) == state
+        assert REAL_VERIFY_REPOSITORY(head) == {"head": head, "branch": "work"}
+
+    def test_a_dirty_tracked_file_is_reported(self, temp_repo):
+        _damage(temp_repo[0], "dirty tracked file")
+        state = RB.read_git_state()
+        assert state["status"] == [" M tracked.txt"] and state["staged"] == []
+
+    def test_a_staged_change_is_reported_in_both_lists(self, temp_repo):
+        _damage(temp_repo[0], "staged change")
+        state = RB.read_git_state()
+        assert state["staged"] == ["staged.txt"] and state["status"] == ["A  staged.txt"]
+
+    def test_an_untracked_file_is_reported(self, temp_repo):
+        _damage(temp_repo[0], "untracked file")
+        state = RB.read_git_state()
+        assert state["status"] == ["?? stray.txt"] and state["staged"] == []
+
+    def test_a_detached_head_reads_as_head_not_a_branch(self, temp_repo):
+        repo, head = temp_repo
+        _damage(repo, "detached head")
+        state = RB.read_git_state()
+        assert state["branch"] == "HEAD" and state["head"] == head
+
+    def test_a_nested_untracked_file_is_listed_individually(self, temp_repo):
+        repo, _ = temp_repo
+        (repo / "dir").mkdir()
+        (repo / "dir" / "a.txt").write_text("x\n", encoding="utf-8")
+        assert RB.read_git_state()["status"] == ["?? dir/a.txt"]    # --untracked-files=all
+
+    @pytest.mark.parametrize("kind", DAMAGE)
+    def test_verify_rejects_every_invalid_state(self, temp_repo, kind):
+        repo, head = temp_repo
+        _damage(repo, kind)
+        with pytest.raises(RB.BenchmarkError):
+            REAL_VERIFY_REPOSITORY(head)
+
+    def test_verify_rejects_a_wrong_expected_head(self, temp_repo):
+        with pytest.raises(RB.BenchmarkError, match="not the expected commit"):
+            REAL_VERIFY_REPOSITORY("1" * 40)
+
+    def test_reading_never_changes_the_repository(self, temp_repo):
+        repo, _ = temp_repo
+        _damage(repo, "untracked file")
+        _damage(repo, "dirty tracked file")
+        before = (sorted(p.relative_to(repo).as_posix() for p in repo.rglob("*")
+                         if ".git" not in p.parts), _git_in(repo, "status", "--porcelain"),
+                  (repo / ".git" / "index").read_bytes())
+        for _ in range(3):
+            RB.read_git_state()
+        after = (sorted(p.relative_to(repo).as_posix() for p in repo.rglob("*")
+                        if ".git" not in p.parts), _git_in(repo, "status", "--porcelain"),
+                 (repo / ".git" / "index").read_bytes())
+        assert before == after
+        assert not (repo / ".git" / "index.lock").exists()
+
+    def test_a_repository_without_commits_fails_closed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subprocess, "Popen", REAL_POPEN)
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        _git_in(empty, "init", "-q", "-b", "work")
+        monkeypatch.setattr(subprocess, "run", REAL_SUBPROCESS_RUN)
+        with pytest.raises(RB.BenchmarkError, match=r"git rev-parse: exit \d+"):
+            RB.read_git_state(empty)
+
+    def test_a_directory_that_is_not_a_repository_fails_closed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subprocess, "run", REAL_SUBPROCESS_RUN)
+        monkeypatch.setattr(subprocess, "Popen", REAL_POPEN)
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+        with pytest.raises(RB.BenchmarkError, match=r"git rev-parse: exit \d+"):
+            RB.read_git_state(plain)
+
+
+class TestGitCommandFailures:
+    """The reader's handling of a failing or odd git, with controlled subprocess results."""
+
+    @staticmethod
+    def _script(monkeypatch, results):
+        issued = []
+
+        def fake(command, **kwargs):
+            issued.append(list(command))
+            step = results[len(issued) - 1]
+            if isinstance(step, BaseException):
+                raise step
+            code, out = step
+            return subprocess.CompletedProcess(command, code, out, "")
+
+        monkeypatch.setattr(subprocess, "run", fake)
+        return issued
+
+    GOOD = [(0, "a" * 40 + "\n"), (0, "work\n"), (0, ""), (0, "")]
+
+    def test_the_four_commands_are_the_read_only_ones(self, monkeypatch):
+        issued = self._script(monkeypatch, self.GOOD)
+        assert RB.read_git_state(Path("somewhere")) == {
+            "head": "a" * 40, "branch": "work", "status": [], "staged": []}
+        assert [c[c.index("-C") + 2:] for c in issued] == [
+            ["rev-parse", "HEAD"], ["rev-parse", "--abbrev-ref", "HEAD"],
+            ["status", "--porcelain", "--untracked-files=all"],
+            ["diff", "--cached", "--name-only"]]
+        assert all(c[:3] == ["git", "--no-optional-locks", "-C"] for c in issued)
+
+    @pytest.mark.parametrize("failing", [0, 1, 2, 3])
+    def test_a_nonzero_exit_of_any_command_fails_closed(self, monkeypatch, failing):
+        results = list(self.GOOD)
+        results[failing] = (128, "")
+        self._script(monkeypatch, results)
+        with pytest.raises(RB.BenchmarkError, match="exit 128"):
+            RB.read_git_state(Path("somewhere"))
+
+    @pytest.mark.parametrize("error", [FileNotFoundError("git"), PermissionError("x"),
+                                       subprocess.TimeoutExpired("git", 60)])
+    def test_a_missing_git_or_a_timeout_fails_closed(self, monkeypatch, error):
+        self._script(monkeypatch, [error])
+        with pytest.raises(RB.BenchmarkError, match="git rev-parse"):
+            RB.read_git_state(Path("somewhere"))
+
+    @pytest.mark.parametrize("results", [
+        [(0, ""), (0, "work\n"), (0, ""), (0, "")],                    # empty HEAD
+        [(0, "garbage\n"), (0, "work\n"), (0, ""), (0, "")],           # not a commit id
+        [(0, "a" * 40 + "\n"), (0, ""), (0, ""), (0, "")],             # no branch name
+        [(0, "a" * 40 + "\n"), (0, "work\n"), (0, "\n\n  \n"), (0, "\n")],  # blank lines only
+    ])
+    def test_malformed_output_never_verifies_a_state(self, monkeypatch, results):
+        self._script(monkeypatch, results)
+        state = RB.read_git_state(Path("somewhere"))
+        if state["head"] == "a" * 40 and state["branch"] == "work":
+            assert state["status"] == [] and state["staged"] == []     # blank lines are ignored
+            return
+        with pytest.raises(RB.BenchmarkError):
+            REAL_VERIFY_REPOSITORY("a" * 40, read=lambda: state)
+
+    def test_output_without_a_proper_head_is_refused_even_when_expected(self, monkeypatch):
+        self._script(monkeypatch, [(0, "garbage\n"), (0, "work\n"), (0, ""), (0, "")])
+        state = RB.read_git_state(Path("somewhere"))
+        assert state["head"] == "garbage"
+        with pytest.raises(RB.BenchmarkError):                         # expect-head is validated
+            RB.check_live_authorization(_approved_cells(), authorize=SMOKE2,
+                                        expect_head=state["head"], warmup_requests=25,
+                                        repetition=2)
+
+
+@needs_git
+class TestInvalidGitStateCreatesNoClaim:
+    """main with the REAL verify_repository_readonly and the REAL read_git_state on a
+    temporary repository: an invalid state is refused before any claim exists."""
+
+    @pytest.fixture
+    def real_git(self, live, temp_repo, monkeypatch):
+        repo, head = temp_repo
+        monkeypatch.setattr(RB, "verify_repository_readonly", REAL_VERIFY_REPOSITORY)
+        args = [*APPROVED, "--live", "--authorize", SMOKE2, "--expect-head", head]
+        live.repo, live.head, live.args = repo, head, args
+        return live
+
+    def test_the_stubs_are_not_in_force(self, real_git):
+        assert RB.verify_repository_readonly is REAL_VERIFY_REPOSITORY
+        assert RB.check_live_output_dir is REAL_CHECK_LIVE_OUTPUT_DIR
+        assert RB.read_git_state.__module__ == "run_benchmark"
+
+    def test_a_valid_state_is_claimed_with_the_real_head_and_branch(self, real_git):
+        assert _live(real_git.args) == 0 and real_git.runs == [SMOKE2]
+        record = real_git.started_during_run
+        assert record["verified_head"] == real_git.head and record["branch"] == "work"
+
+    @pytest.mark.parametrize("kind", DAMAGE)
+    def test_every_invalid_state_is_refused_with_nothing_created(self, real_git, kind, capsys):
+        _damage(real_git.repo, kind)
+        assert _live(real_git.args) == 2
+        assert "nothing was started" in capsys.readouterr().err
+        assert _nothing_created(real_git)
+
+    def test_a_wrong_expected_head_is_refused_with_nothing_created(self, real_git):
+        assert _live(real_git.args[:-1] + ["2" * 40]) == 2 and _nothing_created(real_git)
+
+
+@pytest.fixture
+def canonical_dir(tmp_path, monkeypatch):
+    canonical = tmp_path / "canonical"
+    monkeypatch.setattr(RB, "DEFAULT_OUTPUT", canonical)
+    monkeypatch.setattr(RB, "check_live_output_dir", REAL_CHECK_LIVE_OUTPUT_DIR)
+    return canonical
+
+
+class TestCanonicalOutputDirectory:
+    def test_the_exact_path_is_accepted_whether_or_not_it_exists(self, canonical_dir):
+        assert RB.check_live_output_dir(canonical_dir) == canonical_dir.resolve()
+        assert not canonical_dir.exists()                      # checking creates nothing
+        canonical_dir.mkdir()
+        assert RB.check_live_output_dir(canonical_dir) == canonical_dir.resolve()
+
+    @pytest.mark.parametrize("spelling", [
+        lambda c: c / "sub" / "..",
+        lambda c: c.parent / "elsewhere" / ".." / c.name,
+        lambda c: Path(str(c) + os.sep),
+        lambda c: Path(str(c) + os.sep + "." + os.sep),
+        lambda c: c.parent / "." / c.name,
+    ], ids=["dotdot-below", "dotdot-sibling", "trailing-sep", "trailing-dot", "dot-segment"])
+    def test_equivalent_spellings_resolve_to_the_canonical_location(self, canonical_dir, spelling):
+        canonical_dir.mkdir()
+        assert RB.check_live_output_dir(spelling(canonical_dir)) == canonical_dir.resolve()
+
+    @pytest.mark.skipif(os.name != "nt", reason="case-insensitive paths are a Windows rule")
+    def test_case_differences_are_the_same_directory_on_windows(self, canonical_dir):
+        canonical_dir.mkdir()
+        shouted = canonical_dir.parent / canonical_dir.name.upper()
+        assert RB.check_live_output_dir(shouted) == shouted.resolve()
+        assert os.path.normcase(str(shouted.resolve())) == os.path.normcase(
+            str(canonical_dir.resolve()))
+
+    @pytest.mark.skipif(os.name == "nt", reason="case-sensitive paths are a POSIX rule")
+    def test_case_differences_are_another_directory_on_posix(self, canonical_dir):
+        with pytest.raises(RB.BenchmarkError, match="canonical output directory"):
+            RB.check_live_output_dir(canonical_dir.parent / canonical_dir.name.upper())
+
+    @pytest.mark.parametrize("other", [
+        lambda c: c.parent / "another",
+        lambda c: c.parent / (c.name + "2"),                   # shares the prefix
+        lambda c: c / "child",                                 # inside the canonical one
+        lambda c: c.parent,                                    # its parent
+        lambda c: c.parent / "x" / c.name,                     # same name, another place
+    ], ids=["sibling", "prefix", "child", "parent", "same-name-elsewhere"])
+    def test_a_different_directory_is_rejected(self, canonical_dir, other):
+        canonical_dir.mkdir()
+        with pytest.raises(RB.BenchmarkError, match="canonical output directory"):
+            RB.check_live_output_dir(other(canonical_dir))
+
+    def test_a_symlink_alias_is_the_canonical_directory(self, canonical_dir, tmp_path):
+        canonical_dir.mkdir()
+        alias = tmp_path / "alias"
+        try:
+            os.symlink(canonical_dir, alias, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symbolic links are not available to this user")
+        assert RB.check_live_output_dir(alias) == canonical_dir.resolve()
+        with pytest.raises(RB.BenchmarkError):                 # ".." leaves the link's parent
+            RB.check_live_output_dir(alias / "..")
+
+    @pytest.mark.skipif(os.name != "nt", reason="junctions are a Windows feature")
+    def test_a_junction_alias_is_the_canonical_directory(self, canonical_dir, tmp_path,
+                                                         monkeypatch):
+        monkeypatch.setattr(subprocess, "Popen", REAL_POPEN)
+        canonical_dir.mkdir()
+        junction = tmp_path / "junction"
+        made = REAL_SUBPROCESS_RUN(["cmd", "/c", "mklink", "/J", str(junction), str(canonical_dir)],
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                   timeout=30)
+        if made.returncode != 0 or not junction.exists():
+            pytest.skip("a junction could not be created here")
+        assert RB.check_live_output_dir(junction) == canonical_dir.resolve()
+
+    def test_an_alias_to_a_different_directory_is_rejected(self, canonical_dir, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        alias = tmp_path / "alias-to-other"
+        try:
+            os.symlink(other, alias, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symbolic links are not available to this user")
+        with pytest.raises(RB.BenchmarkError, match="canonical output directory"):
+            RB.check_live_output_dir(alias)
+
+    def test_the_default_is_a_directory_outside_the_repository(self):
+        default = RB.DEFAULT_OUTPUT.resolve()
+        assert default.name == "agentops-benchmarks" and _REPO not in default.parents
+
+    def test_the_real_check_is_in_force_in_the_live_fixture(self, live):
+        assert RB.check_live_output_dir is REAL_CHECK_LIVE_OUTPUT_DIR
+        assert RB.verify_repository_readonly is not REAL_VERIFY_REPOSITORY   # injected reader
+
+    def test_an_equivalent_spelling_shares_one_ledger_through_main(self, live, tmp_path):
+        spelled = live.canonical / "sub" / ".."
+        assert _live(None, "--output-dir", str(spelled)) == 0 and live.runs == [SMOKE2]
+        assert _live(None, "--output-dir", str(live.canonical)) == 2          # same ledger
+        assert _live(None, "--output-dir", str(Path(str(live.canonical) + os.sep))) == 2
+        assert live.runs == [SMOKE2]
+        assert sorted(p.name for p in (live.canonical / "ledger").iterdir()) == [
+            f"{SMOKE2}.done", f"{SMOKE2}.started"]
+        assert not (tmp_path / "sub").exists()
+
+    def test_every_other_test_still_runs_with_the_stubs(self, monkeypatch):
+        # outside the live fixture, the autouse stubs are in force (documented, not hidden)
+        assert RB.check_live_output_dir is not REAL_CHECK_LIVE_OUTPUT_DIR
+        assert RB.verify_repository_readonly is not REAL_VERIFY_REPOSITORY
