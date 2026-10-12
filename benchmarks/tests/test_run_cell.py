@@ -87,6 +87,20 @@ def no_live_access(monkeypatch):
     monkeypatch.setattr(RB, "local_platform_info", lambda: {"os": "test"})
 
 
+#: The real pre-claim checks (B3J-103), for tests that exercise them; every other test
+#: runs with them replaced, as it runs with a fake harness: they would otherwise look at
+#: the real repository and the real canonical output directory.
+REAL_CHECK_LIVE_OUTPUT_DIR = RB.check_live_output_dir
+REAL_VERIFY_REPOSITORY = RB.verify_repository_readonly
+
+
+@pytest.fixture(autouse=True)
+def pre_claim_checks_replaced(monkeypatch):
+    monkeypatch.setattr(RB, "check_live_output_dir", lambda output_dir: Path(output_dir).resolve())
+    monkeypatch.setattr(RB, "verify_repository_readonly",
+                        lambda expect_head, **kw: {"head": expect_head, "branch": "test-branch"})
+
+
 class Boom(RuntimeError):
     pass
 
@@ -3574,3 +3588,386 @@ class TestSmallTenFourthRepetition:
         for section, name in NEW_LEAVES:
             assert name in result["metrics"][section], name
         M.validate_result(result)
+
+
+# ---------------------------------------------------------------------------
+# B3J-103: configuration integrity, marker binding, single use, validation order
+# ---------------------------------------------------------------------------
+
+import copy  # noqa: E402
+import hashlib  # noqa: E402
+import io  # noqa: E402
+import threading  # noqa: E402
+
+LADDER_BYTES = (_BENCH / "ladder.json").read_bytes()
+APPROVED_ARGS = [*APPROVED, "--live", "--authorize", "bm-smoke-r0005-c32-rep2",
+                 "--expect-head", HEAD]
+SMOKE2 = "bm-smoke-r0005-c32-rep2"
+OTHER_OWNER = "another run owns this"
+MUTATIONS = {
+    "seed": lambda d: d["defaults"].__setitem__("seed", 7),
+    "detector off": lambda d: d["levels"][0].__setitem__("refresh_and_detector", False),
+    "drain": lambda d: d["defaults"].__setitem__("drain_limit_seconds", 5),
+    "settle": lambda d: d["defaults"].__setitem__("settle_seconds", 1),
+    "budget": lambda d: d["defaults"].__setitem__("cell_budget_seconds", 99999),
+    "sample interval": lambda d: d["defaults"].__setitem__("sample_interval_seconds", 1),
+    "memory stop": lambda d: d["stop_limits"].__setitem__("memory_fraction", 1.0),
+    "disk stop": lambda d: d["stop_limits"].__setitem__("disk_free_min_gb", 0.001),
+    "lag stop": lambda d: d["stop_limits"].__setitem__("lag_growth_samples", 1000),
+}
+
+
+def _altered(name):
+    data = copy.deepcopy(LADDER)
+    MUTATIONS[name](data)
+    M.check_ladder(data)                      # structurally valid: only the pin can refuse it
+    return data
+
+
+@pytest.fixture
+def live(monkeypatch, tmp_path):
+    """The CLI with the gate open in memory, the real pre-claim checks and the real claim,
+    run_cell replaced, a canonical output directory inside tmp_path, a fake read-only git."""
+    canonical = tmp_path / "canonical"
+    git = {"head": HEAD, "branch": "work", "status": [], "staged": []}
+    seen = SimpleNamespace(runs=[], canonical=canonical, git=git, started_during_run=None)
+    monkeypatch.setattr(RB, "LIVE_ENABLED", True)
+    monkeypatch.setattr(RB, "DEFAULT_OUTPUT", canonical)
+    monkeypatch.setattr(RB, "check_live_output_dir", REAL_CHECK_LIVE_OUTPUT_DIR)
+    monkeypatch.setattr(RB, "verify_repository_readonly",
+                        lambda expect_head, **kw: REAL_VERIFY_REPOSITORY(
+                            expect_head, read=lambda: dict(git)))
+
+    def fake_run_cell(cell, ladder, **kw):
+        seen.runs.append(cell.benchmark_id)
+        started = kw["output_dir"] / "ledger" / f"{cell.benchmark_id}.started"
+        seen.started_during_run = json.loads(started.read_text(encoding="utf-8"))
+        path = kw["output_dir"] / f"{cell.benchmark_id}-fake.json"
+        path.write_text("{}", encoding="utf-8")
+        return {"verdict": "VALID"}, path, True
+
+    monkeypatch.setattr(RB, "run_cell", fake_run_cell)
+    return seen
+
+
+def _live(args=None, *extra):
+    return RB.main([*(APPROVED_ARGS if args is None else args), *extra], stdout=io.StringIO())
+
+
+def _nothing_created(seen):
+    c = seen.canonical
+    return seen.runs == [] and (not c.exists() or not any(c.rglob("*")))
+
+
+class TestB1ConfigurationIntegrity:
+    def test_the_pin_is_the_real_ladders_hash(self):
+        assert RB.APPROVED_LADDER_SHA256 == hashlib.sha256(LADDER_BYTES).hexdigest() == (
+            "571138bb0c10e15547345aca5f15422742ffb03d998e88127c2d7aadc8b2c71f")
+        data, digest = RB.read_ladder(RB.DEFAULT_CONFIG)
+        assert digest == RB.APPROVED_LADDER_SHA256 and data == LADDER
+
+    def test_the_hash_and_the_parse_come_from_the_same_bytes(self, tmp_path, monkeypatch):
+        altered = json.dumps(_altered("seed")).encode("utf-8")
+        path = tmp_path / "x.json"
+        path.write_bytes(LADDER_BYTES)
+        reads = []
+
+        def once(self):
+            reads.append(self)
+            return altered
+
+        monkeypatch.setattr(Path, "read_bytes", once)
+        data, digest = RB.read_ladder(path)
+        assert reads == [path]                                   # read once
+        assert digest == hashlib.sha256(altered).hexdigest() and data["defaults"]["seed"] == 7
+
+    @pytest.mark.parametrize("name", sorted(MUTATIONS))
+    def test_every_altered_value_is_refused_by_the_effective_check(self, name):
+        altered = _altered(name)
+        cells = RB.plan_cells(altered, "SMOKE", rates=[5], repetition=2, concurrency=32,
+                              warmup_requests=25)
+        with pytest.raises(RB.BenchmarkError, match="effective configuration differs"):
+            RB.check_effective_config(cells[0], altered)
+        assert RB.check_effective_config(_approved_cells()[0], LADDER)["seed"] == 42
+
+    @pytest.mark.parametrize("name", sorted(MUTATIONS))
+    def test_an_altered_configuration_is_refused_before_anything_is_created(
+            self, live, tmp_path, name, capsys):
+        config = tmp_path / "alt.json"
+        config.write_text(json.dumps(_altered(name), indent=2), encoding="utf-8")
+        assert _live(None, "--config", str(config)) == 2
+        assert "nothing was started" in capsys.readouterr().err and _nothing_created(live)
+
+    def test_an_identical_content_configuration_at_another_path_is_accepted(self, live, tmp_path):
+        config = tmp_path / "elsewhere" / "copy-of-the-ladder.json"
+        config.parent.mkdir()
+        config.write_bytes(LADDER_BYTES)
+        assert _live(None, "--config", str(config)) == 0 and live.runs == [SMOKE2]
+
+    def test_a_different_content_but_valid_configuration_is_refused_live_only(
+            self, live, tmp_path, capsys):
+        config = tmp_path / "reformatted.json"
+        config.write_text(json.dumps(LADDER, indent=4), encoding="utf-8")   # same values
+        assert _live(None, "--config", str(config)) == 2
+        assert "SHA-256" in capsys.readouterr().err and _nothing_created(live)
+        out = io.StringIO()                       # planning still takes any valid configuration
+        assert RB.main(["--level", "SMOKE", "--config", str(config), "--output-dir",
+                        str(tmp_path / "plan")], stdout=out) == 0
+        assert out.getvalue().startswith("PLAN ONLY")
+        assert not (tmp_path / "plan").exists()
+
+    def test_run_cell_checks_the_effective_values_too(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(RB, "LIVE_ENABLED", True)
+        monkeypatch.setattr(RB, "execute_cell", lambda *a, **k: pytest.fail("reached"))
+        altered = _altered("seed")
+        cell = RB.plan_cells(altered, "SMOKE", rates=[5], repetition=2, concurrency=32,
+                             warmup_requests=25)[0]
+        assert RB.is_approved_live_cell(cell)                    # the old check alone passed it
+        with pytest.raises(RB.BenchmarkError, match="effective configuration differs"):
+            RB.run_cell(cell, altered, expect_head=HEAD, output_dir=tmp_path)
+
+
+class TestB3CanonicalOutputDirectory:
+    def test_another_directory_is_refused_for_live(self, live, tmp_path, capsys):
+        other = tmp_path / "somewhere-else"
+        assert _live(None, "--output-dir", str(other)) == 2
+        assert "canonical output directory" in capsys.readouterr().err
+        assert not other.exists() and _nothing_created(live)
+
+    def test_the_canonical_directory_is_accepted(self, live):
+        assert _live(None, "--output-dir", str(live.canonical)) == 0
+        assert live.runs == [SMOKE2]
+
+    def test_a_used_cell_cannot_be_rerun_by_naming_another_directory(self, live, tmp_path):
+        assert _live(None, "--output-dir", str(live.canonical)) == 0
+        assert _live(None, "--output-dir", str(tmp_path / "fresh")) == 2
+        assert _live(None, "--output-dir", str(live.canonical)) == 2
+        assert live.runs == [SMOKE2]
+
+    @pytest.mark.parametrize("make", ["started", "done", "result", "owner"])
+    def test_existing_evidence_blocks_reuse_and_is_left_alone(self, live, make, capsys):
+        c = live.canonical
+        (c / "ledger").mkdir(parents=True)
+        paths = {"started": c / "ledger" / f"{SMOKE2}.started",
+                 "done": c / "ledger" / f"{SMOKE2}.done",
+                 "result": c / f"{SMOKE2}-20261011T000000.json", "owner": c / RB.OWNER_FILE}
+        paths[make].write_text("historical", encoding="utf-8")
+        before = sorted(str(p.relative_to(c)) for p in c.rglob("*"))
+        assert _live() == 2 and live.runs == []
+        assert sorted(str(p.relative_to(c)) for p in c.rglob("*")) == before
+        assert paths[make].read_text(encoding="utf-8") == "historical"
+        assert "existing records block" in capsys.readouterr().err
+
+
+class TestB4ValidationBeforeClaim:
+    @pytest.mark.parametrize("change", [
+        dict(head="9" * 40), dict(status=[" M benchmarks/run_benchmark.py"]),
+        dict(status=["?? stray.txt"]), dict(staged=["a.py"]), dict(branch="HEAD")])
+    def test_wrong_head_dirty_tree_or_staged_change_creates_nothing(
+            self, live, change, capsys):
+        live.git.update(change)
+        assert _live() == 2 and "nothing was started" in capsys.readouterr().err
+        assert _nothing_created(live)
+
+    def test_the_order_of_the_checks_and_the_claim(self, live, monkeypatch):
+        order = []
+        for name in ("check_live_authorization", "check_effective_config",
+                     "check_live_output_dir", "check_no_prior_evidence",
+                     "verify_repository_readonly", "claim_run", "run_cell"):
+            real = getattr(RB, name)
+
+            def wrapped(*a, _n=name, _r=real, **k):
+                order.append(_n)
+                return _r(*a, **k)
+
+            monkeypatch.setattr(RB, name, wrapped)
+        assert _live() == 0
+        assert order == ["check_live_authorization", "check_effective_config",
+                         "check_live_output_dir", "check_no_prior_evidence",
+                         "verify_repository_readonly", "claim_run", "run_cell"]
+
+    def test_a_failure_before_the_claim_leaves_no_state_whatever_it_is(self, live, tmp_path):
+        for argv in (["--authorize", "bm-smoke-r0005-c32-rep3"],
+                     ["--output-dir", str(tmp_path / "x")]):
+            assert _live(None, *argv) == 2
+        live.git["head"] = "1" * 40
+        assert _live() == 2 and _nothing_created(live)
+
+
+def _good_binding():
+    cell = _approved_cells()[0]
+    return cell, {"branch": "work", "ladder_sha256": RB.APPROVED_LADDER_SHA256,
+                  "config_path": "c.json", "effective_config": RB.effective_config(cell, LADDER)}
+
+
+class TestB2MarkerBinding:
+    def test_started_records_the_verified_configuration_and_run_identity(self, live):
+        assert _live() == 0
+        record = live.started_during_run
+        cell = _approved_cells()[0]
+        assert record["schema"] == 2 and record["benchmark_id"] == SMOKE2
+        assert record["verified_head"] == record["git_head"] == HEAD
+        assert record["branch"] == "work" and record["ladder_sha256"] == RB.APPROVED_LADDER_SHA256
+        assert record["output_dir"] == str(live.canonical.resolve())
+        assert record["config_path"] == str(RB.DEFAULT_CONFIG.resolve())
+        effective = record["effective_config"]
+        assert effective["seed"] == 42 and effective["scenario"] == "normal"
+        assert effective["refresh_and_detector"] is True and effective["live_allowed"] is True
+        assert (effective["drain_limit_seconds"], effective["settle_seconds"],
+                effective["cell_budget_seconds"]) == (120, 6, 3600)
+        assert effective["stop_limits"] == LADDER["stop_limits"]
+        assert effective["target"] == cell.target()
+        assert effective["target"]["warmup_run_id"] == "b-smoke-r0005-c32-w2"
+        assert effective["target"]["measured_run_id"] == "b-smoke-r0005-c32-m2"
+        assert RB.validate_marker(record, cell, live.canonical) == []
+        assert record["arguments"]["authorize"] == SMOKE2 and record["arguments"]["live"] is True
+
+    @pytest.mark.parametrize("field,value", [
+        ("benchmark_id", "bm-smoke-r0005-c32-rep3"), ("verified_head", "7" * 40),
+        ("git_head", "7" * 40), ("branch", "HEAD"), ("ladder_sha256", "0" * 64),
+        ("output_dir", "/elsewhere"), ("nonce", ""), ("schema", 1),
+        ("effective_config", {}), ("unexpected", 1)])
+    def test_inconsistent_fields_are_reported(self, tmp_path, field, value):
+        cell, binding = _good_binding()
+        RB.claim_run(tmp_path, cell, head=HEAD, arguments={}, binding=binding)
+        record = json.loads((tmp_path / "ledger" / f"{SMOKE2}.started").read_text())
+        assert RB.validate_marker(record, cell, tmp_path) == []
+        record[field] = value
+        assert RB.validate_marker(record, cell, tmp_path)
+
+    def test_a_changed_effective_value_or_run_id_is_reported(self, tmp_path):
+        cell, binding = _good_binding()
+        RB.claim_run(tmp_path, cell, head=HEAD, arguments={}, binding=binding)
+        record = json.loads((tmp_path / "ledger" / f"{SMOKE2}.started").read_text())
+        for edit in (lambda r: r["effective_config"].__setitem__("seed", 7),
+                     lambda r: r["effective_config"]["stop_limits"].__setitem__(
+                         "memory_fraction", 1.0),
+                     lambda r: r["effective_config"].__setitem__("refresh_and_detector", False),
+                     lambda r: r["effective_config"]["target"].__setitem__(
+                         "measured_run_id", "b-other-m2")):
+            broken = copy.deepcopy(record)
+            edit(broken)
+            assert RB.validate_marker(broken, cell, tmp_path)
+
+    @pytest.mark.parametrize("bad", ["ladder", "seed", "head"])
+    def test_claim_run_refuses_an_inconsistent_binding_and_creates_nothing(self, tmp_path, bad):
+        cell, binding = _good_binding()
+        head = HEAD
+        if bad == "ladder":
+            binding["ladder_sha256"] = "0" * 64
+        elif bad == "seed":
+            binding["effective_config"]["seed"] = 7
+        else:
+            head = "short"
+        with pytest.raises(RB.BenchmarkError, match="inconsistent"):
+            RB.claim_run(tmp_path, cell, head=head, arguments={}, binding=binding)
+        assert not any(tmp_path.rglob("*"))
+
+    def test_a_stored_record_that_differs_from_the_written_one_is_kept_for_review(
+            self, tmp_path, monkeypatch):
+        cell, binding = _good_binding()
+        real = RB._exclusive_json
+
+        def corrupting(path, payload):
+            if path.name.endswith(".started"):
+                payload = {**payload, "arguments": {"tampered": True}}
+            return real(path, payload)
+
+        monkeypatch.setattr(RB, "_exclusive_json", corrupting)
+        # the in-memory record and the stored one differ: refused, nothing deleted
+        with pytest.raises(RB.BenchmarkError, match="kept for review"):
+            RB.claim_run(tmp_path, cell, head=HEAD, arguments={}, binding=binding)
+        assert (tmp_path / "ledger" / f"{SMOKE2}.started").is_file()
+        assert (tmp_path / RB.OWNER_FILE).is_file()
+
+    def test_the_historical_format_is_unchanged(self, tmp_path):
+        cell = _approved_cells()[0]
+        started = RB.claim_run(tmp_path, cell, head=HEAD, arguments={"repetition": 2})
+        record = json.loads(started.read_text(encoding="utf-8"))
+        assert set(record) == {"benchmark_id", "git_head", "pid", "started_utc", "arguments"}
+        assert RB.validate_marker(record, cell, tmp_path)        # not a schema-2 record
+
+
+class TestAtomicClaim:
+    def test_concurrent_claims_for_the_same_cell_cannot_both_succeed(self, tmp_path):
+        cell, binding = _good_binding()
+        gate, results = threading.Barrier(8), []
+
+        def attempt():
+            gate.wait()
+            try:
+                results.append(("ok", RB.claim_run(tmp_path, cell, head=HEAD, arguments={},
+                                                    binding=binding)))
+            except RB.BenchmarkError as exc:
+                results.append(("refused", str(exc)))
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert [r[0] for r in results].count("ok") == 1 and len(results) == 8
+        assert sorted(p.name for p in (tmp_path / "ledger").iterdir()) == [f"{SMOKE2}.started"]
+        assert (tmp_path / RB.OWNER_FILE).is_file()
+
+    def test_concurrent_claims_for_different_cells_in_one_directory_serialize(self, tmp_path):
+        gate, results = threading.Barrier(2), []
+        cells = [_approved_cells(repetition=n)[0] for n in (2, 3)]
+
+        def attempt(cell):
+            gate.wait()
+            try:
+                RB.claim_run(tmp_path, cell, head=HEAD, arguments={})
+                results.append("ok")
+            except RB.BenchmarkError:
+                results.append("refused")
+
+        threads = [threading.Thread(target=attempt, args=(c,)) for c in cells]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(results) == ["ok", "refused"]
+        assert len(list((tmp_path / "ledger").iterdir())) == 1
+
+    def test_a_failure_while_writing_the_record_leaves_no_partial_started(
+            self, tmp_path, monkeypatch):
+        cell, binding = _good_binding()
+        real_fsync, calls = os.fsync, []
+
+        def failing_fsync(fd):
+            calls.append(fd)
+            if len(calls) == 2:                     # the owner file was fine; the record fails
+                raise OSError("disk")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", failing_fsync)
+        with pytest.raises(RB.BenchmarkError, match="cannot create"):
+            RB.claim_run(tmp_path, cell, head=HEAD, arguments={}, binding=binding)
+        assert not (tmp_path / "ledger" / f"{SMOKE2}.started").exists()
+        assert not (tmp_path / RB.OWNER_FILE).exists()           # its own ownership released
+        assert [p.name for p in (tmp_path / "ledger").iterdir()] == []   # no temporary left
+
+    def test_another_owners_claim_is_never_removed(self, tmp_path, monkeypatch):
+        cell, binding = _good_binding()
+        real = RB._exclusive_json
+
+        def raced(path, payload):
+            if path.name.endswith(".started"):
+                (tmp_path / RB.OWNER_FILE).write_text(OTHER_OWNER, encoding="utf-8")
+                raise OSError("disk")
+            return real(path, payload)
+
+        monkeypatch.setattr(RB, "_exclusive_json", raced)
+        with pytest.raises(RB.BenchmarkError, match="cannot create"):
+            RB.claim_run(tmp_path, cell, head=HEAD, arguments={}, binding=binding)
+        assert (tmp_path / RB.OWNER_FILE).read_text(encoding="utf-8") == OTHER_OWNER
+        assert not (tmp_path / "ledger" / f"{SMOKE2}.started").exists()
+
+    def test_an_existing_record_is_never_replaced(self, tmp_path):
+        target = tmp_path / "ledger" / "x.started"
+        RB._exclusive_json(target, {"a": 1})
+        with pytest.raises(FileExistsError):
+            RB._exclusive_json(target, {"a": 2})
+        assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1}
+        assert [p.name for p in target.parent.iterdir()] == ["x.started"]

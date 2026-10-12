@@ -49,10 +49,12 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,17 +90,31 @@ class LiveDisabled(BenchmarkError):
 # Configuration and cells
 # ---------------------------------------------------------------------------
 
-def load_ladder(path: Path) -> dict[str, Any]:
-    """Read and validate the ladder (targets only)."""
+#: SHA-256 of the approved ladder file's bytes (benchmarks/ladder.json).  A live run
+#: accepts a configuration only when the bytes it read hash to exactly this, whatever
+#: the file is called or where it is; a different valid configuration can still be
+#: planned.  Changing the ladder is a reviewed step that changes this value with it.
+APPROVED_LADDER_SHA256: str = "571138bb0c10e15547345aca5f15422742ffb03d998e88127c2d7aadc8b2c71f"
+
+
+def read_ladder(path: Path) -> tuple[dict[str, Any], str]:
+    """Read the ladder's bytes once; return the validated ladder (targets only) parsed
+    from those same bytes, and the SHA-256 of those bytes."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = Path(path).read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BenchmarkError(f"cannot read the ladder {path}: {exc}") from None
     try:
         M.check_ladder(data)
     except M.MetricError as exc:
         raise BenchmarkError(f"the ladder is not valid: {exc}") from None
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
+
+
+def load_ladder(path: Path) -> dict[str, Any]:
+    """Read and validate the ladder (targets only)."""
+    return read_ladder(path)[0]
 
 
 @dataclass(frozen=True)
@@ -175,6 +191,166 @@ APPROVED_LIVE_CELLS: Mapping[str, Mapping[str, Any]] = {
 }
 MAX_WARMUP_REQUESTS: int = 10000
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+#: What every approved live cell runs with besides its own id, rate, concurrency, request
+#: and warm-up counts: the effective values the ladder supplies.  They repeat the
+#: approved ladder on purpose: a second, independent check that a live run uses exactly
+#: these, whatever the configuration it was handed.  Nothing here is a new threshold.
+APPROVED_EFFECTIVE: Mapping[str, Any] = {
+    "scenario": "normal", "seed": 42, "live_allowed": True, "refresh_and_detector": True,
+    "drain_limit_seconds": 120, "settle_seconds": 6, "cell_budget_seconds": 3600,
+    "sample_interval_seconds": 10,
+    "stop_limits": {
+        "memory_fraction": 0.90, "disk_free_min_gb": 10, "disk_projection_factor": 2.0,
+        "cpu_saturation_percent": 99.5, "cpu_saturation_seconds": 60,
+        "lag_growth_samples": 6, "generator_rate_fraction": 0.95,
+        "late_start_fraction": 0.05, "skew_uncertainty_ms": 10, "skew_drift_ms": 5},
+}
+
+
+def effective_config(cell: Cell, ladder: Mapping[str, Any]) -> dict[str, Any]:
+    """Every value a cell's run takes from the configuration, as it will be used."""
+    defaults = ladder["defaults"]
+    return {
+        "scenario": defaults["scenario"], "seed": cell.seed, "live_allowed": cell.live_allowed,
+        "refresh_and_detector": cell.refresh_and_detector,
+        "drain_limit_seconds": defaults["drain_limit_seconds"],
+        "settle_seconds": defaults["settle_seconds"],
+        "cell_budget_seconds": defaults["cell_budget_seconds"],
+        "sample_interval_seconds": defaults["sample_interval_seconds"],
+        "stop_limits": dict(ladder["stop_limits"]), "target": cell.target(),
+    }
+
+
+def check_effective_config(cell: Cell, ladder: Mapping[str, Any]) -> dict[str, Any]:
+    """The cell's effective configuration, or BenchmarkError naming what differs from the
+    approved one.  Pure."""
+    effective = effective_config(cell, ladder)
+    wrong = [key for key, value in APPROVED_EFFECTIVE.items()
+             if effective[key] != value or type(effective[key]) is not type(value)]
+    if effective["target"]["scenario"] != APPROVED_EFFECTIVE["scenario"] \
+            or effective["target"]["seed"] != APPROVED_EFFECTIVE["seed"]:
+        wrong.append("target")
+    if wrong:
+        raise BenchmarkError("the effective configuration differs from the approved one in "
+                             + ", ".join(f"{key} ({effective[key]!r} != "
+                                         f"{APPROVED_EFFECTIVE.get(key)!r})" if key in effective
+                                         and key in APPROVED_EFFECTIVE else key
+                                         for key in wrong))
+    return effective
+
+
+def check_live_output_dir(output_dir: Path) -> Path:
+    """A live run writes its claim and results only to the one canonical directory, so
+    that a cell's single use cannot be escaped by naming another directory."""
+    given = Path(output_dir).resolve()
+    canonical = Path(DEFAULT_OUTPUT).resolve()
+    if os.path.normcase(str(given)) != os.path.normcase(str(canonical)):
+        raise BenchmarkError(f"--live writes only to the canonical output directory "
+                             f"{canonical}; {given} is not it")
+    return given
+
+
+def check_no_prior_evidence(output_dir: Path, cell: "Cell") -> None:
+    """Read-only: nothing that would make the claim fail already exists.  claim_run
+    decides again, exclusively; this only refuses early, before any state is created."""
+    output_dir = Path(output_dir)
+    found = [str(path.name) for path in (
+        output_dir / OWNER_FILE,
+        output_dir / LEDGER_DIR / f"{cell.benchmark_id}.started",
+        output_dir / LEDGER_DIR / f"{cell.benchmark_id}.done") if path.exists()]
+    found += sorted(path.name for path in output_dir.glob(f"{cell.benchmark_id}-*.json"))
+    if found:
+        raise BenchmarkError(f"existing records block {cell.benchmark_id}: {', '.join(found)}")
+
+
+def read_git_state(repo: Path = None) -> dict[str, Any]:
+    """HEAD, branch, working-tree lines and staged paths of the repository, with read-only
+    git commands only (no optional index locks)."""
+    repo = REPO if repo is None else repo
+
+    def out(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "--no-optional-locks", "-C", str(repo), *args], capture_output=True,
+                text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BenchmarkError(f"git {args[0]}: {type(exc).__name__}") from None
+        if result.returncode != 0:
+            raise BenchmarkError(f"git {args[0]}: exit {result.returncode}")
+        return result.stdout
+
+    return {"head": out("rev-parse", "HEAD").strip(),
+            "branch": out("rev-parse", "--abbrev-ref", "HEAD").strip(),
+            "status": [line for line in out("status", "--porcelain",
+                                            "--untracked-files=all").splitlines() if line.strip()],
+            "staged": [line for line in out("diff", "--cached", "--name-only").splitlines()
+                       if line.strip()]}
+
+
+def verify_repository_readonly(expect_head: str, *, read: Optional[Callable[[], Any]] = None
+                               ) -> dict[str, str]:
+    """Before any claim: HEAD is the expected commit, on a named branch, the working tree
+    has no change and the index is empty.  Returns the verified head and branch."""
+    state = (read_git_state if read is None else read)()
+    if state["branch"] in ("", "HEAD"):
+        raise BenchmarkError("the repository is on a detached HEAD, not a named branch")
+    if state["head"] != expect_head:
+        raise BenchmarkError(f"HEAD is {state['head']}, not the expected commit {expect_head}")
+    if state["staged"]:
+        raise BenchmarkError("the index is not empty")
+    if state["status"]:
+        raise BenchmarkError("the working tree is not clean: " + "; ".join(state["status"][:5]))
+    return {"head": state["head"], "branch": state["branch"]}
+
+
+#: The format of a claim record written with a binding.  Records without a "schema" key are
+#: the historical format; they are never rewritten or re-validated.
+MARKER_SCHEMA: int = 2
+_MARKER_KEYS = frozenset({
+    "schema", "nonce", "benchmark_id", "git_head", "verified_head", "branch", "pid",
+    "started_utc", "arguments", "ladder_sha256", "config_path", "output_dir",
+    "effective_config"})
+
+
+def validate_marker(record: Any, cell: "Cell", output_dir: Path) -> list[str]:
+    """What is wrong with a schema-2 claim record, judged against the approved values and
+    this cell (not against the record itself).  Empty when consistent.  This checks
+    consistency; it is not a signature and does not resist someone able to write the
+    ledger."""
+    if not isinstance(record, Mapping):
+        return ["the record is not an object"]
+    problems = [f"missing field {key}" for key in sorted(_MARKER_KEYS - set(record))]
+    problems += [f"unexpected field {key}" for key in sorted(set(record) - _MARKER_KEYS)]
+    if problems:
+        return problems
+    if record["schema"] != MARKER_SCHEMA:
+        problems.append("unsupported schema")
+    if record["benchmark_id"] != cell.benchmark_id:
+        problems.append("benchmark_id is not the claimed cell")
+    if not isinstance(record["nonce"], str) or not record["nonce"]:
+        problems.append("nonce is missing")
+    if not isinstance(record["verified_head"], str) or not _SHA_RE.fullmatch(record["verified_head"]):
+        problems.append("verified_head is not a full commit")
+    if record["git_head"] != record["verified_head"]:
+        problems.append("git_head differs from verified_head")
+    if not isinstance(record["branch"], str) or record["branch"] in ("", "HEAD"):
+        problems.append("branch is not a named branch")
+    if record["ladder_sha256"] != APPROVED_LADDER_SHA256:
+        problems.append("ladder_sha256 is not the approved ladder")
+    if record["output_dir"] != str(Path(output_dir).resolve()):
+        problems.append("output_dir is not the directory holding the record")
+    effective = record["effective_config"]
+    if not isinstance(effective, Mapping) or set(effective) != set(APPROVED_EFFECTIVE) | {"target"}:
+        problems.append("effective_config has the wrong fields")
+    else:
+        for key, value in APPROVED_EFFECTIVE.items():
+            if effective[key] != value or type(effective[key]) is not type(value):
+                problems.append(f"effective_config.{key} is not the approved value")
+        if effective["target"] != cell.target():
+            problems.append("effective_config.target is not this cell's workload")
+    return problems
 
 
 def _cell_fields(cell: Cell) -> dict[str, Any]:
@@ -1923,6 +2099,7 @@ def run_cell(cell: Cell, ladder: Mapping[str, Any], *, expect_head: Optional[str
         raise BenchmarkError(f"{cell.benchmark_id} is not an approved live cell")
     if not cell.live_allowed:
         raise BenchmarkError(f"level {cell.level} is not allowed live")
+    check_effective_config(cell, ladder)
     if str(REPO / "workload-generator") not in sys.path:
         sys.path.insert(0, str(REPO / "workload-generator"))
     import run_e2e as e2e  # noqa: E402  imported only here, never at module load
@@ -2163,17 +2340,40 @@ def _outside_repository(output_dir: Path) -> Path:
     return output_dir
 
 
-def _exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Create path with payload; fails if it exists.  Written durably."""
+def _exclusive_json(path: Path, payload: Mapping[str, Any]) -> str:
+    """Create path with payload, complete or not at all; FileExistsError if it exists,
+    and an existing file is never replaced.  The payload is written durably to a private
+    temporary file first and then hard-linked into place, so a failure part-way can never
+    leave a partial record under the real name.  Returns the text written."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "x", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temp, "x", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+    return text
+
+
+def _release_own_ownership(owner: Path, written: Optional[str]) -> None:
+    """Remove the ownership file only when it still holds exactly what this call wrote."""
+    try:
+        if written is not None and owner.read_text(encoding="utf-8") == written:
+            owner.unlink()
+    except OSError:
+        pass
 
 
 def claim_run(
     output_dir: Path, cell: Cell, *, head: str, arguments: Mapping[str, Any],
+    binding: Optional[Mapping[str, Any]] = None,
     now: Callable[[], float] = time.time, pid: Callable[[], int] = os.getpid,
 ) -> Path:
     """
@@ -2185,19 +2385,38 @@ def claim_run(
     started before, or when a record cannot be created.  Returns the
     ledger's .started path.  Nothing here is ever deleted automatically,
     except an ownership taken a moment ago by this call when the cell is
-    then refused (nothing has started at that point).
+    then refused before its record exists (nothing has started at that
+    point); that ownership is removed only if it still holds what this call
+    wrote.  A record is created whole or not at all (see _exclusive_json).
+
+    With a binding (branch, ladder_sha256, config_path, effective_config) the record is a
+    schema-2 record: the verified head, the approved ladder hash, the effective
+    configuration, the run identity and the output directory are written into it, and it
+    is validated before it is written and read back and compared after.  Without one the
+    record has the historical format.
     """
     output_dir = _outside_repository(output_dir)
     owner = output_dir / OWNER_FILE
     record = {"benchmark_id": cell.benchmark_id, "git_head": head, "pid": pid(),
               "started_utc": _iso(now()), "arguments": dict(arguments)}
+    if binding is not None:
+        record.update({
+            "schema": MARKER_SCHEMA, "nonce": uuid.uuid4().hex, "verified_head": head,
+            "branch": binding["branch"], "ladder_sha256": binding["ladder_sha256"],
+            "config_path": binding["config_path"], "output_dir": str(output_dir),
+            "effective_config": binding["effective_config"]})
+        problems = validate_marker(record, cell, output_dir)
+        if problems:
+            raise BenchmarkError("the claim record is inconsistent (nothing was created): "
+                                 + "; ".join(problems))
     try:
-        _exclusive_json(owner, record)
+        written = _exclusive_json(owner, record)
     except FileExistsError:
         raise BenchmarkError(f"{owner} exists: another benchmark owns this output directory, "
                              "or an earlier run did not release it; review it") from None
     except OSError as exc:
         raise BenchmarkError(f"cannot create {owner}: {type(exc).__name__}") from None
+    linked = False
     try:
         existing = sorted(output_dir.glob(f"{cell.benchmark_id}-*.json"))
         if existing:
@@ -2206,13 +2425,26 @@ def claim_run(
         started = output_dir / LEDGER_DIR / f"{cell.benchmark_id}.started"
         try:
             _exclusive_json(started, record)
+            linked = True
         except FileExistsError:
             raise BenchmarkError(f"{started} exists: {cell.benchmark_id} was started "
                                  "before; review it") from None
         except OSError as exc:
             raise BenchmarkError(f"cannot create {started}: {type(exc).__name__}") from None
-    except BenchmarkError:
-        owner.unlink()  # taken by this call a moment ago; nothing has started
+        if binding is not None:
+            try:
+                stored = json.loads(started.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                stored = None
+            problems = validate_marker(stored, cell, output_dir)
+            if stored != record:
+                problems.append("the stored record differs from the one written")
+            if problems:
+                raise BenchmarkError(f"the stored claim record is inconsistent; {started} and "
+                                     "the ownership are kept for review: " + "; ".join(problems))
+    except BaseException:
+        if not linked:
+            _release_own_ownership(owner, written)  # taken by this call; nothing has started
         raise
     return started
 
@@ -2285,7 +2517,7 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
     if output_dir == REPO or REPO in output_dir.parents:
         parser.error("--output-dir must be outside the repository")
     try:
-        ladder = load_ladder(Path(args.config))
+        ladder, ladder_sha256 = read_ladder(Path(args.config))
         cells = plan_cells(ladder, args.level, rates=args.rate, repetitions=args.repetitions,
                            concurrency=args.concurrency, warmup_requests=args.warmup_requests,
                            repetition=args.repetition)
@@ -2304,11 +2536,19 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
     except LiveDisabled as exc:
         sys.stderr.write(f"run_benchmark: error: {exc}\n")
         return 2
+    # 2. the exact approved cell; 3. the approved configuration and its effective values;
+    # 4. the canonical output directory; 5. the cleanup marker and existing evidence;
+    # 6. the actual repository state.  Nothing is created before all of them hold.
     try:
         cell = check_live_authorization(cells, authorize=args.authorize,
                                         expect_head=args.expect_head,
                                         warmup_requests=args.warmup_requests,
                                         repetition=args.repetition)
+        if ladder_sha256 != APPROVED_LADDER_SHA256:
+            raise BenchmarkError(f"the configuration's SHA-256 {ladder_sha256} is not the "
+                                 f"approved ladder's {APPROVED_LADDER_SHA256}")
+        effective = check_effective_config(cell, ladder)
+        output_dir = check_live_output_dir(output_dir)
     except BenchmarkError as exc:
         sys.stderr.write(f"run_benchmark: error: {exc}; nothing was started\n")
         return 2
@@ -2317,11 +2557,20 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Any = None) -> int:
                          "earlier cleanup was not verified; nothing was started\n")
         return 2
     try:
-        claim_run(output_dir, cell, head=args.expect_head, arguments={
+        check_no_prior_evidence(output_dir, cell)
+        verified = verify_repository_readonly(args.expect_head)
+    except BenchmarkError as exc:
+        sys.stderr.write(f"run_benchmark: error: {exc}; nothing was started\n")
+        return 2
+    try:
+        claim_run(output_dir, cell, head=verified["head"], arguments={
             "level": args.level, "rate": args.rate, "repetition": args.repetition,
             "concurrency": args.concurrency, "warmup_requests": args.warmup_requests,
             "authorize": args.authorize, "expect_head": args.expect_head,
-            "output_dir": str(output_dir), "live": True})
+            "output_dir": str(output_dir), "live": True},
+            binding={"branch": verified["branch"], "ladder_sha256": ladder_sha256,
+                     "config_path": str(Path(args.config).resolve()),
+                     "effective_config": effective})
     except BenchmarkError as exc:
         sys.stderr.write(f"run_benchmark: error: {exc}; nothing was started\n")
         return 2
