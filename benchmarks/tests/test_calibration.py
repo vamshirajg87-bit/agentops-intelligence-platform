@@ -1299,8 +1299,12 @@ class TestAnalysis:
 
 class TestScope:
     def test_benchmark_authorization_and_rules_unchanged(self):
-        assert sorted(RB.APPROVED_LIVE_CELLS) == ["bm-smoke-r0005-c32-rep2",
-                                                 "bm-smoke-r0005-c32-rep3"]
+        # The allowlist has grown since this test was first written (it had pinned only the
+        # first two SMOKE cells); it now names every approved cell, rep5 being the diagnostic.
+        assert sorted(RB.APPROVED_LIVE_CELLS) == [
+            "bm-small-r0010-c32-rep1", "bm-small-r0010-c32-rep2", "bm-small-r0010-c32-rep3",
+            "bm-small-r0010-c32-rep4", "bm-small-r0010-c32-rep5", "bm-smoke-r0005-c32-rep2",
+            "bm-smoke-r0005-c32-rep3", "bm-smoke-r0005-c32-rep4", "bm-smoke-r0005-c32-rep5"]
         assert RB.DRIVER_LATE_START_SECONDS == 0.1 and M.LATE_START_FRACTION == 0.05
         assert RB.OWNER_FILE == "ACTIVE_RUN" and C.OWNER_FILE == "ACTIVE_CALIBRATION"
 

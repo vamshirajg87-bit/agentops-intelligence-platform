@@ -188,6 +188,7 @@ APPROVED_LIVE_CELLS: Mapping[str, Mapping[str, Any]] = {
     "bm-small-r0010-c32-rep2": {**_SMALL10_FIRST, "repetition": 2},
     "bm-small-r0010-c32-rep3": {**_SMALL10_FIRST, "repetition": 3},
     "bm-small-r0010-c32-rep4": {**_SMALL10_FIRST, "repetition": 4},
+    "bm-small-r0010-c32-rep5": {**_SMALL10_FIRST, "repetition": 5},   # diagnostic (B3J-122)
 }
 MAX_WARMUP_REQUESTS: int = 10000
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -208,10 +209,24 @@ APPROVED_EFFECTIVE: Mapping[str, Any] = {
 }
 
 
+#: The cells approved to run with the storage consumer timing enabled, and the one interval
+#: approved for each.  This literal is deliberately independent of DIAGNOSTIC_TIMING_CELLS
+#: and DIAGNOSTIC_TIMING_INTERVAL_SECONDS: a live run is refused unless they agree with it,
+#: so neither can be changed alone.  Every other cell runs with timing off (0.0).
+APPROVED_DIAGNOSTIC_INTERVALS: Mapping[str, float] = {"bm-small-r0010-c32-rep5": 5.0}
+
+
+def timing_interval_for(benchmark_id: str) -> float:
+    """The consumer timing interval a cell would run with: the diagnostic interval for a
+    cell in DIAGNOSTIC_TIMING_CELLS, else 0.0 (off).  The only place it is derived."""
+    return DIAGNOSTIC_TIMING_INTERVAL_SECONDS if benchmark_id in DIAGNOSTIC_TIMING_CELLS else 0.0
+
+
 def effective_config(cell: Cell, ladder: Mapping[str, Any]) -> dict[str, Any]:
     """Every value a cell's run takes from the configuration, as it will be used."""
     defaults = ladder["defaults"]
     return {
+        "consumer_timing_interval_seconds": timing_interval_for(cell.benchmark_id),
         "scenario": defaults["scenario"], "seed": cell.seed, "live_allowed": cell.live_allowed,
         "refresh_and_detector": cell.refresh_and_detector,
         "drain_limit_seconds": defaults["drain_limit_seconds"],
@@ -225,18 +240,30 @@ def effective_config(cell: Cell, ladder: Mapping[str, Any]) -> dict[str, Any]:
 def check_effective_config(cell: Cell, ladder: Mapping[str, Any]) -> dict[str, Any]:
     """The cell's effective configuration, or BenchmarkError naming what differs from the
     approved one.  Pure."""
+    if frozenset(APPROVED_DIAGNOSTIC_INTERVALS) != DIAGNOSTIC_TIMING_CELLS \
+            or not set(APPROVED_DIAGNOSTIC_INTERVALS) <= set(APPROVED_LIVE_CELLS) \
+            or set(APPROVED_DIAGNOSTIC_INTERVALS.values()) != {DIAGNOSTIC_TIMING_INTERVAL_SECONDS}:
+        raise BenchmarkError("the diagnostic timing configuration differs from the approved "
+                             "one (cells or interval); nothing is run")
     effective = effective_config(cell, ladder)
     wrong = [key for key, value in APPROVED_EFFECTIVE.items()
              if effective[key] != value or type(effective[key]) is not type(value)]
     if effective["target"]["scenario"] != APPROVED_EFFECTIVE["scenario"] \
             or effective["target"]["seed"] != APPROVED_EFFECTIVE["seed"]:
         wrong.append("target")
+    approved_interval = float(APPROVED_DIAGNOSTIC_INTERVALS.get(cell.benchmark_id, 0.0))
+    interval = effective["consumer_timing_interval_seconds"]
+    if interval != approved_interval or type(interval) is not float:
+        wrong.append("consumer_timing_interval_seconds")
     if wrong:
         raise BenchmarkError("the effective configuration differs from the approved one in "
-                             + ", ".join(f"{key} ({effective[key]!r} != "
-                                         f"{APPROVED_EFFECTIVE.get(key)!r})" if key in effective
-                                         and key in APPROVED_EFFECTIVE else key
-                                         for key in wrong))
+                             + ", ".join(
+                                 f"consumer_timing_interval_seconds ({interval!r} != "
+                                 f"{approved_interval!r})" if key == "consumer_timing_interval_seconds"
+                                 else f"{key} ({effective[key]!r} != "
+                                      f"{APPROVED_EFFECTIVE.get(key)!r})" if key in effective
+                                 and key in APPROVED_EFFECTIVE else key
+                                 for key in wrong))
     return effective
 
 
@@ -307,7 +334,7 @@ def verify_repository_readonly(expect_head: str, *, read: Optional[Callable[[], 
 
 #: The format of a claim record written with a binding.  Records without a "schema" key are
 #: the historical format; they are never rewritten or re-validated.
-MARKER_SCHEMA: int = 2
+MARKER_SCHEMA: int = 3
 _MARKER_KEYS = frozenset({
     "schema", "nonce", "benchmark_id", "git_head", "verified_head", "branch", "pid",
     "started_utc", "arguments", "ladder_sha256", "config_path", "output_dir",
@@ -342,12 +369,18 @@ def validate_marker(record: Any, cell: "Cell", output_dir: Path) -> list[str]:
     if record["output_dir"] != str(Path(output_dir).resolve()):
         problems.append("output_dir is not the directory holding the record")
     effective = record["effective_config"]
-    if not isinstance(effective, Mapping) or set(effective) != set(APPROVED_EFFECTIVE) | {"target"}:
+    fields = set(APPROVED_EFFECTIVE) | {"target", "consumer_timing_interval_seconds"}
+    if not isinstance(effective, Mapping) or set(effective) != fields:
         problems.append("effective_config has the wrong fields")
     else:
         for key, value in APPROVED_EFFECTIVE.items():
             if effective[key] != value or type(effective[key]) is not type(value):
                 problems.append(f"effective_config.{key} is not the approved value")
+        approved_interval = float(APPROVED_DIAGNOSTIC_INTERVALS.get(cell.benchmark_id, 0.0))
+        interval = effective["consumer_timing_interval_seconds"]
+        if interval != approved_interval or type(interval) is not float:
+            problems.append("effective_config.consumer_timing_interval_seconds is not the "
+                            "approved value")
         if effective["target"] != cell.target():
             problems.append("effective_config.target is not this cell's workload")
     return problems
@@ -2135,8 +2168,9 @@ def execute_cell(
     smoke.SETTLE_SECONDS = float(defaults["settle_seconds"])
     # Consumer timing is on only for a cell named in DIAGNOSTIC_TIMING_CELLS (none today)
     # and is always set explicitly, so no other cell can inherit it.
-    timing_enabled = cell.benchmark_id in DIAGNOSTIC_TIMING_CELLS
-    smoke.CONSUMER_TIMING_INTERVAL = DIAGNOSTIC_TIMING_INTERVAL_SECONDS if timing_enabled else 0.0
+    timing_interval = timing_interval_for(cell.benchmark_id)
+    timing_enabled = timing_interval > 0
+    smoke.CONSUMER_TIMING_INTERVAL = timing_interval
     budget, start = float(defaults["cell_budget_seconds"]), clock()
     evidence = CellEvidence(cell=cell, git_sha="0" * 40, git_dirty=True, started=wall(),
                             finished=wall())
@@ -2144,6 +2178,10 @@ def execute_cell(
     refresh_built = False
     capture = ((lambda: capture_consumer_timing(smoke, output_dir, cell, evidence))
                if timing_enabled else None)
+    if timing_enabled:  # recorded whether or not the sidecar is later captured
+        evidence.limitations.append(
+            f"diagnostic cell: storage consumer timing was enabled at {timing_interval:g} "
+            "seconds; the consumer ran with timing instrumentation")
 
     def within_budget(step: str) -> None:
         if clock() - start > budget:
@@ -2268,10 +2306,11 @@ def execute_cell(
     return result, path, clean
 
 
-#: Cells that also record the storage consumer timing summaries.  Empty: no cell does.  A
-#: diagnostic cell is added here in a reviewed change, together with its entry in
-#: APPROVED_LIVE_CELLS; authorization itself is not touched by this list.
-DIAGNOSTIC_TIMING_CELLS: frozenset[str] = frozenset()
+#: Cells that also record the storage consumer timing summaries: one, SMALL-10 rep5.  A
+#: diagnostic cell is added here in a reviewed change, together with its entries in
+#: APPROVED_LIVE_CELLS and APPROVED_DIAGNOSTIC_INTERVALS (a live run is refused unless
+#: the last agrees with this set); being listed here does not authorize a cell.
+DIAGNOSTIC_TIMING_CELLS: frozenset[str] = frozenset({"bm-small-r0010-c32-rep5"})
 #: Seconds between the consumer summaries in a diagnostic cell.
 DIAGNOSTIC_TIMING_INTERVAL_SECONDS: float = 5.0
 #: The exact prefix of a timing line in the consumer log (storage-consumer/timing.py).
