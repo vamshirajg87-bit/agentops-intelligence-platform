@@ -53,7 +53,7 @@ COPY stream-processor/canonicalizer.py stream-processor/config.py \
      stream-processor/
 COPY storage-consumer/__init__.py storage-consumer/config.py \
      storage-consumer/consumer.py storage-consumer/main.py \
-     storage-consumer/repository.py \
+     storage-consumer/repository.py storage-consumer/timing.py \
      storage-consumer/
 
 ENV PYTHONPATH=/opt/agentops/demo-app

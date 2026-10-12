@@ -71,3 +71,27 @@ PG_USER: str = os.environ.get("PG_USER", "agentops")
 # Left unset, the connection is attempted without a password and PostgreSQL
 # refuses it.
 PG_PASSWORD: str = os.environ.get("PG_PASSWORD", "")
+
+# ---------------------------------------------------------------------------
+# Timing instrumentation (opt-in)
+# ---------------------------------------------------------------------------
+
+def _timing_interval(raw: str) -> float:
+    """Seconds between timing summaries; 0 (the default) turns timing off."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"CONSUMER_TIMING_INTERVAL_SECONDS must be a number, got {raw!r}") from None
+    if not 0.0 <= value < float("inf"):
+        raise ValueError("CONSUMER_TIMING_INTERVAL_SECONDS must be 0 or a positive number")
+    return value
+
+
+# 0 = disabled (default): the consumer does no timing work.  A positive value
+# enables per-stage timing and writes one aggregate summary line to stdout
+# every that many seconds, and a final summary when the consumer stops.  It
+# only measures; it changes no processing, transaction or offset behavior.
+TIMING_INTERVAL_SECONDS: float = _timing_interval(
+    os.environ.get("CONSUMER_TIMING_INTERVAL_SECONDS", "0")
+)

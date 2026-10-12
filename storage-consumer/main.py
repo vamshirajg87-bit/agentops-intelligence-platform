@@ -57,12 +57,19 @@ def main() -> None:
     )
     repository = SpanRepository(connection)
     shutdown_event = threading.Event()
+    timing = None
+    if config.TIMING_INTERVAL_SECONDS > 0:
+        # Imported only when enabled, so a deployment that never turns timing on
+        # does not need timing.py (the pipeline image copies files by name).
+        from timing import TimingRecorder
+        timing = TimingRecorder(config.TIMING_INTERVAL_SECONDS)
 
     try:
         run_consumer_loop(
             consumer=consumer,
             repository=repository,
             shutdown_event=shutdown_event,
+            timing=timing,
         )
     except KeyboardInterrupt:
         print("\nagentops storage consumer stopped.")
