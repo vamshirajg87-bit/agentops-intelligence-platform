@@ -92,12 +92,17 @@ class TimingRecorder:
 
     summary lines (one JSON object after LINE_PREFIX):
       kind "window"  the interval since the previous summary, every interval_seconds
-      kind "final"   the whole run, once, when the consumer stops
+      kind "final"   the whole run, once, when the consumer stops (not written when the
+                     process is killed, as the benchmark harness stops it)
+    start_epoch_s / end_epoch_s are wall-clock (time.time()) seconds of the window's
+    start and end, so a summary can be aligned with benchmark stages; durations are
+    always measured with the monotonic clock.
     """
 
     def __init__(self, interval_seconds: float, *,
                  clock: Callable[[], float] = time.perf_counter,
-                 emit: Callable[[str], None] = _write_line) -> None:
+                 emit: Callable[[str], None] = _write_line,
+                 wall: Callable[[], float] = time.time) -> None:
         if not interval_seconds > 0:
             raise ValueError("a TimingRecorder needs a positive interval")
         self.clock = clock
@@ -105,8 +110,11 @@ class TimingRecorder:
         self._emit = emit
         self._total = _Accumulator()
         self._window = _Accumulator()
+        self._wall = wall
         self._started = clock()
         self._window_started = self._started
+        self._started_epoch = wall()          # wall clock, only to align summaries with
+        self._window_started_epoch = self._started_epoch   # other evidence; never a duration
         self._final_done = False
 
     @classmethod
@@ -129,10 +137,13 @@ class TimingRecorder:
             now = self.clock()
             if now - self._window_started < self._interval:
                 return
+            epoch = self._wall()
             if self._window.counters["messages"] or self._window.counters["idle_polls"]:
-                self._emit(self._line("window", self._window, now - self._window_started))
+                self._emit(self._line("window", self._window, now - self._window_started,
+                                      self._window_started_epoch, epoch))
             self._window = _Accumulator()
             self._window_started = now
+            self._window_started_epoch = epoch
         except Exception:  # instrumentation must never disturb processing
             pass
 
@@ -142,14 +153,17 @@ class TimingRecorder:
             return
         self._final_done = True
         try:
-            self._emit(self._line("final", self._total, self.clock() - self._started))
+            self._emit(self._line("final", self._total, self.clock() - self._started,
+                                  self._started_epoch, self._wall()))
         except Exception:  # instrumentation must never replace a processing error
             pass
 
     @staticmethod
-    def _line(kind: str, accumulator: _Accumulator, elapsed: float) -> str:
+    def _line(kind: str, accumulator: _Accumulator, elapsed: float,
+              start_epoch: float, end_epoch: float) -> str:
         payload = {
             "kind": kind, "elapsed_s": round(elapsed, 3),
+            "start_epoch_s": round(start_epoch, 3), "end_epoch_s": round(end_epoch, 3),
             "bounds_ms": list(BUCKET_BOUNDS_MS),
             "counters": dict(accumulator.counters),
             "stages": {name: stage.as_dict() for name, stage in accumulator.stages.items()},

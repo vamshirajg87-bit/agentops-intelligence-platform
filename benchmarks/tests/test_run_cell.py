@@ -4328,3 +4328,312 @@ class TestCanonicalOutputDirectory:
         # outside the live fixture, the autouse stubs are in force (documented, not hidden)
         assert RB.check_live_output_dir is not REAL_CHECK_LIVE_OUTPUT_DIR
         assert RB.verify_repository_readonly is not REAL_VERIFY_REPOSITORY
+
+
+# ---------------------------------------------------------------------------
+# B3J-119: diagnostic capture of the storage consumer timing summaries
+# ---------------------------------------------------------------------------
+
+import importlib.util  # noqa: E402
+
+PREFIX = RB.CONSUMER_TIMING_PREFIX
+_STAGE_NAMES = ("poll", "decode_validate", "insert_txn", "kafka_commit", "cycle")
+
+
+def timing_line(kind="window", start=1_791_780_140.0, end=1_791_780_145.0, **extra):
+    """A valid timing summary line, as storage-consumer/timing.py writes it."""
+    stage = {"count": 3, "total_ms": 30.0, "mean_ms": 10.0, "max_ms": 14.0,
+             "hist": [0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0]}
+    payload = {"kind": kind, "elapsed_s": 5.0, "start_epoch_s": start, "end_epoch_s": end,
+               "bounds_ms": [0.5, 1.0, 2.0], "stages": {n: dict(stage) for n in _STAGE_NAMES},
+               "counters": {"messages": 3, "idle_polls": 1, "inserted": 3, "conflicts": 0}}
+    payload.update(extra)
+    return PREFIX + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+class TimedSmoke(FakeSmoke):
+    """A fake harness whose storage consumer log is `log_text` (or raises `log_error`)."""
+
+    def __init__(self, tmp, *, log_text="", log_error=None, **kw):
+        super().__init__(tmp, **kw)
+        self.log_text, self.log_error = log_text, log_error
+
+    def read_log(self, name):
+        self.calls.append("read_log")
+        assert name == "storage-consumer"
+        if self.log_error is not None:
+            raise self.log_error
+        return self.log_text
+
+
+def _diagnostic(monkeypatch, cell=None):
+    cell = cell or _cell()
+    monkeypatch.setattr(RB, "DIAGNOSTIC_TIMING_CELLS", frozenset({cell.benchmark_id}))
+    return cell
+
+
+def _sidecar(tmp_path, cell=None):
+    return (tmp_path / "results").resolve() / f"{(cell or _cell()).benchmark_id}-consumer-timing.jsonl"
+
+
+def _timing_limitations(result):
+    return [x for x in result["limitations"] if "consumer timing sidecar" in x]
+
+
+GOOD_LOG = "\n".join([
+    "agentops storage consumer starting", "  pg host    : 127.0.0.1:15432",
+    timing_line(start=100.0, end=105.0), "noise in between", timing_line(start=105.0, end=110.0),
+    ""])
+
+
+class TestTimingIsDisabledByDefault:
+    def test_no_cell_is_diagnostic_and_no_approved_cell_changed(self):
+        assert RB.DIAGNOSTIC_TIMING_CELLS == frozenset()
+        assert RB.DIAGNOSTIC_TIMING_INTERVAL_SECONDS == 5.0
+        assert not RB.DIAGNOSTIC_TIMING_CELLS & set(RB.APPROVED_LIVE_CELLS)
+        assert RB.LIVE_ENABLED is True and len(RB.APPROVED_LIVE_CELLS) == 8
+
+    def test_an_ordinary_cell_runs_with_timing_off_and_does_nothing_extra(self, tmp_path):
+        result, path, clean, smoke = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=GOOD_LOG))
+        assert smoke.CONSUMER_TIMING_INTERVAL == 0.0
+        assert smoke.calls == ORDER and "read_log" not in smoke.calls
+        assert clean and result["verdict"] == "VALID"
+        assert _timing_limitations(result) == []
+        assert not list((tmp_path / "results").glob("*consumer-timing*"))
+
+    def test_the_setting_is_reset_for_every_cell(self, tmp_path, monkeypatch):
+        smoke = TimedSmoke(tmp_path, log_text=GOOD_LOG)
+        _diagnostic(monkeypatch)
+        _run(tmp_path, smoke=smoke)
+        assert smoke.CONSUMER_TIMING_INTERVAL == 5.0
+        monkeypatch.setattr(RB, "DIAGNOSTIC_TIMING_CELLS", frozenset())
+        _run(tmp_path / "again", smoke=smoke, out=tmp_path / "again-results")
+        assert smoke.CONSUMER_TIMING_INTERVAL == 0.0
+
+    def test_being_diagnostic_does_not_authorize_a_cell(self, monkeypatch, tmp_path):
+        unapproved = dataclasses.replace(_approved_cells(repetition=2)[0], repetition=9)
+        monkeypatch.setattr(RB, "DIAGNOSTIC_TIMING_CELLS", frozenset({unapproved.benchmark_id}))
+        assert not RB.is_approved_live_cell(unapproved)
+        monkeypatch.setattr(RB, "LIVE_ENABLED", True)
+        with pytest.raises(RB.BenchmarkError, match="not an approved live cell"):
+            RB.run_cell(unapproved, LADDER, expect_head=HEAD, output_dir=tmp_path)
+        with pytest.raises(RB.BenchmarkError, match="not an approved live cell"):
+            _authorize([unapproved], authorize=unapproved.benchmark_id)
+
+
+class TestDiagnosticCapture:
+    def test_a_diagnostic_cell_enables_timing_and_writes_the_sidecar(self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+        result, path, clean, smoke = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=GOOD_LOG),
+                                          cell=cell)
+        assert smoke.CONSUMER_TIMING_INTERVAL == 5.0 and clean
+        sidecar = _sidecar(tmp_path, cell)
+        lines = sidecar.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2 and all(line.startswith(PREFIX) for line in lines)
+        assert [json.loads(l[len(PREFIX):])["start_epoch_s"] for l in lines] == [100.0, 105.0]
+        (note,) = _timing_limitations(result)
+        assert "written" in note and "2 summaries (2 windows)" in note and "lost" in note
+        assert sidecar.name == f"{cell.benchmark_id}-consumer-timing.jsonl"
+        assert sidecar.parent == path.parent
+        assert not sidecar.name.endswith(".json")            # never matches the result glob
+
+    def test_the_result_is_unchanged_apart_from_one_limitation(self, tmp_path, monkeypatch):
+        for name in ("a", "b"):
+            (tmp_path / name).mkdir()
+        plain, _, _, _ = _run(tmp_path / "a", smoke=TimedSmoke(tmp_path / "a", log_text=GOOD_LOG))
+        cell = _diagnostic(monkeypatch)
+        timed, _, _, _ = _run(tmp_path / "b", smoke=TimedSmoke(tmp_path / "b", log_text=GOOD_LOG),
+                              cell=cell)
+        assert {k: v for k, v in plain.items() if k != "limitations"} == {
+            k: v for k, v in timed.items() if k != "limitations"}
+        assert timed["verdict"] == plain["verdict"] == "VALID"
+        assert [x for x in timed["limitations"] if x not in _timing_limitations(timed)] \
+            == plain["limitations"]
+        M.validate_result(timed)
+
+    def test_the_capture_runs_after_the_consumer_stops_and_before_the_logs_go(
+            self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+        _, _, _, smoke = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=GOOD_LOG), cell=cell)
+        calls = smoke.calls
+        assert calls.index("stop_host_processes") < calls.index("read_log") < calls.index("cleanup")
+        assert calls.count("read_log") == 1
+
+    @pytest.mark.parametrize("step", ["run_stage_measured", "start_host_services", "run_detector"])
+    def test_a_failed_cell_still_captures_the_windows_it_has(self, tmp_path, monkeypatch, step):
+        cell = _diagnostic(monkeypatch)
+        smoke = TimedSmoke(tmp_path, log_text=GOOD_LOG, fail=step)
+        result, _, clean, smoke = _run(tmp_path, smoke=smoke, cell=cell)
+        assert result["verdict"] != "VALID" and clean
+        assert "read_log" in smoke.calls and smoke.calls[-1] == "cleanup"
+        assert _sidecar(tmp_path, cell).is_file()
+        assert "written" in _timing_limitations(result)[0]
+
+    def test_a_cell_that_failed_before_the_consumer_started_says_so(self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+        smoke = TimedSmoke(tmp_path, log_error=KeyError("storage-consumer"), fail="start_kafka")
+        result, _, clean, _ = _run(tmp_path, smoke=smoke, cell=cell)
+        assert clean and result["verdict"] != "VALID"
+        assert "NOT captured: the consumer log was not available" in _timing_limitations(result)[0]
+        assert not _sidecar(tmp_path, cell).exists()
+
+
+class TestTimingLineFiltering:
+    def test_only_exact_prefix_valid_summaries_are_kept(self):
+        good = timing_line()
+        log = "\n".join([
+            good,
+            "  " + timing_line(),                                  # indented: not the prefix
+            "note: " + timing_line(),                              # prefix not at the start
+            "storage-consumer timing{}",                           # no separating space
+            "storage-consumer  timing " + "{}",
+            "Traceback (most recent call last):",
+            "  pg host    : 127.0.0.1:15432",
+            timing_line("final"),
+        ])
+        kept, malformed = RB.consumer_timing_lines(log)
+        assert kept == [good, timing_line("final")] and malformed == 0
+
+    @pytest.mark.parametrize("bad", [
+        PREFIX + "{not json", PREFIX + "[]", PREFIX + "null", PREFIX + "",
+        PREFIX + json.dumps({"kind": "window"}),
+        timing_line(kind="surprise"),
+        timing_line(elapsed_s="five"),
+        timing_line(extra_key=1),                                   # an unknown field
+        timing_line(trace_id="a" * 32),
+        timing_line(counters={"messages": 1}),
+        timing_line(counters={"messages": -1, "idle_polls": 0, "inserted": 0, "conflicts": 0}),
+        timing_line(stages={"poll": {}}),
+        timing_line(bounds_ms=list(range(100))),
+        PREFIX + '{"kind":"window","elapsed_s":NaN}',
+    ])
+    def test_malformed_lines_are_skipped_and_counted(self, bad):
+        kept, malformed = RB.consumer_timing_lines("\n".join([timing_line(), bad]))
+        assert kept == [timing_line()] and malformed == 1
+
+    def test_nothing_but_numbers_and_known_names_survives(self):
+        poisoned = json.loads(timing_line()[len(PREFIX):])
+        poisoned["stages"]["poll"]["note"] = "password=hunter2"
+        kept, malformed = RB.consumer_timing_lines(PREFIX + json.dumps(poisoned))
+        assert kept == [] and malformed == 1
+
+    def test_the_number_of_lines_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(RB, "MAX_TIMING_LINES", 3)
+        kept, malformed = RB.consumer_timing_lines("\n".join([timing_line()] * 5))
+        assert len(kept) == 3 and malformed == 2
+
+    def test_what_the_real_recorder_writes_is_accepted_unchanged(self):
+        path = _REPO / "storage-consumer" / "timing.py"
+        spec = importlib.util.spec_from_file_location("consumer_timing_contract", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.LINE_PREFIX == PREFIX
+        out, tick = [], iter(x * 0.003 for x in range(1, 1000))
+        recorder = module.TimingRecorder(0.001, clock=lambda: next(tick), emit=out.append,
+                                         wall=lambda: 1_791_780_140.5)
+        for stage in module.STAGES:
+            recorder.record(stage, 0.004)
+        recorder.count("messages")
+        recorder.count("idle_polls")
+        recorder.maybe_emit()
+        recorder.final()
+        assert [json.loads(l[len(PREFIX):])["kind"] for l in out] == ["window", "final"]
+        kept, malformed = RB.consumer_timing_lines("\n".join(out))
+        assert kept == out and malformed == 0
+
+    def test_the_sidecar_holds_no_other_log_output_or_credentials(self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+        log = "\n".join(["PG_PASSWORD=never-printed", "postgresql://u:never-printed@host/db",
+                         timing_line(), "Traceback: never-printed"])
+        _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=log), cell=cell)
+        text = _sidecar(tmp_path, cell).read_text(encoding="utf-8")
+        assert text.count("\n") == 1 and "never-printed" not in text
+        assert "postgresql" not in text and "Traceback" not in text and "pg host" not in text
+
+
+class TestCaptureNeverHarmsTheCell:
+    @pytest.mark.parametrize("log", ["", "no timing here\nonly start-up lines\n",
+                                     PREFIX + "{broken\n"])
+    def test_an_empty_or_useless_log_is_reported_not_claimed(self, tmp_path, monkeypatch, log):
+        cell = _diagnostic(monkeypatch)
+        result, _, clean, _ = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=log), cell=cell)
+        assert clean and result["verdict"] == "VALID"
+        (note,) = _timing_limitations(result)
+        assert "NOT captured" in note and "no timing summary" in note
+        assert not _sidecar(tmp_path, cell).exists()
+
+    def test_malformed_lines_are_reported_when_some_are_kept(self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+        log = "\n".join([timing_line(), PREFIX + "{bad", PREFIX + "[]"])
+        result, _, _, _ = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=log), cell=cell)
+        assert "2 malformed timing line(s) skipped" in _timing_limitations(result)[0]
+        assert _sidecar(tmp_path, cell).read_text(encoding="utf-8").count("\n") == 1
+
+    @pytest.mark.parametrize("error", [KeyError("storage-consumer"), FileNotFoundError("gone"),
+                                       PermissionError("denied"), RuntimeError("odd")])
+    def test_an_unreadable_log_is_reported_and_changes_nothing(self, tmp_path, monkeypatch, error):
+        cell = _diagnostic(monkeypatch)
+        result, _, clean, smoke = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_error=error),
+                                       cell=cell)
+        assert clean and result["verdict"] == "VALID" and smoke.calls[-1] == "cleanup"
+        assert "NOT captured" in _timing_limitations(result)[0]
+        assert not _sidecar(tmp_path, cell).exists()
+
+    def test_an_existing_sidecar_is_never_overwritten(self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+        existing = _sidecar(tmp_path, cell)
+        existing.parent.mkdir(parents=True)
+        existing.write_text("historical evidence\n", encoding="utf-8")
+        result, _, clean, _ = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=GOOD_LOG),
+                                   cell=cell)
+        assert clean and result["verdict"] == "VALID"
+        assert existing.read_text(encoding="utf-8") == "historical evidence\n"
+        assert "NOT written" in _timing_limitations(result)[0]
+        assert [p.name for p in existing.parent.iterdir() if p.name.startswith(".")] == []
+
+    def test_a_write_failure_changes_neither_the_verdict_nor_the_cleanup(
+            self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+
+        def broken(path, text):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(RB, "_exclusive_text", broken)
+        result, _, clean, smoke = _run(tmp_path, smoke=TimedSmoke(tmp_path, log_text=GOOD_LOG),
+                                       cell=cell)
+        assert clean and result["verdict"] == "VALID" and smoke.calls[-1] == "cleanup"
+        assert "NOT captured: OSError" in _timing_limitations(result)[0]
+        assert not _sidecar(tmp_path, cell).exists()
+
+    def test_a_failure_in_the_cell_is_not_masked_by_a_failure_in_the_capture(
+            self, tmp_path, monkeypatch):
+        cell = _diagnostic(monkeypatch)
+        smoke = TimedSmoke(tmp_path, log_error=RuntimeError("log"), fail="run_stage_measured")
+        result, _, clean, smoke = _run(tmp_path, smoke=smoke, cell=cell)
+        assert result["verdict"] != "VALID" and clean and smoke.calls[-1] == "cleanup"
+        assert "run_stage_measured failed" in json.dumps(result)
+
+    def test_the_sidecar_is_whole_or_absent(self, tmp_path):
+        target = tmp_path / "x-consumer-timing.jsonl"
+        RB._exclusive_text(target, "one\ntwo\n")
+        with pytest.raises(FileExistsError):
+            RB._exclusive_text(target, "other\n")
+        assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+        assert [p.name for p in tmp_path.iterdir()] == [target.name]
+
+    def test_cleanup_without_a_capture_is_as_before(self, tmp_path):
+        smoke = FakeSmoke(tmp_path)
+        evidence = SimpleNamespace(limitations=[])
+        assert RB._cleanup(smoke, FakeE2E(smoke), [], False, evidence) is True
+        assert smoke.calls == ["stop_host_processes", "cleanup"] and evidence.limitations == []
+
+    def test_a_capture_that_somehow_raised_still_lets_the_stack_come_down(self, tmp_path):
+        smoke = FakeSmoke(tmp_path)
+        evidence = SimpleNamespace(limitations=[])
+
+        def raising():
+            raise RuntimeError("unexpected")
+
+        assert RB._cleanup(smoke, FakeE2E(smoke), [], False, evidence, raising) is False
+        assert smoke.calls == ["stop_host_processes", "cleanup"]
+        assert any("consumer timing capture failed" in x for x in evidence.limitations)

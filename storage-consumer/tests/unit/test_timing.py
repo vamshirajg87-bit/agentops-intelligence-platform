@@ -404,7 +404,8 @@ class TestNoSensitiveOutput:
                           "password", "agentops.telemetry.spans"):
             assert forbidden not in text
         for line in lines_of(emitted):
-            assert set(line) == {"kind", "elapsed_s", "bounds_ms", "counters", "stages"}
+            assert set(line) == {"kind", "elapsed_s", "start_epoch_s", "end_epoch_s",
+                                 "bounds_ms", "counters", "stages"}
             assert set(line["counters"]) == {"messages", "idle_polls", "inserted", "conflicts"}
             assert set(line["stages"]) == set(STAGES)
 
@@ -503,3 +504,56 @@ class TestFailuresAreUnchanged:
         timing.final()
         out = capsys.readouterr().out
         assert out.count("\n") == 1 and out.startswith(LINE_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock epoch of each summary (alignment with benchmark stages)
+# ---------------------------------------------------------------------------
+
+class TestEpochTimestamps:
+
+    def test_windows_carry_their_wall_clock_start_and_end(self):
+        wall = FakeClock([1000.0, 1010.5, 1030.25, 1040.0])
+        clock = FakeClock([0.0, 10.0, 25.0, 40.0])
+        emitted = []
+        timing = TimingRecorder(10.0, clock=clock, emit=emitted.append, wall=wall)
+        timing.count("messages")
+        timing.maybe_emit()                           # wall 1010.5
+        timing.count("messages")
+        timing.maybe_emit()                           # wall 1030.25
+        timing.final()                                # wall 1040.0
+        first, second, final = lines_of(emitted)
+        assert (first["start_epoch_s"], first["end_epoch_s"]) == (1000.0, 1010.5)
+        assert (second["start_epoch_s"], second["end_epoch_s"]) == (1010.5, 1030.25)
+        assert (final["start_epoch_s"], final["end_epoch_s"]) == (1000.0, 1040.0)
+
+    def test_durations_still_come_from_the_monotonic_clock(self):
+        # the wall clock jumps backwards (a clock correction); durations are unaffected
+        wall = FakeClock([5000.0, 4000.0, 4000.0])
+        clock = FakeClock([0.0, 10.0, 10.0])
+        emitted = []
+        timing = TimingRecorder(10.0, clock=clock, emit=emitted.append, wall=wall)
+        timing.count("messages")
+        timing.record("cycle", 0.002)
+        timing.maybe_emit()
+        (window,) = lines_of(emitted)
+        assert window["elapsed_s"] == 10.0
+        assert window["stages"]["cycle"]["total_ms"] == pytest.approx(2.0)
+        assert window["end_epoch_s"] < window["start_epoch_s"]      # reported as it was
+
+    def test_the_default_wall_clock_is_real_time(self):
+        import time as real_time
+        emitted = []
+        before = real_time.time()
+        timing = TimingRecorder(60.0, clock=Tick(), emit=emitted.append)
+        timing.final()
+        after = real_time.time()
+        (final,) = lines_of(emitted)
+        assert before - 1 <= final["start_epoch_s"] <= final["end_epoch_s"] <= after + 1
+
+    def test_the_epoch_fields_hold_only_numbers(self):
+        emitted = []
+        timing = TimingRecorder(60.0, clock=Tick(), emit=emitted.append, wall=lambda: 1.5)
+        timing.final()
+        (final,) = lines_of(emitted)
+        assert isinstance(final["start_epoch_s"], float) and isinstance(final["end_epoch_s"], float)

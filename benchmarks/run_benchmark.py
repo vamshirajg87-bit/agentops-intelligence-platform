@@ -2133,11 +2133,17 @@ def execute_cell(
     smoke.RATE, smoke.SEED, smoke.CONCURRENCY = cell.rate, cell.seed, cell.concurrency
     smoke.T_DRAIN = float(defaults["drain_limit_seconds"])
     smoke.SETTLE_SECONDS = float(defaults["settle_seconds"])
+    # Consumer timing is on only for a cell named in DIAGNOSTIC_TIMING_CELLS (none today)
+    # and is always set explicitly, so no other cell can inherit it.
+    timing_enabled = cell.benchmark_id in DIAGNOSTIC_TIMING_CELLS
+    smoke.CONSUMER_TIMING_INTERVAL = DIAGNOSTIC_TIMING_INTERVAL_SECONDS if timing_enabled else 0.0
     budget, start = float(defaults["cell_budget_seconds"]), clock()
     evidence = CellEvidence(cell=cell, git_sha="0" * 40, git_dirty=True, started=wall(),
                             finished=wall())
     samplers: list[Any] = []
     refresh_built = False
+    capture = ((lambda: capture_consumer_timing(smoke, output_dir, cell, evidence))
+               if timing_enabled else None)
 
     def within_budget(step: str) -> None:
         if clock() - start > budget:
@@ -2246,7 +2252,7 @@ def execute_cell(
     except Exception as exc:  # recorded as evidence; the cell is never retried
         evidence.failure = f"{type(exc).__name__}: {exc}"
     finally:
-        clean = _cleanup(smoke, e2e, samplers, refresh_built, evidence)
+        clean = _cleanup(smoke, e2e, samplers, refresh_built, evidence, capture)
     evidence.lag_samples = list(samplers[0].samples) if samplers else []
     evidence.resource_samples = list(samplers[1].samples) if len(samplers) > 1 else []
     evidence.finished = wall()
@@ -2262,15 +2268,146 @@ def execute_cell(
     return result, path, clean
 
 
+#: Cells that also record the storage consumer timing summaries.  Empty: no cell does.  A
+#: diagnostic cell is added here in a reviewed change, together with its entry in
+#: APPROVED_LIVE_CELLS; authorization itself is not touched by this list.
+DIAGNOSTIC_TIMING_CELLS: frozenset[str] = frozenset()
+#: Seconds between the consumer summaries in a diagnostic cell.
+DIAGNOSTIC_TIMING_INTERVAL_SECONDS: float = 5.0
+#: The exact prefix of a timing line in the consumer log (storage-consumer/timing.py).
+CONSUMER_TIMING_PREFIX: str = "storage-consumer timing "
+MAX_TIMING_LINES: int = 5000
+_TIMING_TOP = frozenset({"kind", "elapsed_s", "start_epoch_s", "end_epoch_s", "bounds_ms",
+                         "counters", "stages"})
+_TIMING_COUNTERS = frozenset({"messages", "idle_polls", "inserted", "conflicts"})
+_TIMING_STAGES = frozenset({"poll", "decode_validate", "insert_txn", "kafka_commit", "cycle"})
+_TIMING_STAGE_KEYS = frozenset({"count", "total_ms", "mean_ms", "max_ms", "hist"})
+
+
+def _plain_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) \
+        and math.isfinite(value)
+
+
+def _timing_summary_ok(data: Any) -> bool:
+    """A consumer timing summary holds only numbers under the known names; anything
+    else (an unknown key, a string value) is refused, so nothing but timing is copied."""
+    if not isinstance(data, dict) or set(data) != _TIMING_TOP:
+        return False
+    if data["kind"] not in ("window", "final"):
+        return False
+    if not all(_plain_number(data[k]) for k in ("elapsed_s", "start_epoch_s", "end_epoch_s")):
+        return False
+    bounds = data["bounds_ms"]
+    if not isinstance(bounds, list) or len(bounds) > 32 or not all(map(_plain_number, bounds)):
+        return False
+    counters = data["counters"]
+    if not isinstance(counters, dict) or set(counters) != _TIMING_COUNTERS \
+            or not all(_plain_number(v) and v >= 0 for v in counters.values()):
+        return False
+    stages = data["stages"]
+    if not isinstance(stages, dict) or set(stages) != _TIMING_STAGES:
+        return False
+    for stage in stages.values():
+        if not isinstance(stage, dict) or set(stage) != _TIMING_STAGE_KEYS:
+            return False
+        if not all(_plain_number(stage[k]) for k in ("count", "total_ms", "mean_ms", "max_ms")):
+            return False
+        hist = stage["hist"]
+        if not isinstance(hist, list) or len(hist) > 33 or not all(map(_plain_number, hist)):
+            return False
+    return True
+
+
+def consumer_timing_lines(log_text: str) -> tuple[list[str], int]:
+    """The timing summaries in a consumer log, as canonical lines, and the number of
+    lines that carried the prefix but were not a valid summary (skipped).  Lines
+    without the exact prefix are ignored and never copied."""
+    kept: list[str] = []
+    malformed = 0
+    for line in log_text.splitlines():
+        if not line.startswith(CONSUMER_TIMING_PREFIX):
+            continue
+        try:
+            data = json.loads(line[len(CONSUMER_TIMING_PREFIX):])
+        except ValueError:
+            malformed += 1
+            continue
+        if not _timing_summary_ok(data) or len(kept) >= MAX_TIMING_LINES:
+            malformed += 1
+            continue
+        kept.append(CONSUMER_TIMING_PREFIX + json.dumps(data, sort_keys=True,
+                                                         separators=(",", ":")))
+    return kept, malformed
+
+
+def _exclusive_text(path: Path, text: str) -> None:
+    """Create path with text, whole or not at all, never replacing a file (the same
+    temporary-file-and-link write as _exclusive_json)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temp, "x", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
+def capture_consumer_timing(smoke: Any, output_dir: Path, cell: Cell,
+                            evidence: "CellEvidence") -> None:
+    """
+    Diagnostic cells only.  Copy the storage consumer timing summaries out of its
+    temporary log, before that log is deleted, into
+    <output dir>/<benchmark id>-consumer-timing.jsonl (one summary per line, exclusive
+    creation).  Best effort: it never raises, never changes a verdict, and always leaves
+    one limitation in the result saying what was and was not captured.  The consumer is
+    stopped by force, so its final summary and the last partial window are not expected.
+    """
+    label = "consumer timing sidecar"
+    try:
+        try:
+            text = smoke.read_log("storage-consumer")
+        except (KeyError, OSError, AttributeError):
+            evidence.limitations.append(f"{label} NOT captured: the consumer log was not available")
+            return
+        lines, malformed = consumer_timing_lines(text)
+        skipped = f"; {malformed} malformed timing line(s) skipped" if malformed else ""
+        if not lines:
+            evidence.limitations.append(
+                f"{label} NOT captured: the consumer log held no timing summary{skipped}")
+            return
+        path = _outside_repository(output_dir) / f"{cell.benchmark_id}-consumer-timing.jsonl"
+        _exclusive_text(path, "\n".join(lines) + "\n")
+        windows = sum(1 for line in lines if '"kind":"window"' in line)
+        evidence.limitations.append(
+            f"{label} written: {path.name}, {len(lines)} summaries ({windows} windows); "
+            f"periodic windows only, the final summary and the last partial window are lost "
+            f"when the consumer is stopped by force{skipped}")
+    except FileExistsError:
+        evidence.limitations.append(f"{label} NOT written: the file already exists and is "
+                                    "never replaced")
+    except Exception as exc:  # diagnostics never change the outcome of the cell
+        evidence.limitations.append(f"{label} NOT captured: {type(exc).__name__}")
+
+
 def _cleanup(smoke: Any, e2e: Any, samplers: Sequence[Any], refresh_built: bool,
-             evidence: CellEvidence) -> bool:
-    """Samplers, host processes, the refresh profile, then the stack.  Every
-    step runs even when an earlier one fails; True only if all succeeded and
-    the harness verified the stack is gone and the normal stack unchanged."""
+             evidence: CellEvidence, capture: Optional[Callable[[], None]] = None) -> bool:
+    """Samplers, host processes, the diagnostic timing capture (when there is one), the
+    refresh profile, then the stack.  Every step runs even when an earlier one fails;
+    True only if all succeeded and the harness verified the stack is gone and the normal
+    stack unchanged.  The capture runs after the host processes stop and before the
+    harness deletes their logs; it cannot fail the cleanup."""
     ok = True
     for step, action in (
         ("samplers", lambda: [sampler.stop() for sampler in samplers]),
         ("host processes", smoke.stop_host_processes),
+        ("consumer timing capture", capture if capture is not None else (lambda: None)),
         ("refresh profile", e2e.remove_profile_resources if refresh_built else (lambda: None)),
     ):
         try:

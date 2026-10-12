@@ -113,6 +113,11 @@ T_DRAIN: float = 60.0
 T_DOWN: float = 120.0
 T_COMMAND: float = 60.0
 SETTLE_SECONDS: float = 6.0
+#: Diagnostic only: seconds between the storage consumer's timing summaries.  0 (the
+#: default) leaves timing off and the consumer's environment exactly as it was.  Only
+#: the benchmark harness sets it, and only for a cell listed in
+#: run_benchmark.DIAGNOSTIC_TIMING_CELLS; the environment is never inherited.
+CONSUMER_TIMING_INTERVAL: float = 0.0
 
 _SENSITIVE_NAME = re.compile(
     r"(?i)^(OTEL_|PG|POSTGRES_|KAFKA_|CONSUMER_|TOPIC_|GF_|COMPOSE_|AGENTOPS_DIRECT_EXPORT$)"
@@ -807,7 +812,7 @@ def start_host_services() -> None:
     say("alive; configuration points to the isolated broker")
 
     section("storage consumer")
-    start_host_process("storage-consumer", "storage-consumer", host_environment(
+    storage_environment = host_environment(
         KAFKA_BOOTSTRAP_SERVERS=f"127.0.0.1:{KAFKA_PORT}",
         CONSUMER_GROUP_ID=GROUP_STORAGE,
         CONSUMER_AUTO_OFFSET_RESET="earliest",
@@ -817,7 +822,11 @@ def start_host_services() -> None:
         PG_DATABASE="agentops",
         PG_USER="agentops",
         PG_PASSWORD=RUN.generated["POSTGRES_PASSWORD"],
-    ))
+    )
+    if CONSUMER_TIMING_INTERVAL > 0:  # diagnostic cells only; this process only
+        storage_environment["CONSUMER_TIMING_INTERVAL_SECONDS"] = f"{CONSUMER_TIMING_INTERVAL:g}"
+        say(f"consumer timing summaries every {CONSUMER_TIMING_INTERVAL:g} s (diagnostic)")
+    start_host_process("storage-consumer", "storage-consumer", storage_environment)
     wait_started("storage-consumer", (
         f"bootstrap  : 127.0.0.1:{KAFKA_PORT}", f"group      : {GROUP_STORAGE}",
         f"topic      : {TOPIC_SPANS}", f"pg host    : 127.0.0.1:{POSTGRES_PORT}",
