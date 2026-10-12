@@ -158,9 +158,9 @@ class Cell:
 _SMOKE_REPEAT: Mapping[str, Any] = {"level": "SMOKE", "requests": 100, "rate": 5,
                                     "concurrency": 32, "warmup_requests": 25}
 #: The SMALL-10 cells: 1,000 requests at 10/s, warm-up 300 (the ladder's
-#: rate x warmup_seconds).  rep1 and rep2 have run; rep3 is the one further
-#: repeat approved, to collect the time-aligned series.  The other SMALL rates
-#: and repetitions stay unapproved.
+#: rate x warmup_seconds).  rep1 to rep3 have run; rep4 is the one further
+#: repeat approved, to collect the ingest-gap diagnostics.  The other SMALL
+#: rates and repetitions stay unapproved.
 _SMALL10_FIRST: Mapping[str, Any] = {"level": "SMALL", "requests": 1000, "rate": 10,
                                      "concurrency": 32, "warmup_requests": 300}
 APPROVED_LIVE_CELLS: Mapping[str, Mapping[str, Any]] = {
@@ -171,6 +171,7 @@ APPROVED_LIVE_CELLS: Mapping[str, Mapping[str, Any]] = {
     "bm-small-r0010-c32-rep1": {**_SMALL10_FIRST, "repetition": 1},
     "bm-small-r0010-c32-rep2": {**_SMALL10_FIRST, "repetition": 2},
     "bm-small-r0010-c32-rep3": {**_SMALL10_FIRST, "repetition": 3},
+    "bm-small-r0010-c32-rep4": {**_SMALL10_FIRST, "repetition": 4},
 }
 MAX_WARMUP_REQUESTS: int = 10000
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
