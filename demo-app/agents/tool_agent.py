@@ -21,6 +21,30 @@ from state import AgentState, ToolResult
 
 TOOL_NAME = "technology_info_service"
 
+# Exact query string (case-insensitive) that triggers the deterministic failure
+# scenario.  Pass this as the user request to produce an ERROR-status span for
+# testing the error investigation UI without any real service being unavailable.
+FAIL_TRIGGER = "fail_demo_unavailable"
+
+# research._derive_retrieval_query() applies _tokenize() which replaces every
+# non-alphanumeric character (including underscores) with a space and lower-
+# cases. The user types FAIL_TRIGGER but run_tool() receives the normalized
+# form below. Both are checked so the failure fires whether the trigger arrives
+# directly or via the LangGraph research pipeline.
+_FAIL_TRIGGER_NORMALIZED = " ".join(
+    "".join(ch.lower() if ch.isalnum() else " " for ch in FAIL_TRIGGER).split()
+)
+
+
+class ToolExecutionError(RuntimeError):
+    """Raised by run_tool() when the deterministic failure scenario is triggered.
+
+    Trigger by passing FAIL_TRIGGER as the query.  The resulting exception is
+    captured on the 'tool.execute' span with error.type and error.message
+    attributes so the full error pipeline (OTel → Kafka → DB → Trace Viewer)
+    can be exercised end-to-end.
+    """
+
 # Deterministic local table simulating a fake external "technology
 # information service". Each entry has a canonical metadata payload
 # and a list of aliases used to match against the incoming query.
@@ -142,7 +166,17 @@ def run_tool(query: str) -> ToolResult:
     If the query is empty/whitespace or matches no known technology,
     returns a structured "not_found" result. This is a defined,
     deterministic outcome, not a failure or error condition.
+
+    If the query matches FAIL_TRIGGER (case-insensitive, stripped), raises
+    ToolExecutionError to simulate a service failure for demo/testing purposes.
     """
+    q = query.strip().lower()
+    if q == FAIL_TRIGGER or q == _FAIL_TRIGGER_NORMALIZED:
+        raise ToolExecutionError(
+            "External service unavailable: "
+            "connection refused to metadata.example.internal"
+        )
+
     if not query or not query.strip():
         return ToolResult(
             tool_name=TOOL_NAME,

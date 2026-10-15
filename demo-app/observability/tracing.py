@@ -4,6 +4,8 @@ observability/tracing.py
 OpenTelemetry tracing foundation for the AgentOps demo-app.
 """
 
+import os
+
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
@@ -41,9 +43,13 @@ def configure_tracing() -> None:
     )
 
     # Local canonical Kafka development path.
-    provider.add_span_processor(
-        SimpleSpanProcessor(CanonicalSpanExporter())
-    )
+    # Controlled by AGENTOPS_DIRECT_EXPORT env var (default: disabled).
+    # The direct canonical Kafka path is retained as an optional development
+    # adapter and is enabled only when explicitly requested.
+    if os.environ.get("AGENTOPS_DIRECT_EXPORT", "false").lower() == "true":
+        provider.add_span_processor(
+            SimpleSpanProcessor(CanonicalSpanExporter())
+        )
 
     # Production-style OTLP path to OpenTelemetry Collector.
     provider.add_span_processor(

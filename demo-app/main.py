@@ -12,6 +12,7 @@ Phase 3 / Milestone 3.2:
 import uuid
 
 from graph import app
+from agents.tool_agent import ToolExecutionError
 from observability.tracing import configure_tracing, get_tracer
 
 
@@ -47,28 +48,36 @@ def main() -> None:
         "final_response": None,
     }
 
-    with tracer.start_as_current_span("agentops.request") as span:
-        span.set_attribute(
-            "gen_ai.operation.name",
-            "invoke_workflow",
-        )
-        span.set_attribute(
-            "agentops.request_id",
-            request_id,
-        )
-        span.set_attribute(
-            "agentops.session_id",
-            session_id,
-        )
-        span.set_attribute(
-            "agentops.schema_version",
-            SCHEMA_VERSION,
-        )
+    try:
+        with tracer.start_as_current_span("agentops.request") as span:
+            span.set_attribute(
+                "gen_ai.operation.name",
+                "invoke_workflow",
+            )
+            span.set_attribute(
+                "agentops.request_id",
+                request_id,
+            )
+            span.set_attribute(
+                "agentops.session_id",
+                session_id,
+            )
+            span.set_attribute(
+                "agentops.schema_version",
+                SCHEMA_VERSION,
+            )
 
-        result = app.invoke(initial_state)
+            result = app.invoke(initial_state)
 
-    print()
-    print(result["final_response"])
+        print()
+        print(result["final_response"])
+    except ToolExecutionError as exc:
+        print()
+        print(f"[DEMO FAILURE] Agent execution failed: {exc}")
+        print(
+            "An error trace has been emitted. "
+            "Open the Trace Viewer to investigate."
+        )
 
 
 if __name__ == "__main__":
