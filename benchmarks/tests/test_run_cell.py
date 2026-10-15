@@ -15,6 +15,7 @@ import json
 import socket
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1053,8 +1054,8 @@ class TestCorrectionsKeepSafety:
 # Phase 14.4B3H2 repetition selection, run ledger and ownership
 # ---------------------------------------------------------------------------
 
-HISTORICAL_RESULT = Path(r"C:\Users\Vamshi Raj Goud\AppData\Local\Temp\agentops-benchmarks"
-                         r"\bm-smoke-r0005-c32-rep1-20261008T174815.json")
+HISTORICAL_RESULT = (Path(tempfile.gettempdir()) / "agentops-benchmarks"
+                     / "bm-smoke-r0005-c32-rep1-20261008T174815.json")
 HISTORICAL_SHA256_PREFIX = "e2f98781f555d31c"
 
 

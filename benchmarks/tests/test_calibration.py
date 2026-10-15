@@ -43,6 +43,7 @@ HEAD = "a" * 40
 TOKEN = "0123456789abcdef0123456789abcdef"
 CREATED = "2026-10-09T10:00:00.000Z"
 SPACED_PYTHON = r"C:\Program Files\Python 3\python.exe"
+LOG_DIR = r"C:\Temp\S"          # a space-free log directory, as the detached wrapper requires
 
 
 class LiveAccessAttempt(AssertionError):
@@ -742,11 +743,11 @@ class TestChildCommand:
     def test_detached_wrapper_keeps_the_verified_form(self, tmp_path):
         text = C.detached_orchestrator_command(
             interpreter=SPACED_PYTHON, runs=2, output_dir=tmp_path / "cal out",
-            expected_head=HEAD, log_dir=Path(r"C:\Users\VAMSHI~1\AppData\Local\Temp\S"))
+            expected_head=HEAD, log_dir=Path(LOG_DIR))
         assert text.startswith("Start-Process cmd.exe -ArgumentList '/d /s /v:on /c \"")
-        assert text.endswith(r'1>C:\Users\VAMSHI~1\AppData\Local\Temp\S\orchestrator.out '
-                             r'2>C:\Users\VAMSHI~1\AppData\Local\Temp\S\orchestrator.err & '
-                             r'>C:\Users\VAMSHI~1\AppData\Local\Temp\S\orchestrator.exit '
+        assert text.endswith(rf'1>{LOG_DIR}\orchestrator.out '
+                             rf'2>{LOG_DIR}\orchestrator.err & '
+                             rf'>{LOG_DIR}\orchestrator.exit '
                              "echo exit_code=!errorlevel!\"'")
         assert f'"{SPACED_PYTHON}"' in text and text.count("--authorize") == 2
         with pytest.raises(C.CalibrationError, match="space-free"):
