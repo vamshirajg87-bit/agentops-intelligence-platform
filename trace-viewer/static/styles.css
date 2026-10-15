@@ -726,6 +726,22 @@ select.filter-input { min-width: 150px; }
   outline-offset: 1px;
 }
 
+/* --- Synthetic demo data marker (text, so the meaning never depends on colour) --- */
+.demo-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid #e0b252;
+  border-radius: 10px;
+  color: #e0b252;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.demo-badge.hidden { display: none; }
+
 .anom-badge {
   display: inline-block;
   padding: 1px 8px;

@@ -33,6 +33,7 @@ const backBtn           = document.getElementById('back-btn');
 const detailTraceIdEl   = document.getElementById('detail-trace-id-display');
 const detailCopyBtn     = document.getElementById('detail-copy-btn');
 const detailSpanCount   = document.getElementById('detail-span-count');
+const detailDemoBadge   = document.getElementById('detail-demo-badge');
 const detailHealthEl    = document.getElementById('detail-health');
 const cycleWarningEl    = document.getElementById('cycle-warning');
 const detailStatusEl    = document.getElementById('detail-status');
@@ -63,6 +64,32 @@ function formatTimestamp(iso) {
     pad(d.getUTCMinutes())      + ':' +
     pad(d.getUTCSeconds())      + ' UTC'
   );
+}
+
+// Same as formatTimestamp, with milliseconds: 2026-10-15 09:00:00.123 UTC.
+function formatTimestampMs(iso) {
+  const d = new Date(iso);
+  const pad = (n, w) => String(n).padStart(w || 2, '0');
+  return (
+    d.getUTCFullYear()          + '-' +
+    pad(d.getUTCMonth() + 1)    + '-' +
+    pad(d.getUTCDate())         + ' ' +
+    pad(d.getUTCHours())        + ':' +
+    pad(d.getUTCMinutes())      + ':' +
+    pad(d.getUTCSeconds())      + '.' +
+    pad(d.getUTCMilliseconds(), 3) + ' UTC'
+  );
+}
+
+// The marker shown on seeded demonstration data.  The API derives is_demo_data from
+// the demo_seed span attribute; real telemetry never carries it.
+const DEMO_BADGE_TEXT = 'Synthetic Demo Data';
+
+function makeDemoBadge() {
+  const b = document.createElement('span');
+  b.className = 'demo-badge';
+  b.textContent = DEMO_BADGE_TEXT;
+  return b;
 }
 
 function formatDuration(ms) {
@@ -239,6 +266,7 @@ function makeRow(t) {
   opSpan.textContent = t.root_span_name || '—';
   if (t.root_span_name) opSpan.title = t.root_span_name;
   opTd.appendChild(opSpan);
+  if (t.is_demo_data === true) opTd.appendChild(makeDemoBadge());
   tr.appendChild(opTd);
 
   // Service
@@ -464,6 +492,8 @@ function renderDetail(data) {
   detailTraceIdEl.textContent = data.trace_id.slice(0, 8) + '…' + data.trace_id.slice(-8);
   detailTraceIdEl.title = data.trace_id;
   detailCopyBtn.dataset.traceId = data.trace_id;
+
+  detailDemoBadge.classList.toggle('hidden', data.is_demo_data !== true);
 
   detailSpanCount.textContent = data.span_count + ' span' + (data.span_count === 1 ? '' : 's');
 
@@ -693,8 +723,8 @@ function renderSpanPanel(span) {
 
   // --- Timing ---
   addSep();
-  addField('Start',    formatTimestamp(span.start_time));
-  addField('End',      formatTimestamp(span.end_time));
+  addField('Start',    formatTimestampMs(span.start_time));
+  addField('End',      formatTimestampMs(span.end_time));
   addField('Duration', formatDuration(span.duration_ms));
 
   // --- Classification ---
@@ -895,6 +925,19 @@ function anomNumber(v) {
   return Number.isInteger(v) ? String(v) : String(Math.round(v * 1000) / 1000);
 }
 
+// Observed value with its unit.  The raw value is never altered, only labelled:
+// latency anomalies are durations in milliseconds, tool-failure anomalies carry a
+// tool error rate (the detector emits 1.0 for a failed tool call).
+function formatObserved(a) {
+  const v = a.observed_value;
+  if (v === null || v === undefined) return '—';
+  if (a.signal_name === 'duration_ms' || a.anomaly_type === 'latency') return anomNumber(v) + ' ms';
+  if (typeof a.signal_name === 'string' && a.signal_name.endsWith('error_rate')) {
+    return anomNumber(v) + ' (error rate)';
+  }
+  return anomNumber(v);
+}
+
 function anomTime(v) {
   return v ? formatTimestamp(v) : '—';
 }
@@ -1029,7 +1072,7 @@ function makeAnomalyRow(a) {
   tr.appendChild(makeTextCell(anomText(a.anomaly_type)));
   tr.appendChild(makeTextCell(anomText(a.service_name)));
   tr.appendChild(makeTextCell(anomText(a.operation_name)));
-  const obs = makeTextCell(anomNumber(a.observed_value));
+  const obs = makeTextCell(formatObserved(a));
   obs.className = 'align-right';
   tr.appendChild(obs);
   const idTd = makeTextCell(a.trace_id ? a.trace_id.slice(0, 8) + '…' + a.trace_id.slice(-8) : '—');
@@ -1114,7 +1157,7 @@ function renderAnomalyDetail(a) {
   addField(f, 'Signal', anomText(a.signal_name));
   addField(f, 'Service', anomText(a.service_name));
   addField(f, 'Operation', anomText(a.operation_name));
-  addField(f, 'Observed value', anomNumber(a.observed_value));
+  addField(f, 'Observed value', formatObserved(a));
   addField(f, 'Anomaly score', anomNumber(a.anomaly_score));
   addField(f, 'Event time', anomTime(a.event_time));
   addField(f, 'Detected at', anomTime(a.detected_at));

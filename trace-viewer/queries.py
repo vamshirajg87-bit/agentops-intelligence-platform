@@ -43,7 +43,7 @@ class TraceListResult:
 # SQL fragments
 # ---------------------------------------------------------------------------
 
-# All 16 columns from analytics.int_trace_spans.
+# All 16 columns from analytics.int_trace_spans, plus the derived is_demo_data flag.
 _LIST_TRACES_SELECT = """\
 SELECT
     trace_id,
@@ -61,7 +61,12 @@ SELECT
     agent_span_count,
     tool_span_count,
     retrieval_span_count,
-    has_error
+    has_error,
+    EXISTS (
+        SELECT 1 FROM analytics.stg_telemetry_spans AS demo_s
+        WHERE demo_s.trace_id = int_trace_spans.trace_id
+          AND demo_s.attributes ->> 'demo_seed' IS NOT NULL
+    ) AS is_demo_data
 FROM analytics.int_trace_spans
 """
 
@@ -96,7 +101,8 @@ SELECT
     retrieval_result_count,
     retrieval_top_relevance_score,
     error_type,
-    error_message
+    error_message,
+    (attributes ->> 'demo_seed' IS NOT NULL) AS is_demo_data
 FROM analytics.stg_telemetry_spans
 WHERE trace_id = %(trace_id)s
 """
@@ -145,6 +151,7 @@ def _row_to_span_record(row: dict[str, Any]) -> SpanRecord:
         retrieval_top_relevance_score=row.get("retrieval_top_relevance_score"),
         error_type=row.get("error_type"),
         error_message=row.get("error_message"),
+        is_demo_data=bool(row.get("is_demo_data", False)),
     )
 
 

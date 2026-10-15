@@ -101,6 +101,7 @@ class TraceSummary(BaseModel):
     tool_span_count: int
     retrieval_span_count: int
     has_error: bool
+    is_demo_data: bool = False      # derived from the demo_seed span attribute
 
 
 class TraceListResponse(BaseModel):
@@ -137,6 +138,7 @@ class SpanResponse(BaseModel):
     retrieval_top_relevance_score: float | None = None
     error_type: str | None = None
     error_message: str | None = None
+    is_demo_data: bool = False
 
     @classmethod
     def from_span_record(cls, span: SpanRecord) -> SpanResponse:
@@ -163,6 +165,7 @@ class SpanResponse(BaseModel):
             retrieval_top_relevance_score=span.retrieval_top_relevance_score,
             error_type=span.error_type,
             error_message=span.error_message,
+            is_demo_data=span.is_demo_data,
         )
 
 
@@ -188,6 +191,15 @@ class TraceNodeResponse(BaseModel):
 TraceNodeResponse.model_rebuild()
 
 
+def _walk(nodes: list[TraceNode]) -> Generator[TraceNode, None, None]:
+    """Every node of the given subtrees (iterative, so a deep trace cannot exhaust the stack)."""
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(node.children)
+
+
 class TraceDetailResponse(BaseModel):
     """Full reconstructed trace returned by GET /api/traces/{trace_id}."""
 
@@ -197,6 +209,7 @@ class TraceDetailResponse(BaseModel):
     roots: list[TraceNodeResponse]
     orphans: list[TraceNodeResponse]
     cycle_members: list[TraceNodeResponse]
+    is_demo_data: bool = False
 
     @classmethod
     def from_reconstruction(
@@ -211,6 +224,11 @@ class TraceDetailResponse(BaseModel):
             roots=[TraceNodeResponse.from_trace_node(n) for n in result.roots],
             orphans=[TraceNodeResponse.from_trace_node(n) for n in result.orphans],
             cycle_members=[TraceNodeResponse.from_trace_node(n) for n in result.cycle_members],
+            is_demo_data=any(
+                n.span.is_demo_data
+                for group in (result.roots, result.orphans, result.cycle_members)
+                for n in _walk(group)
+            ),
         )
 
 

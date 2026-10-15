@@ -278,7 +278,8 @@ class TestListTracesHasErrorFilter:
         count_sql, _ = cur.execute_calls[0]
         page_sql, _ = cur.execute_calls[1]
         assert "WHERE" not in count_sql
-        assert "WHERE" not in page_sql
+        # the demo-flag subquery has its own WHERE; the outer query must have none
+        assert "WHERE" not in page_sql.split("FROM analytics.int_trace_spans")[-1]
 
     def test_has_error_true_sends_where_clause(self):
         conn, cur = _make_conn_for_list()

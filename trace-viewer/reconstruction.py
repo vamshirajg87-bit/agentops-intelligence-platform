@@ -66,6 +66,10 @@ class SpanRecord:
     error_type: Optional[str] = None
     error_message: Optional[str] = None
 
+    # Derived, presentation only: True when the span's attribute bag carries the
+    # demo_seed marker written by the MVP demo seed.  The bag itself is not exposed.
+    is_demo_data: bool = False
+
 
 @dataclass
 class TraceNode:
