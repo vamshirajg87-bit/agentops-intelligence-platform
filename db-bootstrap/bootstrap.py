@@ -8,6 +8,7 @@ analytics objects the platform needs, by applying the existing migrations and
 the existing dbt project in the one order that works on an empty database:
 
     ledger -> 001 -> dbt run -> 002 ... 014 -> post-dbt grants -> verify
+          -> complete -> upgrades (015 ...)
 
 dbt has to run after 001 and before 002: migrations 002, 003, 005 and 008
 grant on objects that only dbt creates.  For that first run to be possible
@@ -15,7 +16,18 @@ the dbt models must not need a role that a later migration creates; their
 grant hooks are conditional on the role for this reason.  This program
 changes no migration and no dbt model.
 
-Before the database is marked complete, every grant the migrations make on
+Base bootstrap and upgrades
+---------------------------
+The base plan ends with the "complete" marker: the schema, roles and analytics
+objects were built and verified.  Migrations added later are listed in
+_UPGRADES and follow the marker, one ledger row each, so the rows of a database
+that was already complete stay valid and such a database simply resumes at the
+first upgrade it has not recorded.  The marker therefore means "the base
+bootstrap is complete", not "the whole plan is".  The database is COMPLETE
+only when every step of the whole plan, upgrades included, is recorded; the
+analytics refresh and the services that wait for this program rely on that.
+
+Before the base bootstrap is marked complete, every grant the migrations make on
 the analytics schema is checked.  post_dbt_grants.sql restores the part of
 them that a later dbt run removes and nothing else restores.
 
@@ -35,7 +47,8 @@ Before anything is changed, the database is classified:
     PARTIAL_VALID  the ledger holds a strict prefix of the steps, every
                    checksum matches, and the objects in the database are
                    exactly those of the recorded steps
-    COMPLETE       every step is recorded, including the final marker
+    COMPLETE       every step of the plan is recorded: the base steps, the
+                   "complete" marker and every upgrade
     INCOMPATIBLE   anything else
 
 EMPTY starts from the beginning.  PARTIAL_VALID resumes at the first step
@@ -199,7 +212,21 @@ _MIGRATIONS: tuple[tuple[str, tuple[str, ...], Mapping[str, str]], ...] = (
      {"alert_notifier_password": "alert_notifier"}),
 )
 
-MIGRATION_FILES: tuple[str, ...] = tuple(name for name, _, _ in _MIGRATIONS)
+#: Migrations added after the base bootstrap, in the order they are applied.
+#: They follow the "complete" marker (see the module docstring), so a database
+#: that was complete before an upgrade existed resumes at it and nothing else.
+#: Same shape as _MIGRATIONS.  An entry is final once any database has applied
+#: it: its file is checksummed in the ledger.
+_UPGRADES: tuple[tuple[str, tuple[str, ...], Mapping[str, str]], ...] = (
+    # Read-only grants (SELECT on three tables, USAGE on schema public) to
+    # trace_viewer_reader.  It creates no object and needs no password.
+    ("015_grant_trace_viewer_anomaly_rca_read.sql", (), {}),
+)
+
+#: Every migration file the bootstrap knows: the base ones, then the upgrades.
+MIGRATION_FILES: tuple[str, ...] = tuple(
+    name for name, _, _ in _MIGRATIONS + _UPGRADES
+)
 
 #: dbt runs after this migration and before the next one.
 DBT_AFTER_MIGRATION: str = "001_create_telemetry_spans.sql"
@@ -302,6 +329,9 @@ def build_plan(migrations_dir: Path, grants_file: Path) -> tuple[Step, ...]:
     """
     The ordered steps, with the checksum of every file as it is on disk now.
 
+    Order: the base migrations (dbt after 001), the post-dbt grants, the
+    "complete" marker, then the upgrades.
+
     Raises:
         ConfigError  a migration is missing, an unknown migration is present,
                      or a file cannot be read.
@@ -324,9 +354,9 @@ def build_plan(migrations_dir: Path, grants_file: Path) -> tuple[Step, ...]:
         raise ConfigError("the post-dbt grants file does not exist")
 
     steps: list[Step] = []
-    for name, sentinels, variables in _MIGRATIONS:
+    def sql_step(name, sentinels, variables) -> Step:
         path = migrations_dir / name
-        steps.append(Step(
+        return Step(
             name=name,
             kind=KIND_SQL,
             checksum=_read_checksum(path),
@@ -336,7 +366,10 @@ def build_plan(migrations_dir: Path, grants_file: Path) -> tuple[Step, ...]:
                 variable: ROLE_PASSWORD_ENV[role]
                 for variable, role in variables.items()
             },
-        ))
+        )
+
+    for name, sentinels, variables in _MIGRATIONS:
+        steps.append(sql_step(name, sentinels, variables))
         if name == DBT_AFTER_MIGRATION:
             steps.append(Step(
                 name=STEP_DBT,
@@ -352,6 +385,8 @@ def build_plan(migrations_dir: Path, grants_file: Path) -> tuple[Step, ...]:
         path=grants_file,
     ))
     steps.append(Step(name=STEP_COMPLETE, kind=KIND_COMPLETE, checksum=NO_CHECKSUM))
+    for name, sentinels, variables in _UPGRADES:
+        steps.append(sql_step(name, sentinels, variables))
     return tuple(steps)
 
 

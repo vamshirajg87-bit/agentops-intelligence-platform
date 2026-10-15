@@ -815,7 +815,10 @@ nextBtn.addEventListener('click', () => {
 // Event listeners — detail view
 // ==========================================================================
 
-backBtn.addEventListener('click', showListView);
+backBtn.addEventListener('click', () => {
+  if (anomalyBackFromTrace()) return;   // opened from an anomaly: return there
+  showListView();
+});
 
 detailCopyBtn.addEventListener('click', () => {
   const traceId = detailCopyBtn.dataset.traceId;
@@ -831,6 +834,469 @@ detailCopyBtn.addEventListener('click', () => {
 });
 
 detailRetryBtn.addEventListener('click', fetchDetail);
+
+// ==========================================================================
+// Anomalies tab — list, detail and RCA panel (read-only)
+//
+// Every database-sourced string is written with textContent (via anomEl or an
+// explicit textContent assignment).  innerHTML is never used in this section.
+// ==========================================================================
+
+const ANOMALY_PAGE_SIZE = 50;
+const TRACE_ID_RE   = /^[0-9a-f]{32}$/;
+const ANOMALY_ID_RE = /^[0-9a-f]{64}$/;
+
+let anomalyPageIndex = 0;
+let anomalyTotal = 0;
+let anomalySeverity = '';
+let anomalyService  = '';
+let anomalyTraceFilter = '';
+let anomalyListLoaded = false;
+let anomalyListToken = 0;     // discards responses from superseded requests
+let anomalyDetailToken = 0;
+let currentAnomalyId = null;
+let currentAnomalyTraceId = null;
+let traceOpenedFromAnomaly = false;
+
+const anomaliesViewEl      = document.getElementById('anomalies-view');
+const anomalyDetailViewEl  = document.getElementById('anomaly-detail-view');
+const anomaliesBody        = document.getElementById('anomalies-body');
+const anomalyStatusEl      = document.getElementById('anomaly-status');
+const anomalyErrBanner     = document.getElementById('anomaly-error-banner');
+const anomalyErrMsg        = document.getElementById('anomaly-error-message');
+const anomalyPrevBtn       = document.getElementById('anomaly-prev-btn');
+const anomalyNextBtn       = document.getElementById('anomaly-next-btn');
+const anomalyPageIndicator = document.getElementById('anomaly-page-indicator');
+const anomalyCountEl       = document.getElementById('anomaly-count');
+const anomalyDetailStatus  = document.getElementById('anomaly-detail-status');
+const anomalyDetailErr     = document.getElementById('anomaly-detail-error');
+const anomalyDetailErrMsg  = document.getElementById('anomaly-detail-error-message');
+const anomalyTraceBtn      = document.getElementById('anomaly-trace-btn');
+const rcaStatusEl          = document.getElementById('rca-status');
+const rcaErrBanner         = document.getElementById('rca-error-banner');
+const rcaErrMsg            = document.getElementById('rca-error-message');
+const rcaContentEl         = document.getElementById('rca-content');
+
+// ---------- helpers ----------
+
+function anomEl(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+
+function anomText(v) {
+  return v === null || v === undefined || v === '' ? '—' : String(v);
+}
+
+function anomNumber(v) {
+  if (v === null || v === undefined) return '—';
+  return Number.isInteger(v) ? String(v) : String(Math.round(v * 1000) / 1000);
+}
+
+function anomTime(v) {
+  return v ? formatTimestamp(v) : '—';
+}
+
+// Severity and confidence are shown as text with a class for colour, so the
+// meaning never depends on colour alone.
+function anomBadge(text, kind) {
+  return anomEl('span', 'anom-badge anom-' + String(kind).toLowerCase(), text);
+}
+
+function anomFetchError(resp) {
+  return resp.json().then(
+    body => 'HTTP ' + resp.status + ' — ' + ((body && body.detail) || resp.statusText || resp.status),
+    () => 'HTTP ' + resp.status + ' — ' + (resp.statusText || resp.status)
+  );
+}
+
+function addField(dl, label, value, mono) {
+  dl.appendChild(anomEl('dt', null, label));
+  const dd = anomEl('dd', mono ? 'mono' : null, value);
+  dl.appendChild(dd);
+  return dd;
+}
+
+// ---------- tab switching ----------
+
+function hideAnomalyViews() {
+  anomaliesViewEl.classList.add('hidden');
+  anomalyDetailViewEl.classList.add('hidden');
+}
+
+function selectTab(name) {
+  document.getElementById('tab-traces')
+    .setAttribute('aria-pressed', name === 'traces' ? 'true' : 'false');
+  document.getElementById('tab-anomalies')
+    .setAttribute('aria-pressed', name === 'anomalies' ? 'true' : 'false');
+  document.body.classList.toggle('anomalies-mode', name === 'anomalies');
+}
+
+function showTracesTab() {
+  traceOpenedFromAnomaly = false;
+  hideAnomalyViews();
+  selectTab('traces');
+  showListView();
+}
+
+function showAnomaliesTab() {
+  traceOpenedFromAnomaly = false;
+  // leave any trace list / trace detail
+  document.body.classList.remove('detail-mode');
+  listViewEl.classList.add('hidden');
+  detailViewEl.classList.add('hidden');
+  currentTraceId = null;
+  anomalyDetailViewEl.classList.add('hidden');
+  anomaliesViewEl.classList.remove('hidden');
+  selectTab('anomalies');
+  if (!anomalyListLoaded) fetchAnomalies();
+}
+
+// ---------- list ----------
+
+function buildAnomalyUrl() {
+  const params = new URLSearchParams();
+  params.set('limit', String(ANOMALY_PAGE_SIZE));
+  params.set('offset', String(anomalyPageIndex * ANOMALY_PAGE_SIZE));
+  if (anomalySeverity)    params.set('severity', anomalySeverity);
+  if (anomalyService)     params.set('service_name', anomalyService);
+  if (anomalyTraceFilter) params.set('trace_id', anomalyTraceFilter);
+  return '/api/anomalies?' + params.toString();
+}
+
+async function fetchAnomalies() {
+  const token = ++anomalyListToken;
+  anomalyStatusEl.textContent = 'Loading anomalies…';
+  anomalyErrBanner.classList.add('hidden');
+  anomalyPrevBtn.setAttribute('aria-disabled', 'true');
+  anomalyNextBtn.setAttribute('aria-disabled', 'true');
+  try {
+    const resp = await fetch(buildAnomalyUrl());
+    if (!resp.ok) throw new Error(await anomFetchError(resp));
+    const data = await resp.json();
+    if (token !== anomalyListToken) return;
+    anomalyListLoaded = true;
+    anomalyTotal = data.total;
+    renderAnomalyTable(data.anomalies);
+    renderAnomalyPagination(data.anomalies.length);
+    anomalyStatusEl.textContent = '';
+  } catch (err) {
+    if (token !== anomalyListToken) return;
+    anomalyStatusEl.textContent = '';
+    anomalyErrMsg.textContent =
+      'Could not load anomalies — ' + err.message + '. Check that the API is running.';
+    anomalyErrBanner.classList.remove('hidden');
+    anomaliesBody.replaceChildren();
+    anomalyCountEl.textContent = '';
+    anomalyPageIndicator.textContent = '';
+  }
+}
+
+function renderAnomalyTable(rows) {
+  if (rows.length === 0) {
+    const tr = anomEl('tr', 'empty-row');
+    const td = anomEl('td', null,
+      (anomalySeverity || anomalyService || anomalyTraceFilter)
+        ? 'No anomalies match the current filters.'
+        : 'No anomalies found.');
+    td.setAttribute('colspan', '7');
+    tr.appendChild(td);
+    anomaliesBody.replaceChildren(tr);
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const a of rows) fragment.appendChild(makeAnomalyRow(a));
+  anomaliesBody.replaceChildren(fragment);
+}
+
+function makeAnomalyRow(a) {
+  const tr = anomEl('tr');
+  tr.setAttribute('tabindex', '0');
+  tr.setAttribute('role', 'link');
+  tr.setAttribute('aria-label', 'Open ' + a.severity + ' anomaly, service ' + anomText(a.service_name));
+  const open = () => openAnomalyDetail(a.anomaly_id);
+  tr.addEventListener('click', open);
+  tr.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+  });
+
+  const sevTd = anomEl('td');
+  sevTd.appendChild(anomBadge(a.severity, a.severity));
+  tr.appendChild(sevTd);
+  tr.appendChild(makeTextCell(anomTime(a.event_time)));
+  tr.appendChild(makeTextCell(anomText(a.anomaly_type)));
+  tr.appendChild(makeTextCell(anomText(a.service_name)));
+  tr.appendChild(makeTextCell(anomText(a.operation_name)));
+  const obs = makeTextCell(anomNumber(a.observed_value));
+  obs.className = 'align-right';
+  tr.appendChild(obs);
+  const idTd = makeTextCell(a.trace_id ? a.trace_id.slice(0, 8) + '…' + a.trace_id.slice(-8) : '—');
+  idTd.className = 'trace-id-display';
+  if (a.trace_id) idTd.title = a.trace_id;
+  tr.appendChild(idTd);
+  return tr;
+}
+
+function renderAnomalyPagination(pageCount) {
+  const first = anomalyTotal === 0 ? 0 : anomalyPageIndex * ANOMALY_PAGE_SIZE + 1;
+  const last  = anomalyPageIndex * ANOMALY_PAGE_SIZE + pageCount;
+  anomalyCountEl.textContent = anomalyTotal === 0
+    ? '0 anomalies'
+    : 'Showing ' + first + '–' + last + ' of ' + anomalyTotal;
+  const pages = Math.max(1, Math.ceil(anomalyTotal / ANOMALY_PAGE_SIZE));
+  anomalyPageIndicator.textContent = 'Page ' + (anomalyPageIndex + 1) + ' of ' + pages;
+  anomalyPrevBtn.setAttribute('aria-disabled', anomalyPageIndex === 0 ? 'true' : 'false');
+  anomalyNextBtn.setAttribute('aria-disabled',
+    (anomalyPageIndex + 1) * ANOMALY_PAGE_SIZE >= anomalyTotal ? 'true' : 'false');
+}
+
+// ---------- detail ----------
+
+function openAnomalyDetail(anomalyId) {
+  currentAnomalyId = anomalyId;
+  anomaliesViewEl.classList.add('hidden');
+  anomalyDetailViewEl.classList.remove('hidden');
+  loadAnomalyDetail();
+}
+
+function clearAnomalyDetail() {
+  document.getElementById('anomaly-explanation').textContent = '';
+  document.getElementById('anomaly-fields').replaceChildren();
+  document.getElementById('anomaly-baseline').replaceChildren();
+  anomalyTraceBtn.classList.add('hidden');
+  currentAnomalyTraceId = null;
+  rcaContentEl.classList.add('hidden');
+  rcaErrBanner.classList.add('hidden');
+  rcaStatusEl.textContent = '';
+}
+
+function loadAnomalyDetail() {
+  if (!currentAnomalyId || !ANOMALY_ID_RE.test(currentAnomalyId)) return;
+  const token = ++anomalyDetailToken;
+  clearAnomalyDetail();
+  anomalyDetailErr.classList.add('hidden');
+  anomalyDetailStatus.textContent = 'Loading anomaly…';
+  fetchAnomalyDetail(token);
+  fetchRca(token);
+}
+
+async function fetchAnomalyDetail(token) {
+  try {
+    const resp = await fetch('/api/anomalies/' + currentAnomalyId);
+    if (resp.status === 404) {
+      if (token !== anomalyDetailToken) return;
+      anomalyDetailStatus.textContent = 'Anomaly not found.';
+      return;
+    }
+    if (!resp.ok) throw new Error(await anomFetchError(resp));
+    const a = await resp.json();
+    if (token !== anomalyDetailToken) return;
+    anomalyDetailStatus.textContent = '';
+    renderAnomalyDetail(a);
+  } catch (err) {
+    if (token !== anomalyDetailToken) return;
+    anomalyDetailStatus.textContent = '';
+    anomalyDetailErrMsg.textContent = 'Could not load anomaly — ' + err.message;
+    anomalyDetailErr.classList.remove('hidden');
+  }
+}
+
+function renderAnomalyDetail(a) {
+  document.getElementById('anomaly-explanation').textContent = a.explanation;
+
+  const f = document.getElementById('anomaly-fields');
+  f.replaceChildren();
+  const sev = addField(f, 'Severity', '');
+  sev.appendChild(anomBadge(a.severity, a.severity));
+  addField(f, 'Type', anomText(a.anomaly_type));
+  addField(f, 'Signal', anomText(a.signal_name));
+  addField(f, 'Service', anomText(a.service_name));
+  addField(f, 'Operation', anomText(a.operation_name));
+  addField(f, 'Observed value', anomNumber(a.observed_value));
+  addField(f, 'Anomaly score', anomNumber(a.anomaly_score));
+  addField(f, 'Event time', anomTime(a.event_time));
+  addField(f, 'Detected at', anomTime(a.detected_at));
+  addField(f, 'Detector', anomText(a.detector_name) + ' v' + anomText(a.detector_version));
+  addField(f, 'Trace ID', anomText(a.trace_id), true);
+  addField(f, 'Span ID', anomText(a.span_id), true);
+  addField(f, 'Anomaly ID', a.anomaly_id, true);
+
+  const b = document.getElementById('anomaly-baseline');
+  b.replaceChildren();
+  if (a.baseline_median === null && a.baseline_mad === null && a.baseline_n === null) {
+    addField(b, 'Baseline', 'Not available for this signal.');
+  } else {
+    addField(b, 'Median', anomNumber(a.baseline_median));
+    addField(b, 'MAD', anomNumber(a.baseline_mad));
+    addField(b, 'Samples', anomNumber(a.baseline_n));
+    addField(b, 'Window start', anomTime(a.baseline_window_start));
+    addField(b, 'Window end', anomTime(a.baseline_window_end));
+  }
+
+  currentAnomalyTraceId = a.trace_id && TRACE_ID_RE.test(a.trace_id) ? a.trace_id : null;
+  anomalyTraceBtn.classList.toggle('hidden', currentAnomalyTraceId === null);
+}
+
+// ---------- RCA panel ----------
+
+async function fetchRca(token) {
+  rcaStatusEl.textContent = 'Loading root cause analysis…';
+  rcaErrBanner.classList.add('hidden');
+  rcaContentEl.classList.add('hidden');
+  try {
+    const resp = await fetch('/api/anomalies/' + currentAnomalyId + '/rca');
+    if (token !== anomalyDetailToken) return;
+    if (resp.status === 404) {
+      rcaStatusEl.textContent = 'No root cause analysis has been recorded for this anomaly.';
+      return;
+    }
+    if (!resp.ok) throw new Error(await anomFetchError(resp));
+    const rca = await resp.json();
+    if (token !== anomalyDetailToken) return;
+    rcaStatusEl.textContent = '';
+    renderRca(rca);
+  } catch (err) {
+    if (token !== anomalyDetailToken) return;
+    rcaStatusEl.textContent = '';
+    rcaErrMsg.textContent = 'Could not load root cause analysis — ' + err.message;
+    rcaErrBanner.classList.remove('hidden');
+  }
+}
+
+function renderRca(r) {
+  const conf = document.getElementById('rca-confidence');
+  conf.replaceChildren(anomBadge(r.confidence, r.confidence));
+  document.getElementById('rca-summary').textContent = r.summary;
+
+  const meta = document.getElementById('rca-meta');
+  meta.replaceChildren();
+  addField(meta, 'Investigated', anomTime(r.investigated_at));
+  addField(meta, 'Analyzer', 'v' + anomText(r.analyzer_version));
+  addField(meta, 'Spans in trace', anomNumber(r.trace_span_count));
+  addField(meta, 'Investigation ID', r.investigation_id, true);
+
+  const lim = document.getElementById('rca-limitations');
+  lim.replaceChildren();
+  if (r.limitations.length === 0) {
+    lim.appendChild(anomEl('li', null, 'None recorded.'));
+  } else {
+    for (const l of r.limitations) lim.appendChild(anomEl('li', null, l));
+  }
+
+  const ev = document.getElementById('rca-evidence');
+  ev.replaceChildren();
+  if (r.evidence.length === 0) {
+    ev.appendChild(anomEl('li', 'rca-evidence-empty', 'No evidence spans were recorded.'));
+  } else {
+    // The API returns evidence already ordered by rank_position.
+    for (const e of r.evidence) ev.appendChild(makeEvidenceItem(e));
+  }
+  rcaContentEl.classList.remove('hidden');
+}
+
+function makeEvidenceItem(e) {
+  const li = anomEl('li', 'rca-evidence-item');
+  const head = anomEl('div', 'rca-evidence-head');
+  head.appendChild(anomEl('span', 'rca-rank', '#' + e.rank_position));
+  head.appendChild(anomEl('span', 'op-name', e.span_name));
+  head.appendChild(anomEl('span', 'rca-score', 'score ' + anomNumber(e.evidence_score)));
+  li.appendChild(head);
+  li.appendChild(anomEl('p', 'rca-evidence-expl', e.explanation));
+
+  const dl = anomEl('dl', 'span-fields');
+  addField(dl, 'Service', anomText(e.service_name));
+  addField(dl, 'Duration', formatDuration(e.duration_ms));
+  addField(dl, 'Status', anomText(e.status_code));
+  addField(dl, 'Evidence type', anomText(e.evidence_type));
+  if (e.error_type !== null || e.error_message !== null) {
+    const dd = addField(dl, 'Error', [e.error_type, e.error_message].filter(x => x).join(': '));
+    dd.className = 'error-value';
+  }
+  if (e.trace_duration_fraction !== null) {
+    addField(dl, 'Share of trace', anomNumber(Math.round(e.trace_duration_fraction * 1000) / 10) + '%');
+  }
+  addField(dl, 'Score breakdown', anomText(e.evidence_score_breakdown));
+  addField(dl, 'Span ID', e.span_id, true);
+  li.appendChild(dl);
+  return li;
+}
+
+// ---------- navigation to the existing trace viewer ----------
+
+function openAnomalyTrace() {
+  if (!currentAnomalyTraceId) return;
+  traceOpenedFromAnomaly = true;
+  hideAnomalyViews();
+  selectTab('traces');        // the trace filter nav is hidden again by detail-mode
+  openTraceDetail(currentAnomalyTraceId);
+}
+
+// Called by the trace detail "Back" button.  Returns true when it handled the
+// click by returning to the anomaly the trace was opened from.
+function anomalyBackFromTrace() {
+  if (!traceOpenedFromAnomaly) return false;
+  traceOpenedFromAnomaly = false;
+  document.body.classList.remove('detail-mode');
+  detailViewEl.classList.add('hidden');
+  currentTraceId = null;
+  selectTab('anomalies');
+  anomalyDetailViewEl.classList.remove('hidden');
+  return true;
+}
+
+// ---------- events ----------
+
+document.getElementById('tab-traces').addEventListener('click', showTracesTab);
+document.getElementById('tab-anomalies').addEventListener('click', showAnomaliesTab);
+
+document.getElementById('anomaly-filter-form').addEventListener('submit', e => {
+  e.preventDefault();
+  const traceInput = document.getElementById('anomaly-trace-input');
+  const traceVal = traceInput.value.trim().toLowerCase();
+  if (traceVal && !TRACE_ID_RE.test(traceVal)) {
+    anomalyStatusEl.textContent = 'Trace ID must be 32 lowercase hex characters.';
+    traceInput.focus();
+    return;
+  }
+  anomalySeverity    = document.getElementById('anomaly-severity-select').value;
+  anomalyService     = document.getElementById('anomaly-service-input').value.trim();
+  anomalyTraceFilter = traceVal;
+  anomalyPageIndex = 0;
+  fetchAnomalies();
+});
+
+document.getElementById('anomaly-clear-btn').addEventListener('click', () => {
+  document.getElementById('anomaly-severity-select').value = '';
+  document.getElementById('anomaly-service-input').value = '';
+  document.getElementById('anomaly-trace-input').value = '';
+  anomalySeverity = anomalyService = anomalyTraceFilter = '';
+  anomalyPageIndex = 0;
+  fetchAnomalies();
+});
+
+document.getElementById('anomaly-retry-btn').addEventListener('click', fetchAnomalies);
+
+anomalyPrevBtn.addEventListener('click', () => {
+  if (anomalyPrevBtn.getAttribute('aria-disabled') === 'true') return;
+  anomalyPageIndex -= 1;
+  fetchAnomalies();
+});
+anomalyNextBtn.addEventListener('click', () => {
+  if (anomalyNextBtn.getAttribute('aria-disabled') === 'true') return;
+  anomalyPageIndex += 1;
+  fetchAnomalies();
+});
+
+document.getElementById('anomaly-back-btn').addEventListener('click', () => {
+  anomalyDetailToken += 1;    // drop in-flight detail responses
+  anomalyDetailViewEl.classList.add('hidden');
+  anomaliesViewEl.classList.remove('hidden');
+});
+anomalyTraceBtn.addEventListener('click', openAnomalyTrace);
+document.getElementById('anomaly-detail-retry-btn').addEventListener('click', loadAnomalyDetail);
+document.getElementById('rca-retry-btn').addEventListener('click', () => fetchRca(anomalyDetailToken));
 
 // ==========================================================================
 // Init

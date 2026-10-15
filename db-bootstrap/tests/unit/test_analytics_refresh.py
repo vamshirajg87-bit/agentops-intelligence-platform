@@ -193,6 +193,27 @@ class TestCompleteRequirement:
         )
         assert db.actions == []
 
+    def test_base_complete_database_is_refused_until_the_upgrade_is_applied(self):
+        """17 rows: built and verified before 015 existed, 015 not yet applied."""
+        upgrade = "015_grant_trace_viewer_anomaly_rca_read.sql"
+        base_rows = [step.name for step in _PLAN].index(upgrade)
+        assert _PLAN[base_rows - 1].name == "complete"
+        db = FakeDatabase(_state(base_rows))
+        assert classify(db.state, _PLAN).state is BootstrapState.PARTIAL_VALID
+        with pytest.raises(IncompatibleError) as excinfo:
+            _run(db)
+        assert str(excinfo.value) == (
+            "the database bootstrap has not finished; it has to finish first "
+            f"({base_rows} of {len(_PLAN)} steps are recorded)"
+        )
+        assert db.actions == []
+
+    def test_refresh_is_allowed_once_the_upgrade_is_recorded(self):
+        db = FakeDatabase(_state(len(_PLAN)))
+        assert classify(db.state, _PLAN).state is BootstrapState.COMPLETE
+        _run(db)
+        assert db.actions == ["dbt", "grants:post_dbt_grants.sql"]
+
     def test_database_without_ledger_is_refused_before_dbt(self):
         db = FakeDatabase(_LEGACY)
         with pytest.raises(IncompatibleError, match="there is no ledger"):

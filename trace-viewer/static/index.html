@@ -10,6 +10,10 @@
 <body>
   <header class="app-header">
     <h1 class="app-title">AgentOps Trace Viewer</h1>
+    <nav class="tab-nav" aria-label="Sections">
+      <button id="tab-traces" class="filter-btn" aria-pressed="true" type="button">Traces</button>
+      <button id="tab-anomalies" class="filter-btn" aria-pressed="false" type="button">Anomalies</button>
+    </nav>
     <nav class="filter-nav" aria-label="Trace filter">
       <button id="filter-all" class="filter-btn" aria-pressed="true" type="button">All</button>
       <button id="filter-errors" class="filter-btn" aria-pressed="false" type="button">Errors Only</button>
@@ -112,6 +116,95 @@
             <dl id="span-fields" class="span-fields"></dl>
           </div>
         </aside>
+      </div>
+    </div>
+
+    <!-- ANOMALIES LIST VIEW -->
+    <div id="anomalies-view" class="anom-view hidden">
+      <form id="anomaly-filter-form" class="filter-form" autocomplete="off" aria-label="Anomaly filters">
+        <div class="filter-row">
+          <select id="anomaly-severity-select" class="filter-input" aria-label="Filter by severity">
+            <option value="">All severities</option>
+            <option value="CRITICAL">Critical</option>
+            <option value="WARNING">Warning</option>
+            <option value="INFO">Info</option>
+          </select>
+          <input id="anomaly-service-input" class="filter-input" type="text"
+                 placeholder="Service name" aria-label="Filter anomalies by service name">
+          <input id="anomaly-trace-input" class="filter-input filter-input-wide" type="text"
+                 maxlength="32" placeholder="Trace ID (32 hex characters)"
+                 aria-label="Filter anomalies by trace ID">
+          <button id="anomaly-apply-btn" class="filter-apply-btn" type="submit">Apply</button>
+          <button id="anomaly-clear-btn" class="filter-clear-btn" type="button">Clear</button>
+        </div>
+      </form>
+      <div id="anomaly-status" class="status-region" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="anomaly-error-banner" class="error-banner anom-banner hidden" role="alert">
+        <span id="anomaly-error-message" class="error-message"></span>
+        <button id="anomaly-retry-btn" class="retry-btn" type="button">Retry</button>
+      </div>
+      <div class="table-wrapper">
+        <table id="anomalies-table" aria-label="Anomaly list">
+          <thead>
+            <tr>
+              <th scope="col">Severity</th>
+              <th scope="col">Event time (UTC)</th>
+              <th scope="col">Type</th>
+              <th scope="col">Service</th>
+              <th scope="col">Operation</th>
+              <th scope="col" class="align-right">Observed</th>
+              <th scope="col">Trace ID</th>
+            </tr>
+          </thead>
+          <tbody id="anomalies-body"></tbody>
+        </table>
+      </div>
+      <footer class="table-footer">
+        <span id="anomaly-count" class="count-display" aria-live="polite"></span>
+        <nav class="pagination" aria-label="Anomaly page navigation">
+          <button id="anomaly-prev-btn" class="page-btn" type="button" aria-label="Previous page of anomalies">Prev</button>
+          <span id="anomaly-page-indicator" class="page-indicator" aria-live="polite" aria-atomic="true"></span>
+          <button id="anomaly-next-btn" class="page-btn" type="button" aria-label="Next page of anomalies">Next</button>
+        </nav>
+      </footer>
+    </div>
+
+    <!-- ANOMALY DETAIL VIEW -->
+    <div id="anomaly-detail-view" class="anom-view hidden">
+      <div class="detail-toolbar">
+        <button id="anomaly-back-btn" class="back-btn" type="button">← Back to anomalies</button>
+        <button id="anomaly-trace-btn" class="back-btn hidden" type="button">View related trace →</button>
+      </div>
+      <div id="anomaly-detail-status" class="status-region" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="anomaly-detail-error" class="error-banner anom-banner hidden" role="alert">
+        <span id="anomaly-detail-error-message" class="error-message"></span>
+        <button id="anomaly-detail-retry-btn" class="retry-btn" type="button">Retry</button>
+      </div>
+      <div class="anom-detail-grid">
+        <section class="anom-card" aria-labelledby="anomaly-detail-heading">
+          <h2 id="anomaly-detail-heading" class="tree-section-heading">Anomaly</h2>
+          <p id="anomaly-explanation" class="anom-explanation"></p>
+          <dl id="anomaly-fields" class="span-fields"></dl>
+          <h3 class="anom-subheading">Baseline</h3>
+          <dl id="anomaly-baseline" class="span-fields"></dl>
+        </section>
+        <section class="anom-card" aria-labelledby="rca-heading">
+          <h2 id="rca-heading" class="tree-section-heading">Root cause analysis</h2>
+          <div id="rca-status" class="status-region" role="status" aria-live="polite" aria-atomic="true"></div>
+          <div id="rca-error-banner" class="error-banner anom-banner hidden" role="alert">
+            <span id="rca-error-message" class="error-message"></span>
+            <button id="rca-retry-btn" class="retry-btn" type="button">Retry</button>
+          </div>
+          <div id="rca-content" class="hidden">
+            <p class="rca-confidence-line">Confidence: <span id="rca-confidence" class="anom-badge"></span></p>
+            <p id="rca-summary" class="anom-explanation"></p>
+            <dl id="rca-meta" class="span-fields"></dl>
+            <h3 class="anom-subheading">Limitations</h3>
+            <ul id="rca-limitations" class="rca-limitations"></ul>
+            <h3 class="anom-subheading">Ranked evidence</h3>
+            <ol id="rca-evidence" class="rca-evidence"></ol>
+          </div>
+        </section>
       </div>
     </div>
 

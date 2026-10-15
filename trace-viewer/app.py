@@ -33,7 +33,7 @@ import logging
 import pathlib
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Annotated, Generator
+from typing import Annotated, Any, Generator, Literal
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Path, Query, Request
@@ -41,6 +41,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
+from anomaly_queries import (
+    get_anomaly,
+    get_latest_rca_for_anomaly,
+    get_rca_investigation,
+    list_anomalies,
+)
 from db import connect
 from queries import get_trace_reconstruction, list_traces
 from reconstruction import SpanRecord, TraceNode, TraceReconstruction
@@ -364,3 +370,182 @@ def get_trace_endpoint(
             detail=f"Trace not found: {trace_id}",
         )
     return TraceDetailResponse.from_reconstruction(trace_id, result)
+
+
+# ---------------------------------------------------------------------------
+# Anomalies and RCA (read-only)
+# ---------------------------------------------------------------------------
+#
+# Models mirror the columns of public.anomaly_events, public.rca_investigations
+# and public.rca_evidence.  anomaly_id and investigation_id are both 64 lowercase
+# hex characters; trace_id filters use the 32-character trace-viewer format.
+
+
+class AnomalyResponse(BaseModel):
+    """One row of public.anomaly_events."""
+
+    anomaly_id: str
+    anomaly_type: str
+    signal_name: str
+    detector_name: str
+    detector_version: str
+    trace_id: str | None
+    span_id: str | None
+    service_name: str | None
+    operation_name: str | None
+    observed_value: float
+    event_time: datetime
+    baseline_median: float | None
+    baseline_mad: float | None
+    baseline_n: int | None
+    baseline_window_start: datetime | None
+    baseline_window_end: datetime | None
+    anomaly_score: float | None
+    severity: str
+    explanation: str
+    detected_at: datetime
+
+
+class AnomalyListResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    anomalies: list[AnomalyResponse]
+
+
+class RcaEvidenceResponse(BaseModel):
+    """One ranked row of public.rca_evidence (rank_position 1 is strongest)."""
+
+    rank_position: int
+    span_id: str
+    parent_span_id: str | None
+    span_name: str
+    service_name: str
+    duration_ms: float
+    status_code: str
+    error_type: str | None
+    error_message: str | None
+    tool_name: str | None
+    tool_status: str | None
+    agent_name: str | None
+    agent_operation: str | None
+    retrieval_result_count: int | None
+    retrieval_top_relevance_score: float | None
+    is_root_span: bool
+    is_error_span: bool
+    is_direct_subject: bool
+    depth: int
+    trace_duration_fraction: float | None
+    evidence_type: str
+    evidence_score: float
+    evidence_score_breakdown: str
+    explanation: str
+
+
+class RcaInvestigationResponse(BaseModel):
+    """One row of public.rca_investigations plus its evidence, best first."""
+
+    investigation_id: str
+    anomaly_id: str
+    analyzer_version: str
+    investigated_at: datetime
+    trace_id: str | None
+    subject_span_id: str | None
+    service_name: str | None
+    operation_name: str | None
+    event_time: datetime
+    trace_span_count: int
+    anomaly_type: str
+    observed_value: float
+    baseline_median: float | None
+    anomaly_score: float | None
+    severity: str
+    confidence: str
+    summary: str
+    limitations: list[str]
+    evidence: list[RcaEvidenceResponse]
+
+
+_Id64Path = Annotated[str, Path(pattern=r"^[0-9a-f]{64}$")]
+
+
+@app.get("/api/anomalies", response_model=AnomalyListResponse)
+def list_anomalies_endpoint(
+    limit: Annotated[int, Query(ge=1, le=_MAX_LIMIT)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    severity: Annotated[Literal["INFO", "WARNING", "CRITICAL"] | None, Query()] = None,
+    service_name: Annotated[str | None, Query()] = None,
+    trace_id: Annotated[str | None, Query(pattern=r"^[0-9a-f]{32}$")] = None,
+) -> AnomalyListResponse:
+    """
+    Return a paginated list of anomalies, newest event_time first
+    (ties broken by anomaly_id ascending).
+
+    Query parameters:
+        limit         1-200, default 50
+        offset        >= 0, default 0
+        severity      INFO | WARNING | CRITICAL
+        service_name  exact match
+        trace_id      32 lowercase hex characters, exact match
+    """
+    with get_db() as conn:
+        result = list_anomalies(
+            conn,
+            limit=limit,
+            offset=offset,
+            severity=severity,
+            service_name=service_name,
+            trace_id=trace_id,
+        )
+    return AnomalyListResponse(
+        total=result.total,
+        limit=limit,
+        offset=offset,
+        anomalies=[AnomalyResponse.model_validate(row) for row in result.anomalies],
+    )
+
+
+@app.get("/api/anomalies/{anomaly_id}", response_model=AnomalyResponse)
+def get_anomaly_endpoint(anomaly_id: _Id64Path) -> AnomalyResponse:
+    """Return one anomaly. 404 if the (valid) anomaly_id does not exist."""
+    with get_db() as conn:
+        row = get_anomaly(conn, anomaly_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Anomaly not found: {anomaly_id}")
+    return AnomalyResponse.model_validate(row)
+
+
+def _rca_response(row: dict[str, Any]) -> RcaInvestigationResponse:
+    return RcaInvestigationResponse.model_validate(row)
+
+
+@app.get("/api/rca/{investigation_id}", response_model=RcaInvestigationResponse)
+def get_rca_endpoint(investigation_id: _Id64Path) -> RcaInvestigationResponse:
+    """
+    Return one RCA investigation with confidence, summary, limitations and
+    evidence ordered by rank_position. 404 if it does not exist.
+    """
+    with get_db() as conn:
+        row = get_rca_investigation(conn, investigation_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Investigation not found: {investigation_id}",
+        )
+    return _rca_response(row)
+
+
+@app.get("/api/anomalies/{anomaly_id}/rca", response_model=RcaInvestigationResponse)
+def get_anomaly_rca_endpoint(anomaly_id: _Id64Path) -> RcaInvestigationResponse:
+    """
+    Return the most recent RCA investigation (with evidence) for an anomaly.
+    404 if the anomaly has no investigation.
+    """
+    with get_db() as conn:
+        row = get_latest_rca_for_anomaly(conn, anomaly_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No RCA investigation for anomaly: {anomaly_id}",
+        )
+    return _rca_response(row)

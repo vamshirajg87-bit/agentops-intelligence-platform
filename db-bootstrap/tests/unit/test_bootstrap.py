@@ -85,7 +85,13 @@ _EXPECTED_ORDER = [
     "014_create_alert_notifier_role.sql",
     "post_dbt_grants.sql",
     "complete",
+    # An upgrade: it follows the base marker (see bootstrap's _UPGRADES).
+    "015_grant_trace_viewer_anomaly_rca_read.sql",
 ]
+
+_UPGRADE = "015_grant_trace_viewer_anomaly_rca_read.sql"
+# The ledger of a database the bootstrap completed before 015 existed.
+_BASE_ROWS = 17
 
 _ROLES = [
     "grafana_reader", "trace_viewer_reader", "anomaly_detector", "rca_analyzer",
@@ -168,15 +174,32 @@ class TestPlan:
 
     def test_migrations_are_in_numeric_order(self):
         numbers = [int(name[:3]) for name in _NAMES if name[:3].isdigit()]
-        assert numbers == list(range(1, 15))
+        assert numbers == list(range(1, 16))
 
     def test_every_migration_on_disk_is_in_the_plan_and_nothing_else(self):
         on_disk = sorted(path.name for path in _MIGRATIONS.glob("*.sql"))
         assert on_disk == sorted(bootstrap.MIGRATION_FILES)
-        assert len(on_disk) == 14
+        assert len(on_disk) == 15
 
-    def test_grants_then_complete_come_last(self):
-        assert _NAMES[-2:] == ["post_dbt_grants.sql", "complete"]
+    def test_grants_then_marker_then_upgrades_come_last(self):
+        assert _NAMES[-3:] == ["post_dbt_grants.sql", "complete", _UPGRADE]
+        assert _INDEX["complete"] == _BASE_ROWS - 1
+        assert _NAMES[:_BASE_ROWS] == _EXPECTED_ORDER[:_BASE_ROWS]
+
+    def test_base_plan_is_what_it_was_before_the_upgrade(self):
+        """A database completed before 015 existed holds exactly these rows."""
+        assert _NAMES[:_BASE_ROWS] == [
+            "001_create_telemetry_spans.sql", "dbt_run",
+            *[n for n in _NAMES[2:15]], "post_dbt_grants.sql", "complete",
+        ]
+        assert [int(n[:3]) for n in _NAMES[:15] if n[:3].isdigit()] == list(range(1, 15))
+
+    def test_upgrade_step_is_a_plain_sql_step_with_no_variable_or_object(self):
+        step = _PLAN[_INDEX[_UPGRADE]]
+        assert step.kind == "sql" and step.atomic
+        assert step.sentinels == () and dict(step.psql_variables) == {}
+        assert step.path.is_file()
+        assert step.checksum == bootstrap.file_checksum(step.path.read_bytes())
 
     def test_kinds(self):
         kinds = {step.name: step.kind for step in _PLAN}
@@ -255,7 +278,7 @@ class TestPlan:
     def test_unknown_migration_is_rejected(self, tmp_path):
         for path in _MIGRATIONS.glob("*.sql"):
             (tmp_path / path.name).write_bytes(path.read_bytes())
-        (tmp_path / "015_something_new.sql").write_text("SELECT 1;", encoding="utf-8")
+        (tmp_path / "016_something_new.sql").write_text("SELECT 1;", encoding="utf-8")
         with pytest.raises(ConfigError, match="unknown to the bootstrap"):
             build_plan(tmp_path, _GRANTS)
 
@@ -336,10 +359,17 @@ class TestClassification:
         result = classify(_state(len(_PLAN)), _PLAN)
         assert result == Classification(BootstrapState.COMPLETE, "every step is recorded")
 
-    def test_all_steps_but_the_marker_is_not_complete(self):
-        result = classify(_state(len(_PLAN) - 1), _PLAN)
+    def test_all_base_steps_but_the_marker_is_not_complete(self):
+        result = classify(_state(_INDEX["complete"]), _PLAN)
         assert result.state is BootstrapState.PARTIAL_VALID
         assert _PLAN[result.next_index].name == "complete"
+
+    def test_base_complete_database_is_not_complete_until_the_upgrade_is_recorded(self):
+        result = classify(_state(_BASE_ROWS), _PLAN)
+        assert result.state is BootstrapState.PARTIAL_VALID
+        assert result.next_index == _BASE_ROWS
+        assert _PLAN[result.next_index].name == _UPGRADE
+        assert result.reason == f"{_BASE_ROWS} of {len(_PLAN)} steps are recorded"
 
     # -- objects without a ledger --------------------------------------------
 
@@ -542,7 +572,7 @@ class FakeDatabase:
 _FULL_RUN = (
     ["init_ledger", "sql:001_create_telemetry_spans.sql", "dbt", "record:dbt_run"]
     + [f"sql:{name}" for name in _EXPECTED_ORDER[2:16]]
-    + ["record:complete"]
+    + ["record:complete", f"sql:{_UPGRADE}"]
 )
 
 
@@ -713,7 +743,8 @@ class TestVerification:
     def test_marker_is_written_only_after_verification(self):
         db = FakeDatabase()
         _run(db)
-        assert db.calls[-1] == "record:complete"
+        # The marker is the last base step; the upgrade follows it.
+        assert db.calls[-2:] == ["record:complete", f"sql:{_UPGRADE}"]
         # The whole matrix of the migrations is checked, not only the part
         # the grants file restores.
         assert db.grants_checked == _INTENDED == _EXPECTED_GRANTS
@@ -725,6 +756,7 @@ class TestVerification:
         with pytest.raises(StepError, match="analytics grant missing"):
             _run(db)
         assert "record:complete" not in db.calls
+        assert f"sql:{_UPGRADE}" not in db.calls
         result = classify(db.read_state(_PLAN), _PLAN)
         assert _PLAN[result.next_index].name == "complete"
 
@@ -736,7 +768,7 @@ class TestVerification:
         assert "record:complete" not in db.calls
 
     def test_missing_object_at_the_end_blocks_the_marker(self):
-        db = FakeDatabase(_state(len(_PLAN) - 1))
+        db = FakeDatabase(_state(_INDEX["complete"]))
         db.sentinels.discard("extension:vector")
         # Found before anything runs: the ledger and the objects disagree.
         with pytest.raises(IncompatibleError):
@@ -927,7 +959,7 @@ class TestChildProcesses:
         for position, step in enumerate(_PLAN, start=1):
             if step.kind == "sql":
                 executor.apply_sql(step, position)
-        assert len(recorder.calls) == 15
+        assert len(recorder.calls) == 16
         _assert_no_secret_in_argv_or_script(recorder)
 
     def test_sql_step_is_one_transaction_with_its_ledger_row(self, tmp_path):
@@ -1512,6 +1544,163 @@ class SimulatedServer:
         return ProcessResult(0, "", "")
 
 
+# ---------------------------------------------------------------------------
+# BS12  Upgrades after the base marker (migration 015)
+# ---------------------------------------------------------------------------
+
+class TestUpgrade:
+
+    def _existing(self) -> FakeDatabase:
+        """A database the bootstrap completed before 015 existed: 17 rows."""
+        return FakeDatabase(_state(_BASE_ROWS))
+
+    # -- fresh database -------------------------------------------------------
+
+    def test_fresh_database_runs_the_base_plan_then_015(self):
+        db = FakeDatabase()
+        found, _ = _run(db)
+        assert found is BootstrapState.EMPTY
+        assert db.calls[-2:] == ["record:complete", f"sql:{_UPGRADE}"]
+        assert db.rows[_BASE_ROWS - 1][:2] == (_BASE_ROWS, "complete")
+        assert db.rows[_BASE_ROWS][:2] == (_BASE_ROWS + 1, _UPGRADE)
+        assert len(db.rows) == len(_PLAN) == _BASE_ROWS + 1
+        assert classify(db.read_state(_PLAN), _PLAN).state is BootstrapState.COMPLETE
+
+    # -- previously completed database ----------------------------------------
+
+    def test_existing_complete_database_is_not_complete_until_015(self):
+        found = classify(self._existing().read_state(_PLAN), _PLAN)
+        assert found.state is BootstrapState.PARTIAL_VALID
+        assert _PLAN[found.next_index].name == _UPGRADE
+
+    def test_existing_17_row_ledger_resumes_at_015_only(self):
+        db = self._existing()
+        base_rows = list(db.rows)
+        found, lines = _run(db)
+        assert found is BootstrapState.PARTIAL_VALID
+        # Nothing but 015: no ledger creation, no dbt, no earlier migration,
+        # no second marker, no verification of the base.
+        assert db.calls == [f"sql:{_UPGRADE}"]
+        assert db.rows[:_BASE_ROWS] == base_rows          # historical rows untouched
+        assert db.rows[_BASE_ROWS] == (
+            _BASE_ROWS + 1, _UPGRADE, _PLAN[_INDEX[_UPGRADE]].checksum)
+        assert f"resuming at step {_BASE_ROWS + 1}: {_UPGRADE}" in lines
+        assert lines[-1] == "bootstrap complete"
+        assert classify(db.read_state(_PLAN), _PLAN).state is BootstrapState.COMPLETE
+
+    def test_015_is_applied_exactly_once(self):
+        db = self._existing()
+        _run(db)
+        db.calls.clear()
+        found, lines = _run(db)
+        assert found is BootstrapState.COMPLETE
+        assert db.mutations == []
+        assert lines[-1] == "already initialized; nothing to do"
+        assert [row[1] for row in db.rows].count(_UPGRADE) == 1
+
+    # -- crash and restart ----------------------------------------------------
+
+    def test_failed_015_on_an_existing_database_changes_nothing_and_retries(self):
+        db = self._existing()
+        before = (list(db.rows), set(db.sentinels))
+        db.fail_at = _UPGRADE
+        with pytest.raises(StepError, match="rolled back"):
+            _run(db)
+        assert (list(db.rows), set(db.sentinels)) == before
+        assert classify(db.read_state(_PLAN), _PLAN).state is BootstrapState.PARTIAL_VALID
+
+        db.fail_at = None
+        db.calls.clear()
+        _run(db)
+        assert db.calls == [f"sql:{_UPGRADE}"]
+        assert classify(db.read_state(_PLAN), _PLAN).state is BootstrapState.COMPLETE
+
+    def test_crash_between_the_marker_and_015_on_a_fresh_database_resumes_at_015(self):
+        db = FakeDatabase()
+        db.fail_at = _UPGRADE
+        with pytest.raises(StepError):
+            _run(db)
+        assert [row[1] for row in db.rows] == _EXPECTED_ORDER[:_BASE_ROWS]
+        db.fail_at = None
+        db.calls.clear()
+        found, _ = _run(db)
+        assert found is BootstrapState.PARTIAL_VALID
+        assert db.calls == [f"sql:{_UPGRADE}"]
+        assert [row[1] for row in db.rows] == _EXPECTED_ORDER
+
+    def test_failed_marker_never_lets_015_run(self):
+        db = FakeDatabase(_state(_INDEX["complete"]))
+        db.missing = ["SELECT:analytics.mart_trace_metrics:anomaly_detector"]
+        with pytest.raises(StepError):
+            _run(db)
+        assert f"sql:{_UPGRADE}" not in db.calls
+
+    # -- refusals -------------------------------------------------------------
+
+    def test_changed_015_checksum_is_refused(self):
+        rows = _rows_through(len(_PLAN))[:-1] + ((len(_PLAN), _UPGRADE, "0" * 64),)
+        db = FakeDatabase(_state(len(_PLAN), ledger_rows=rows))
+        with pytest.raises(
+            IncompatibleError, match=f"checksum mismatch for recorded step {_UPGRADE}",
+        ):
+            _run(db)
+        assert db.mutations == []
+
+    def test_015_recorded_in_place_of_the_marker_is_refused(self):
+        rows = _rows_through(_INDEX["complete"]) + (
+            (_BASE_ROWS, _UPGRADE, _PLAN[_INDEX[_UPGRADE]].checksum),)
+        db = FakeDatabase(_state(_BASE_ROWS, ledger_rows=rows))
+        with pytest.raises(IncompatibleError, match="not the expected step complete"):
+            _run(db)
+        assert db.mutations == []
+
+    def test_unknown_step_after_015_is_refused(self):
+        rows = _rows_through(len(_PLAN)) + (
+            (len(_PLAN) + 1, "016_something_new.sql", "0" * 64),)
+        db = FakeDatabase(_state(len(_PLAN), ledger_rows=rows))
+        with pytest.raises(IncompatibleError, match="more steps than the plan"):
+            _run(db)
+        assert db.mutations == []
+
+    def test_unknown_migration_file_is_still_refused(self, tmp_path):
+        for path in _MIGRATIONS.glob("*.sql"):
+            (tmp_path / path.name).write_bytes(path.read_bytes())
+        (tmp_path / "016_something_new.sql").write_text("SELECT 1;", encoding="utf-8")
+        with pytest.raises(ConfigError, match="unknown to the bootstrap"):
+            build_plan(tmp_path, _GRANTS)
+
+    def test_missing_015_file_is_refused(self, tmp_path):
+        for path in _MIGRATIONS.glob("*.sql"):
+            if path.name != _UPGRADE:
+                (tmp_path / path.name).write_bytes(path.read_bytes())
+        with pytest.raises(ConfigError, match=f"missing: {_UPGRADE}"):
+            build_plan(tmp_path, _GRANTS)
+
+    def test_015_does_not_change_the_analytics_matrix(self):
+        assert _INTENDED == _EXPECTED_GRANTS
+        text = _PLAN[_INDEX[_UPGRADE]].path.read_text(encoding="utf-8")
+        assert parse_analytics_grants(text) == frozenset()
+
+    # -- through the real executor -------------------------------------------
+
+    def test_existing_database_through_the_real_executor_applies_only_015(
+        self, capsys, tmp_path,
+    ):
+        runner = SimulatedServer()
+        runner.schema = runner.table = True
+        runner.rows = list(_rows_through(_BASE_ROWS))
+        runner.sentinels = set(_sentinels_through(_BASE_ROWS))
+        env = _environ(BOOTSTRAP_WORK_DIR=str(tmp_path / "work"))
+        assert bootstrap.main([], environ=env, runner=runner) == 0
+        assert runner.writes == [_UPGRADE]
+        assert [row[1] for row in runner.rows] == _EXPECTED_ORDER
+        assert f"resuming at step {_BASE_ROWS + 1}: {_UPGRADE}" in capsys.readouterr().out
+
+        runner.writes.clear()
+        assert bootstrap.main([], environ=env, runner=runner) == 0
+        assert runner.writes == []
+
+
 class TestMain:
 
     def test_complete_database_exits_zero_and_writes_nothing(self, capsys):
@@ -1580,7 +1769,7 @@ class TestMain:
         assert [row[1] for row in runner.rows] == _EXPECTED_ORDER
         assert runner.writes == (
             ["ledger", "001_create_telemetry_spans.sql", "dbt", "dbt_run"]
-            + _EXPECTED_ORDER[2:16] + ["complete"]
+            + _EXPECTED_ORDER[2:16] + ["complete", _UPGRADE]
         )
         out = capsys.readouterr()
         assert out.err == ""
@@ -1618,7 +1807,7 @@ class TestMain:
         runner.fail_on = None
         runner.writes.clear()
         assert bootstrap.main([], environ=env, runner=runner) == 0
-        assert runner.writes == _EXPECTED_ORDER[10:16] + ["complete"]
+        assert runner.writes == _EXPECTED_ORDER[10:16] + ["complete", _UPGRADE]
         assert "resuming at step 11: 010_create_rca_investigation_embeddings.sql" in (
             capsys.readouterr().out
         )
