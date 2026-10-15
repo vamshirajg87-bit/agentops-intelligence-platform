@@ -10,6 +10,12 @@ Status:
 - The viewer was run from that image against the existing legacy database in isolated
   temporary containers; the API smoke test and an interactive browser check both passed
   (B3J-141, B3J-142). See [Verified legacy-database demo](#verified-legacy-database-demo).
+- `legacy-demo.ps1` (below) completed a live start, status, API-check and stop cycle
+  against the legacy database **twice**, each time with its containers and network cleaned
+  up afterwards: B3J-149B for the original script version (hash prefix `8016cc23`) and
+  B3J-152 for the current, revised version (hash prefix `db6eb55a`). Failure cleanup,
+  Ctrl+C interruption, the refusal paths and repeated runs have **not** been live-verified.
+  See [Repeatable legacy demo](#repeatable-legacy-demo-legacy-demops1).
 - The Compose overlay `docker/compose.trace-viewer.yml` itself has only been validated with
   `docker compose config`. It has not been started, and it cannot be used unchanged with
   a database that has no bootstrap ledger (see below).
@@ -85,6 +91,10 @@ configuration or an authentication model.
 | B3J-141 | The API smoke test passed: health, traces, anomalies, RCA, 404 and 422 handling, and the static dashboard files. |
 | B3J-142 | Interactive browser verification passed: traces, anomaly details, RCA confidence, limitations and ranked evidence, related-trace navigation, execution tree and span details. |
 | B3J-143 | The temporary containers and network were removed. The original container, the data volume, the images, the backups and the evidence notes were kept. |
+| B3J-148 | `legacy-demo.ps1` was written to repeat this arrangement with guards (see below) and covered by 76 static tests. |
+| B3J-149B | One live `start`, `status`, API-check and `stop` cycle of the **original** script version (hash prefix `8016cc23`) passed, run with the one-process `-ExecutionPolicy Bypass` option. Cleanup left no demo resources, and the original container, volume, images, backups and evidence were preserved. |
+| B3J-151 | The start cleanup moved into a `finally` block (so it is also attempted on Ctrl+C), the execution-policy and interruption limits were documented, and an ineffective test assertion was fixed (92 static tests). |
+| B3J-152 | One live `start`, `status`, API-check and `stop` cycle of the **current, revised** script version (hash prefix `db6eb55a`) passed, run with the plain `powershell -NoProfile -File` command and no execution-policy option. Same cleanup and preservation results as B3J-149B. |
 
 How it was isolated: temporary containers, not Compose. A temporary PostgreSQL container
 used the existing image and data volume on a private network and published **only**
@@ -98,6 +108,115 @@ connections, with a non-secret placeholder in place of a password. That is accep
 inside a throwaway, single-machine, loopback-only demonstration. It does not exercise a real
 password, and no role or password was changed. A shared or persistent setup needs a real
 password and an authentication layer in front of the API, neither of which exists yet.
+
+## Repeatable legacy demo (`legacy-demo.ps1`)
+
+`docker/trace-viewer/legacy-demo.ps1` repeats the isolated legacy-database demo above with
+guards, for Windows PowerShell 5.1 and Docker Desktop. It is the supported way to run the
+viewer against the ledger-less database (the Compose overlay cannot be used there).
+
+Run these from the repository root, in Windows PowerShell:
+
+```
+powershell -NoProfile -File docker/trace-viewer/legacy-demo.ps1 start      # add -Open to open the browser
+powershell -NoProfile -File docker/trace-viewer/legacy-demo.ps1 status     # read-only report
+powershell -NoProfile -File docker/trace-viewer/legacy-demo.ps1 stop
+```
+
+**If PowerShell refuses to run the script** (a "running scripts is disabled on this system"
+or signature error), your execution policy blocks it. You can allow it for **that one
+process only** by adding `-ExecutionPolicy Bypass` to the same command:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File docker/trace-viewer/legacy-demo.ps1 start
+```
+
+That option lasts only for the process it is given to. It does not change any stored
+policy, and nothing here needs one changed: do not change the machine-wide or the
+per-user execution policy for this script. If the policy is set by Group Policy (your
+organization), the option has no effect and you should ask whoever manages the policy
+rather than work around it. The live test in B3J-149B used the one-process option; the live
+test in B3J-152 used the plain command without it and succeeded on this machine, whose
+user-level policy already allows local scripts. That does not show the plain command works
+under a stricter policy.
+
+**Status of the script:** it is covered by static guard tests (including a PowerShell 5.1
+parse that does not run it) and it has **two successful live cycles on one machine**, each
+a single `start`, then `status`, then the four HTTP checks (`/api/health`,
+`/api/traces?limit=1`, `/api/anomalies?limit=1` and `/`, all answering 200 with 9 traces and
+2 anomalies), then `stop`, without `-Open`:
+
+- **B3J-149B** ran the original script version (hash prefix `8016cc23`), using the
+  one-process `-ExecutionPolicy Bypass` option.
+- **B3J-152** ran the **current** script version (hash prefix `db6eb55a`), the one this
+  README describes, using the plain `powershell -NoProfile -File` command.
+
+After each, no demo container, network or published port remained, and the original
+container, the database volume, the images, the backup and the evidence notes were intact.
+The two runs were on the same machine and each was a normal, uninterrupted lifecycle.
+
+**Not live-verified.** The failure cleanup, interruption (Ctrl+C) cleanup, the refusal
+paths, the `-Open` switch and repeated runs have only been checked statically, not live. The
+current version's `finally`-based cleanup has only been exercised on the success path, where
+it removes nothing; no interruption or failure was triggered on purpose. Each live run still
+needs its own authorization.
+
+What it uses: the containers `agentops-legacy-demo-pg` and `agentops-legacy-demo-viewer`,
+the private network `agentops-legacy-demo-net`, and the label `agentops.demo=legacy-viewer`.
+
+**`start`** refuses, changing nothing, unless all of these hold: Docker responds; no demo
+resource already exists; the original `agentops-postgres` container exists and is stopped;
+the `agentops_postgres-data` volume exists and no running container uses it; the image
+`agentops-trace-viewer:local` exists (the script never builds it); at least one non-empty
+`*.dump` backup exists under `%LOCALAPPDATA%\agentops-backups` (there is no way to skip this
+check); host port 8000 is free; and nothing listens on host port 5432. It then creates the
+network, starts a PostgreSQL container from the **original container's exact image id** on
+the existing volume, and starts the viewer in that container's network namespace (non-root,
+read-only root file system, `tmpfs` at `/tmp`, all capabilities dropped,
+`no-new-privileges`, no restart policy). Only the literal `127.0.0.1:8000:8000` mapping is
+published; PostgreSQL's port is never published. The script then verifies Docker's port
+mappings (it tears down at once if they are anything else), waits for PostgreSQL and the
+viewer with fixed time limits, and checks `/api/health`, `/api/traces?limit=1`,
+`/api/anomalies?limit=1` and `/`. It prints the URL and a short browser checklist. If any
+step fails, or the start is interrupted, it removes only the resources that invocation
+created (see "If a start is interrupted" below).
+
+**`stop`** removes only the two demo containers and the network, and only after checking
+each one's exact name and label. It stops the viewer first, then PostgreSQL with a time
+limit. It refuses when ownership is ambiguous or an unrelated container uses the demo, and it
+never deletes volumes, images, backups or evidence. Afterwards it verifies that the original
+container is still stopped, the database volume is present and port 8000 is free.
+
+**If a start is interrupted.** The cleanup of a start runs in a `finally` block, so it is
+attempted both when a step fails and when you press Ctrl+C. It removes only the resources
+that this invocation itself created, each after an exact-name and label check, and never
+anything that existed before. A pre-existing resource with a demo name makes `start` refuse
+before it creates anything. It is **best effort and cannot be guaranteed** when:
+
+- the PowerShell process is killed (Task Manager, `Stop-Process`, closing the terminal
+  window) or the machine loses power or crashes: no cleanup code runs;
+- Docker Desktop stops or restarts in the middle of a start;
+- you interrupt a second time while the cleanup itself is running;
+- the interrupt arrives in the instant after a `docker run` has created a container but
+  before the script has recorded it as its own (it is deliberately not removed by guesswork).
+
+After any of these, run `status` and then `stop`. `stop` removes only exact-name, labelled
+demo resources and refuses when ownership is ambiguous. Until it has run, a new `start`
+refuses. An interrupted or failed start is never retried automatically.
+
+**Safety limits you should know about**
+
+- The PostgreSQL data volume is mounted **read-write**, because PostgreSQL cannot start
+  without that. Starting and stopping PostgreSQL rewrites some of its own files (the
+  process-id file, a shutdown checkpoint, the WAL position). This demo therefore does **not**
+  guarantee that the database files stay byte-for-byte unchanged. The script runs no SQL and
+  the viewer's role is read-only, but take a backup first, which is why `start` requires one.
+- Authentication is PostgreSQL's local **trust** rule for loopback connections inside the
+  shared network namespace, with a random throwaway password value generated for each start
+  and never printed or stored. This is a local demonstration, **not a security model** and
+  not a production deployment: the API has no authentication and must stay on loopback.
+- The analytics view grants for `trace_viewer_reader` are removed by any dbt run; a `503`
+  from the data endpoints usually means they need restoring (see B3J-139 above).
 
 ## Demonstration
 
