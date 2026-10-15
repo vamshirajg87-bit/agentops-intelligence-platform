@@ -113,6 +113,26 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: python -m pytest db-bootstrap/tests -q -rs -p no:cacheprovider
 
+      # Portable MVP stack (docker/mvp/compose.yml), static checks only: the
+      # Compose file is read as text (and parsed with PyYAML, which
+      # uvicorn[standard] installs; with CI=true the test fails instead of
+      # skipping when it is missing). Docker is never started. The file is
+      # also covered by the db-bootstrap step above; this step repeats it so a
+      # failure names the MVP stack.
+      - name: Test MVP compose contract
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest db-bootstrap/tests/unit/test_mvp_compose_contract.py -q -rs -p no:cacheprovider
+
+      # MVP credential tooling (scripts/agentops_mvp.py): standard library
+      # only. On this Linux runner the POSIX permission and symbolic-link tests
+      # run for real (-rs lists anything skipped); the Windows permission tool is
+      # replaced by a mock. Everything is created below pytest's temporary
+      # directory: no MVP credential file is created and no tool or container
+      # engine is run.
+      - name: Test MVP tooling
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: python -m pytest scripts/tests -q -rs -p no:cacheprovider
+
       # Workload generator: planning, fault injection and the execution
       # driver, with every exporter and socket replaced inside the tests.
       # Nothing is sent. The two live harnesses (run_smoke.py, run_e2e.py)
